@@ -52,8 +52,8 @@ pub fn analyse(data: &[u8]) {
             analyzer.analyze(BasicBlockPass::default());
             println!("done");
 
-            println!("Priting basic block tree for function at 0x1403AF610");
-            walk_bb_tree(&analyzer.database.basic_blocks, 0x1403AF610, &mut String::new(), "");
+            println!("Printing basic block tree for function");
+            walk_bb_tree(&analyzer.database.basic_blocks, 0x1403AF610, &mut String::new(), "func ");
 
             // std::thread::sleep(Duration::from_secs(10));
 
@@ -75,18 +75,20 @@ pub fn analyse(data: &[u8]) {
 
 fn walk_bb_tree(bbs: &HashMap<u64, BasicBlock>, ip: u64, padding: &mut String, prefix: &str) {
     let bb = &bbs[&ip];
-    println!("{padding}{prefix}0x{:08X} -> 0x{:08X}", bb.begin_ip, bb.end_ip);
+    print!("{padding}{prefix}0x{:08X} -> 0x{:08X} ", bb.begin_ip, bb.end_ip);
     padding.push_str("  ");
     match bb.exit {
         BasicBlockExit::Unconditionnal { goto_ip } => {
+            println!("jmp");
             walk_bb_tree(bbs, goto_ip, padding, "goto ");
         }
         BasicBlockExit::Conditionnal { then_ip, else_ip } => {
+            println!("jcc");
             walk_bb_tree(bbs, then_ip, padding, "then ");
             walk_bb_tree(bbs, else_ip, padding, "else ");
         }
         BasicBlockExit::Unknown => {
-            println!("{padding}end");
+            println!("ret|unk");
         }
     }
     padding.truncate(padding.len() - 2);

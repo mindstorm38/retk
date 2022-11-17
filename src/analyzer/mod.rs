@@ -13,9 +13,7 @@ use colored::{Color, Colorize};
 
 use crate::symbol::{BasicBlock, Function};
 
-mod func;
 mod block;
-pub use func::DefineFunctionPass;
 pub use block::BasicBlockPass;
 
 
@@ -127,9 +125,11 @@ pub trait AnalyzerStepPass {
     fn accept(&mut self, analyzer: &mut Analyzer, inst: &Instruction);
 
     /// Called before analysis.
+    #[allow(unused)]
     fn before(&mut self, analyzer: &mut Analyzer) { }
 
     /// Called after analysis.
+    #[allow(unused)]
     fn after(&mut self, analyzer: &mut Analyzer) { }
 
 }
