@@ -1,7 +1,10 @@
-//! Calls analyzer passes.
+//! # Basic Block Analysis implementation.
+//! The goal of this pass is to 
+//! Instructions are fetched only once in this pass.
 //! 
-//! The first pass ensure that all symbols exists for each jumped-to address.
-//! The second pass complete the graph.
+//! ## Algorithm
+//! We walk through each instruction in the analyzer's code
+//! and 
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -12,7 +15,32 @@ use super::{Analyzer, AnalyzerStepPass};
 use crate::symbol::{BasicBlock, BasicBlockExit};
 
 
-/// The role of this pass is to cover the whole code behind basic blocks.
+/// ## Basic Block Analysis
+/// The goal of this pass is to find most of the [`Basic Blocks`]
+/// in the analyzer's code. Basic blocks are linear code sequence
+/// that have a single branch instruction as the last instruction
+/// of the block (called exit) and a single entry point where 
+/// other basic blocks jumps to. **The analysis here is static, 
+/// and can be inexact** due to relative addressing jumps, this 
+/// implies that the "single entry point" assertion is not 
+/// guaranteed by this implementation.
+/// 
+/// *Instructions are fetched only once in this pass.*
+/// 
+/// ### Algorithm
+/// During the processing of the input, an "incomplete block" 
+/// structure is used to hold temporary data required during 
+/// analysis. It contains two fields
+/// 
+/// 
+/// We walk through each instruction in the analyzer's code. When
+/// we get a branch instruction, `jmp`, `jcc`, `call` or `ret` we
+/// know three things:
+/// - We leave the current basic block;
+/// - We have to create a basic block just after the branch 
+///   instruction. 
+/// 
+/// [`Basic Blocks`]: https://en.wikipedia.org/wiki/Basic_block
 #[derive(Default)]
 pub struct BasicBlockPass {
     /// Temporary basic blocks being built.
@@ -28,7 +56,7 @@ pub struct BasicBlockPass {
 #[derive(Debug)]
 struct IncompleteBlock {
     /// The uncomplete basic block being built.
-    basic_block: BasicBlock,
+    basic_block: BasicBlock, // TODO: only use start_ip here
     /// The exit statement that should be defined for the the previous block.
     prev_exit: BasicBlockExit,
 }
@@ -45,7 +73,7 @@ impl BasicBlockPass {
                 let idx = self.blocks.len();
                 self.blocks.push(IncompleteBlock {
                     basic_block: BasicBlock::new(begin_ip),
-                    prev_exit: BasicBlockExit::Unknown
+                    prev_exit: BasicBlockExit::Unknown // TODO: Fix default to self
                 });
                 *v.insert(idx)
             },
