@@ -1,29 +1,8 @@
 //! A module providing high-level symbols that helps understanding
 //! the code. They are produce by analyzer passes.
 
-use std::collections::HashSet;
 use std::fmt;
 
-
-// /// Enumeration of all type
-// #[derive(Debug, Clone)]
-// pub enum Symbol<'data> {
-//     /// An raw block of code, that can be called or jumped
-//     /// to. Certain blocks might be upgraded into functions, but
-//     /// most of them will remains basic labels jumped to in 
-//     /// functions.
-//     /// 
-//     /// *This type of block should not be called a basic block,
-//     /// because it might contains unresolved relative jumps.*
-//     /// 
-//     /// *This type is temporary during analysis.*
-//     Block(BasicBlock),
-//     /// Basically a label that is called, instead of jumped to.
-//     /// This symbol is derived from labels by certain passes
-//     /// and contains, in addition to labels fields, a calling
-//     /// convention and a signature.
-//     Function(Function<'data>),
-// }
 
 /// A "basic block" of code. In the analyzer code, a basic block is 
 /// a block of code that has a single entry point and a single output 
@@ -42,13 +21,12 @@ pub struct BasicBlock {
     pub begin_ip: u64,
     /// End instruction pointer (exclusive) for the basic block.
     pub end_ip: u64,
-    /// All unique locations (xrefs) that can goto this block.
-    pub entries_from: HashSet<u64>,
+    /// IP of bblocks that are known to lead to this bblock.
+    pub entries_from: Vec<u64>,
     /// Number of goto to this block.
-    pub entries_count: usize,
-    /// From the total number of entries, how many are calls.
-    /// This is used to know if a block is a function.
-    pub entries_calls_count: usize,
+    pub entries_count: u32,
+    /// Number of calls to this block (counted in [`entries_count`]).
+    pub calls_count: u32,
     /// The kind of exit for this basic block.
     pub exit: BasicBlockExit,
 }
@@ -64,21 +42,6 @@ pub enum BasicBlockExit {
     Unknown,
 }
 
-impl BasicBlock {
-
-    pub fn new(begin_ip: u64) -> Self {
-        Self { 
-            begin_ip,
-            end_ip: begin_ip,
-            entries_from: Default::default(), 
-            entries_count: Default::default(), 
-            entries_calls_count: Default::default(), 
-            exit: BasicBlockExit::Unknown,
-        }
-    }
-
-}
-
 impl fmt::Debug for BasicBlock {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BasicBlock")
@@ -86,7 +49,7 @@ impl fmt::Debug for BasicBlock {
             .field("end_ip", &format_args!("0x{:08X}", self.end_ip))
             // .field("entries_from", &self.entries_from)
             // .field("entries_count", &self.entries_count)
-            // .field("entries_calls_count", &self.entries_calls_count)
+            // .field("calls_count", &self.calls_count)
             .field("exit", &self.exit)
             .finish()
     }

@@ -35,7 +35,7 @@ pub struct Analyzer<'data> {
 
 pub struct AnalyzerRuntime<'data> {
     data: &'data [u8],
-    ip: u64,
+    data_ip: u64,
     decoder: Decoder<'data>,
 }
 
@@ -47,12 +47,12 @@ pub struct AnalyzerDatabase<'data> {
 
 impl<'data> Analyzer<'data> {
 
-    pub fn new(data: &'data [u8], ip: u64) -> Self {
+    pub fn new(data: &'data [u8], data_ip: u64) -> Self {
         Self {
             runtime: AnalyzerRuntime {
                 data,
-                ip,
-                decoder: Decoder::with_ip(64, data, ip, DecoderOptions::NONE),
+                data_ip,
+                decoder: Decoder::with_ip(64, data, data_ip, DecoderOptions::NONE),
             },
             database: AnalyzerDatabase::default()
         }
@@ -100,7 +100,12 @@ impl<'data> AnalyzerRuntime<'data> {
     /// Reset the decoder to an absolute data position.
     pub fn reset(&mut self, pos: u64) {
         self.decoder.set_position(pos as usize).unwrap();
-        self.decoder.set_ip(pos + self.ip);
+        self.decoder.set_ip(pos + self.data_ip);
+    }
+
+    #[inline]
+    pub fn data_ip(&self) -> u64 {
+        self.data_ip
     }
 
     #[inline]
@@ -109,8 +114,13 @@ impl<'data> AnalyzerRuntime<'data> {
     }
 
     #[inline]
+    pub fn data_len(&self) -> usize {
+        self.data.len()
+    }
+
+    #[inline]
     pub fn data_ip_range(&self, ip: u64, len: u64) -> &'data [u8] {
-        let offset = (ip - self.ip) as usize;
+        let offset = (ip - self.data_ip) as usize;
         &self.data[offset..][..len as usize]
     }
 

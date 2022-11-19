@@ -30,15 +30,27 @@ use crate::symbol::{BasicBlock, BasicBlockExit};
 /// ### Algorithm
 /// During the processing of the input, an "incomplete block" 
 /// structure is used to hold temporary data required during 
-/// analysis. It contains two fields
-/// 
+/// analysis. It contains three fields: "begin IP", "calls count"
+/// and "previous exit".
 /// 
 /// We walk through each instruction in the analyzer's code. When
 /// we get a branch instruction, `jmp`, `jcc`, `call` or `ret` we
 /// know three things:
 /// - We leave the current basic block;
 /// - We have to create a basic block just after the branch 
-///   instruction. 
+///   instruction, this is used to delimit the end of the current
+///   block; this block contains the exit condition of the current
+///   block, known from the branch instruction;
+/// - If the instruction's target IP is statically known, ensure
+///   that a block exists at this position. If this block is new, 
+///   its "previous exit" is set to an unconditionnal jump to 
+///   itself, in order to continue the execution flow.
+/// 
+/// After all these incomplete blocks have been defined, we sort
+/// all of them by beginning IP. And then we iterate them in reverse
+/// order to define all basic blocks in the analyzer's database
+/// while apply the "previous exit" field recursively, we also
+/// set the "end IP" of defined basic blocks.
 /// 
 /// [`Basic Blocks`]: https://en.wikipedia.org/wiki/Basic_block
 #[derive(Default)]
@@ -55,8 +67,10 @@ pub struct BasicBlockPass {
 /// A structure temporarily used to construct basic blocks.
 #[derive(Debug)]
 struct IncompleteBlock {
-    /// The uncomplete basic block being built.
-    basic_block: BasicBlock, // TODO: only use start_ip here
+    /// The beginning Instruction Position for the future basic block.
+    begin_ip: u64,
+    /// Number of calls to this block.
+    calls_count: u32,
     /// The exit statement that should be defined for the the previous block.
     prev_exit: BasicBlockExit,
 }
@@ -72,8 +86,11 @@ impl BasicBlockPass {
             Entry::Vacant(v) => {
                 let idx = self.blocks.len();
                 self.blocks.push(IncompleteBlock {
-                    basic_block: BasicBlock::new(begin_ip),
-                    prev_exit: BasicBlockExit::Unknown // TODO: Fix default to self
+                    begin_ip,
+                    calls_count: 0,
+                    // New blocs set the previous exit to unconditionnaly jump to 
+                    // themself, this will be override if a jump precede this block.
+                    prev_exit: BasicBlockExit::Unconditionnal { goto_ip: begin_ip }
                 });
                 *v.insert(idx)
             },
@@ -109,7 +126,10 @@ impl AnalyzerStepPass for BasicBlockPass {
         // Update the targetted basic block with entries addresses.
         // Target IP=0 if the destination is not statically known.
         if target_ip != 0 {
-            self.ensure_basic_block(target_ip);
+            let target_bb = self.ensure_basic_block(target_ip);
+            if call {
+                target_bb.calls_count += 1;
+            }
         }
 
         // Don't cut the current basic block for calls.
@@ -147,35 +167,58 @@ impl AnalyzerStepPass for BasicBlockPass {
         }
 
         // Sort incomplete blocks by IP.
-        self.blocks.sort_by_key(|block| block.basic_block.begin_ip);
-        
+        self.blocks.sort_by_key(|block| block.begin_ip);
+
         // A reverse iterator to propage the exit statement to previous block.
+        let blocks_len = self.blocks.len();
         let mut blocks_it = self.blocks.drain(..);
-        let mut next_exit;
-        let mut next_ip;
 
-        {
-            
-            // SAFETY: We can unwrap because the iterator is not empty.
-            let last_block = blocks_it.next_back().unwrap();
-            
-            next_exit = last_block.prev_exit.clone();
-            next_ip = last_block.basic_block.begin_ip;
+        // These are initially set to an imaginary bblock on the EOF.
+        let mut next_exit = BasicBlockExit::Unknown;
+        let mut next_ip = analyzer.runtime.data_ip() + analyzer.runtime.data_len() as u64;
 
-            analyzer.database.basic_blocks.insert(next_ip, last_block.basic_block);
+        let mut cross_refs = Vec::with_capacity(blocks_len);
+
+        // Propate end IP for basic blocks.
+        while let Some(block) = blocks_it.next_back() {
+
+            match next_exit {
+                BasicBlockExit::Unconditionnal { goto_ip } => {
+                    cross_refs.push((block.begin_ip, goto_ip, 0));
+                },
+                BasicBlockExit::Conditionnal { then_ip, else_ip } => {
+                    cross_refs.push((block.begin_ip, then_ip, else_ip));
+                },
+                BasicBlockExit::Unknown => {},
+            }
+
+            analyzer.database.basic_blocks.insert(block.begin_ip, BasicBlock { 
+                begin_ip: block.begin_ip, 
+                end_ip: next_ip, 
+                entries_from: Vec::new(), 
+                entries_count: block.calls_count, 
+                calls_count: block.calls_count, 
+                exit: next_exit
+            });
+
+            next_exit = block.prev_exit;
+            next_ip = block.begin_ip;
 
         }
 
-        // Propate end IP for basic blocks.
-        while let Some(mut block) = blocks_it.next_back() {
+        // The last pass compute back references to callers.
+        // SAFETY: We can unwrap because we expect the goto blocks to be defined.
+        for (from_ip, goto0, goto1) in cross_refs {
 
-            block.basic_block.end_ip = next_ip;
-            block.basic_block.exit = next_exit.clone();
-            
-            next_exit = block.prev_exit;
-            next_ip = block.basic_block.begin_ip;
+            let bb0 = analyzer.database.basic_blocks.get_mut(&goto0).unwrap();
+            bb0.entries_count += 1;
+            bb0.entries_from.push(from_ip);
 
-            analyzer.database.basic_blocks.insert(next_ip, block.basic_block);
+            if goto1 != 0 {
+                let bb1 = analyzer.database.basic_blocks.get_mut(&goto1).unwrap();
+                bb1.entries_count += 1;
+                bb1.entries_from.push(from_ip);
+            }
 
         }
 
