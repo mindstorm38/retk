@@ -20,13 +20,15 @@ pub struct BasicBlock {
     /// Beging instruction pointer for the basic block.
     pub begin_ip: u64,
     /// End instruction pointer (exclusive) for the basic block.
+    /// 
+    /// *This should be the pointer of another block contiguous to it.*
     pub end_ip: u64,
     /// IP of bblocks that are known to lead to this bblock.
     pub entries_from: Vec<u64>,
     /// Number of goto to this block.
     pub entries_count: u32,
-    /// Number of calls to this block (counted in [`entries_count`]).
-    pub calls_count: u32,
+    /// True if this basic block is called, i.e. is a function.
+    pub function: bool,
     /// The kind of exit for this basic block.
     pub exit: BasicBlockExit,
 }
@@ -35,9 +37,24 @@ pub struct BasicBlock {
 #[derive(Clone)]
 pub enum BasicBlockExit {
     /// Unconditionnaly jumps to the absolute address.
-    Unconditionnal { goto_ip: u64 },
+    Unconditionnal { 
+        /// Instruction pointer of the next basic block.
+        goto_ip: u64 
+    },
     /// Conditionnal jump to the absolute address.
-    Conditionnal { then_ip: u64, else_ip: u64 },
+    Conditionnal { 
+        /// The instruction pointer of the basic block to goto if 
+        /// the condition is true.
+        goto_ip: u64,
+        /// The instruction pointer of the next contiguous basic block
+        /// to goto if the condition is false.
+        /// 
+        /// *Note that **the next block should be directly following the 
+        /// current block**, because conditionnal jump instructions only
+        /// provides a single "goto address", if the condition is not met,
+        /// the flow continue after the instruction.*
+        continue_ip: u64,
+    },
     /// For relative addressed jumps.
     Unknown,
 }
@@ -61,7 +78,7 @@ impl fmt::Debug for BasicBlockExit {
             Self::Unconditionnal { goto_ip } => f.debug_struct("Unconditionnal")
                 .field("goto_ip", &format_args!("0x{:08X}", goto_ip))
                 .finish(),
-            Self::Conditionnal { then_ip, else_ip } => f.debug_struct("Conditionnal")
+            Self::Conditionnal { goto_ip: then_ip, continue_ip: else_ip } => f.debug_struct("Conditionnal")
                 .field("then_ip", &format_args!("0x{:08X}", then_ip))
                 .field("else_ip", &format_args!("0x{:08X}", else_ip))
                 .finish(),
@@ -85,82 +102,30 @@ impl fmt::Debug for BasicBlockExit {
 //     EcxZero,
 //     /// Jump if RCX = 0
 //     RcxZero,
-
 // }
 
 /// Function symbol details, signature and return types.
 #[derive(Debug, Clone)]
-pub struct Function<'data> {
-    /// Slice of the function's data.
-    pub data: &'data [u8],
-    /// Custom name for the function.
-    pub name: String,
-    /// Calling convention.
-    pub cc: CallingConvention,
+pub struct Function {
+    /// First basic block of the function.
+    pub begin_ip: u64,
+    /// End IP of the function (exclusive).
+    pub end_ip: u64,
+    /// Calling convention's ABI.
+    pub abi: Abi,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CallingConvention {
-    /// Unknown calling convention.
+pub enum Abi {
+    /// Unknown ABI.
     Unknown,
-    /// Unix C x86
+    /// Unix C x86.
     Cdecl,
-    /// WINAPI
+    /// WINAPI.
     Stdcall,
-    /// Default on Windows x86
+    /// Windows x86.
     Fastcall,
-    /// # The x64 calling convention
-    /// 
-    /// ## Links
-    /// - https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention
-    /// - https://learn.microsoft.com/en-us/cpp/build/stack-usage
-    /// - https://learn.microsoft.com/en-us/cpp/build/prolog-and-epilog
-    /// - https://learn.microsoft.com/en-us/cpp/build/exception-handling-x64
-    /// 
-    /// ## Stack overview
-    /// Here is an overview of the stack of such calling convention.
-    /// 
-    /// ```txt
-    ///  ╒═ func A ═══════════════╕
-    ///  │ Local variables and    │
-    ///  │ saved non-volatile     │
-    ///  │ registers.             │
-    ///  ├────────────────────────┤
-    ///  │ Space for alloca,      │
-    ///  │ if relevant.           │
-    ///  ├───────┬────────────────┤
-    ///  │ Stack │ Nth            │ (1)(2) 
-    ///  │ args  ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-    ///  │       │ 5th            │
-    ///  ├───────┼────────────────┤
-    ///  │ Reg   │ R9 home (4th)  │ (3)
-    ///  │ args  ├────────────────┤
-    ///  │ homes │ R8 home (3rd)  │ 
-    ///  │       ├────────────────┤
-    ///  │       │ RDX home (2nd) │
-    ///  │       ├────────────────┤       
-    ///  │       │ RCX home (1st) │
-    ///  ├───────┴────────────────┤ ← 16-bytes align 
-    ///  │ Caller return addr     │ ← call B
-    ///  ╞═ func B ═══════════════╡ 
-    ///  │                        │
-    ///  │ ... same as above      │
-    ///  │                        │
-    ///  └────────────────────────┘
-    /// 
-    /// (1) Each slot is 8-bytes wide and aligned,
-    ///     if an argument is smaller than 8 bytes,
-    ///     it is right-aligned and if greater,
-    ///     a pointer to it is used.
-    /// (2) The number N of slots is the maximum
-    ///     number of arguments needed for a call
-    ///     in the function body.
-    /// (3) Even if less than 4 arguments are needed,
-    ///     the 4 "home" slots are guaranteed to be 
-    ///     present. They are allocated in the caller 
-    ///     but owned/used by the callee.
-    /// ```
-    /// 
+    /// Windows x64.
     Win64,
     /// For leaf function calling convention, no 
     /// argument or framing.

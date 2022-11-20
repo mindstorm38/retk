@@ -8,6 +8,7 @@
 //! It should also work with newer versions of the binary.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::time::Duration;
 
 use object::{Object, ObjectSection, Architecture, SectionKind};
@@ -19,6 +20,8 @@ pub mod symbol;
 use analyzer::{
     Analyzer, 
     BasicBlockPass,
+    FunctionFindPass,
+    FunctionAbiPass,
 };
 
 use symbol::{BasicBlock, BasicBlockExit};
@@ -47,12 +50,29 @@ pub fn analyse(data: &[u8]) {
             println!("== Analysis...");
             let mut analyzer = Analyzer::new(section_data, section_vaddr);
 
-            print!(" = BasicBlockPass... ");
+            print!(" = Basic Block pass... ");
+            std::io::stdout().flush().unwrap();
             analyzer.analyze(BasicBlockPass::default());
-            println!("done ({} basic blocks)", analyzer.database.basic_blocks.len());
+            println!("done: {} basic blocks", analyzer.database.basic_blocks.len());
 
-            println!("== Printing basic block tree for function");
-            walk_bb_tree(&analyzer.database.basic_blocks, 0x1403AF610, &mut String::new(), "func ");
+            print!(" = Function find pass... ");
+            std::io::stdout().flush().unwrap();
+            analyzer.analyze(FunctionFindPass::default());
+            println!("done: {} functions", analyzer.database.functions.len());
+
+            print!(" = Function ABI pass... ");
+            std::io::stdout().flush().unwrap();
+            analyzer.analyze(FunctionAbiPass::default());
+            println!("done");
+
+            let func = &analyzer.database.functions[&0x14047AA70];
+            analyzer.print(func.begin_ip, func.end_ip, false);
+
+
+            // println!("== Priting function asm");
+
+            // println!("== Printing basic block tree for function");
+            // walk_bb_tree(&analyzer.database.basic_blocks, 0x1400A1500, &mut String::new(), "func ");
 
             std::thread::sleep(Duration::from_secs(10));
 
@@ -81,7 +101,7 @@ fn walk_bb_tree(bbs: &HashMap<u64, BasicBlock>, ip: u64, padding: &mut String, p
             println!("jmp");
             walk_bb_tree(bbs, goto_ip, padding, "goto ");
         }
-        BasicBlockExit::Conditionnal { then_ip, else_ip } => {
+        BasicBlockExit::Conditionnal { goto_ip: then_ip, continue_ip: else_ip } => {
             println!("jcc");
             walk_bb_tree(bbs, then_ip, padding, "then ");
             walk_bb_tree(bbs, else_ip, padding, "else ");

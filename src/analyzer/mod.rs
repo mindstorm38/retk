@@ -13,8 +13,13 @@ use colored::{Color, Colorize};
 
 use crate::symbol::{BasicBlock, Function};
 
+pub mod abi;
+
 mod block;
 pub use block::BasicBlockPass;
+
+mod func;
+pub use func::{FunctionFindPass, FunctionAbiPass};
 
 
 /// A trait usable to run a pass on an [`Analyzer`].
@@ -26,33 +31,34 @@ pub trait AnalyzerPass {
 }
 
 /// A utility to analyze instructions and auto detect various symbols.
-/// This structure doesn't do anything alone, but it needs custom 
-/// [`CodePass`]
+/// This structure doesn't do anything alone, but needs custom [`CodePass`].
 pub struct Analyzer<'data> {
+    /// Runtime's data of the analyzer.
     pub runtime: AnalyzerRuntime<'data>,
-    pub database: AnalyzerDatabase<'data>,
+    /// Database of the analyzer, filled during analysis.
+    pub database: AnalyzerDatabase,
 }
 
 pub struct AnalyzerRuntime<'data> {
-    data: &'data [u8],
-    data_ip: u64,
-    decoder: Decoder<'data>,
+    /// The first instruction pointer for the first byte of data.
+    first_ip: u64,
+    /// The data decoder.
+    pub decoder: Decoder<'data>,
 }
 
-#[derive(Debug, Default)]
-pub struct AnalyzerDatabase<'data> {
+#[derive(Default)]
+pub struct AnalyzerDatabase {
     pub basic_blocks: HashMap<u64, BasicBlock>,
-    pub functions: HashMap<u64, Function<'data>>,
+    pub functions: HashMap<u64, Function>,
 }
 
 impl<'data> Analyzer<'data> {
 
-    pub fn new(data: &'data [u8], data_ip: u64) -> Self {
+    pub fn new(data: &'data [u8], first_ip: u64) -> Self {
         Self {
             runtime: AnalyzerRuntime {
-                data,
-                data_ip,
-                decoder: Decoder::with_ip(64, data, data_ip, DecoderOptions::NONE),
+                first_ip,
+                decoder: Decoder::with_ip(64, data, first_ip, DecoderOptions::NONE),
             },
             database: AnalyzerDatabase::default()
         }
@@ -68,7 +74,7 @@ impl<'data> Analyzer<'data> {
     }
 
     /// A debug method to print a range.
-    pub fn print(&mut self, from: u64, to: u64) {
+    pub fn print(&mut self, from_ip: u64, to_ip: u64, debug: bool) {
 
         let mut formatter = IntelFormatter::new();
         formatter.options_mut().set_first_operand_char_index(10);
@@ -78,16 +84,28 @@ impl<'data> Analyzer<'data> {
         let mut inst = Instruction::default();
 
         let rt = &mut self.runtime;
-        rt.reset(from);
+        rt.goto_ip(from_ip);
         
-        while rt.decoder.can_decode() && (rt.decoder.position() as u64) < to {
+        while rt.decoder.can_decode() && rt.decoder.ip() < to_ip {
 
             rt.decoder.decode_out(&mut inst);
 
             line.init();
             formatter.format(&inst, &mut line);
             println!("{:016X} {}", inst.ip(), line.buffer);
-            println!("  {:?}, base={:?}, off={}, off-scale={:?}", inst.code(), inst.memory_base(), inst.memory_displacement64(), inst.memory_index_scale());
+
+            if debug {
+                println!("  {:?}, base={:?}, off={}, off_scale={:?}, registers=[{:?}, {:?}, {:?}, {:?}]", 
+                    inst.code(), 
+                    inst.memory_base(), 
+                    inst.memory_displacement64() as i64, 
+                    inst.memory_index_scale(), 
+                    inst.op0_register(),
+                    inst.op1_register(),
+                    inst.op2_register(),
+                    inst.op3_register(),
+                );
+            }
 
         }
 
@@ -97,31 +115,23 @@ impl<'data> Analyzer<'data> {
 
 impl<'data> AnalyzerRuntime<'data> {
 
-    /// Reset the decoder to an absolute data position.
-    pub fn reset(&mut self, pos: u64) {
-        self.decoder.set_position(pos as usize).unwrap();
-        self.decoder.set_ip(pos + self.data_ip);
+    #[inline]
+    pub fn first_ip(&self) -> u64 {
+        self.first_ip
     }
 
     #[inline]
-    pub fn data_ip(&self) -> u64 {
-        self.data_ip
+    pub fn last_ip(&self) -> u64 {
+        self.first_ip + self.decoder.max_position() as u64
     }
 
-    #[inline]
-    pub fn data(&self) -> &'data [u8] {
-        self.data
-    }
-
-    #[inline]
-    pub fn data_len(&self) -> usize {
-        self.data.len()
-    }
-
-    #[inline]
-    pub fn data_ip_range(&self, ip: u64, len: u64) -> &'data [u8] {
-        let offset = (ip - self.data_ip) as usize;
-        &self.data[offset..][..len as usize]
+    /// Reset the decoder to a given instruction pointer.
+    #[track_caller]
+    pub fn goto_ip(&mut self, ip: u64) {
+        debug_assert!(ip >= self.first_ip(), "min ip reached: {ip}");
+        debug_assert!(ip < self.last_ip(), "max ip reached: {ip}");
+        self.decoder.set_position((ip - self.first_ip) as usize).unwrap();
+        self.decoder.set_ip(ip);
     }
 
 }
@@ -131,8 +141,8 @@ impl<'data> AnalyzerRuntime<'data> {
 /// You can also define a function to run before and after analysis.
 pub trait AnalyzerStepPass {
 
-    /// Analyze an instruction and update the internal pass' state machine.
-    fn accept(&mut self, analyzer: &mut Analyzer, inst: &Instruction);
+    /// Feed the pass with an instruction.
+    fn feed(&mut self, analyzer: &mut Analyzer, inst: &Instruction);
 
     /// Called before analysis.
     #[allow(unused)]
@@ -151,11 +161,11 @@ impl<P: AnalyzerStepPass> AnalyzerPass for P {
         self.before(&mut *analyzer);
 
         let mut inst = Instruction::default();
-        analyzer.runtime.reset(0);
+        analyzer.runtime.goto_ip(analyzer.runtime.first_ip);
 
         while analyzer.runtime.decoder.can_decode() {
             analyzer.runtime.decoder.decode_out(&mut inst);
-            self.accept(&mut *analyzer, &inst);
+            self.feed(&mut *analyzer, &inst);
         }
 
         self.after(&mut *analyzer);

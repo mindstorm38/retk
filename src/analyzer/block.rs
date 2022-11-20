@@ -1,10 +1,5 @@
 //! # Basic Block Analysis implementation.
-//! The goal of this pass is to 
-//! Instructions are fetched only once in this pass.
-//! 
-//! ## Algorithm
-//! We walk through each instruction in the analyzer's code
-//! and 
+//! See [`BasicBlockPass`] structure.
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -69,8 +64,8 @@ pub struct BasicBlockPass {
 struct IncompleteBlock {
     /// The beginning Instruction Position for the future basic block.
     begin_ip: u64,
-    /// Number of calls to this block.
-    calls_count: u32,
+    /// True if this block is called.
+    function: bool,
     /// The exit statement that should be defined for the the previous block.
     prev_exit: BasicBlockExit,
 }
@@ -87,7 +82,7 @@ impl BasicBlockPass {
                 let idx = self.blocks.len();
                 self.blocks.push(IncompleteBlock {
                     begin_ip,
-                    calls_count: 0,
+                    function: false,
                     // New blocs set the previous exit to unconditionnaly jump to 
                     // themself, this will be override if a jump precede this block.
                     prev_exit: BasicBlockExit::Unconditionnal { goto_ip: begin_ip }
@@ -104,7 +99,7 @@ impl BasicBlockPass {
 
 impl AnalyzerStepPass for BasicBlockPass {
 
-    fn accept(&mut self, _analyzer: &mut Analyzer, inst: &Instruction) {
+    fn feed(&mut self, analyzer: &mut Analyzer, inst: &Instruction) {
 
         // We only cover x86_64 jumps/calls for now.
         let (target_ip, cond, call) = match inst.code() {
@@ -116,6 +111,7 @@ impl AnalyzerStepPass for BasicBlockPass {
             code if code.is_jcc_short_or_near() 
                                 => (inst.near_branch64(), true, false),
             // Procedure calls
+            Code::Call_rel16    => (inst.near_branch64(), false, true),
             Code::Call_rel32_64 => (inst.near_branch64(), false, true),
             Code::Call_rm64     => return, 
             Code::Retnq         => (0,                    false, false),
@@ -123,12 +119,17 @@ impl AnalyzerStepPass for BasicBlockPass {
             _ => return,
         };
 
+        if target_ip < analyzer.runtime.first_ip() || target_ip >= analyzer.runtime.last_ip() {
+            // For now, we ignore targets that are out of code's range.
+            return;
+        }
+
         // Update the targetted basic block with entries addresses.
         // Target IP=0 if the destination is not statically known.
         if target_ip != 0 {
             let target_bb = self.ensure_basic_block(target_ip);
             if call {
-                target_bb.calls_count += 1;
+                target_bb.function = true;
             }
         }
 
@@ -147,8 +148,8 @@ impl AnalyzerStepPass for BasicBlockPass {
             next_bb.prev_exit = BasicBlockExit::Unknown;
         } else if cond {
             next_bb.prev_exit = BasicBlockExit::Conditionnal { 
-                then_ip: target_ip, 
-                else_ip: next_ip,
+                goto_ip: target_ip, 
+                continue_ip: next_ip,
             };
         } else {
             next_bb.prev_exit = BasicBlockExit::Unconditionnal { 
@@ -175,7 +176,7 @@ impl AnalyzerStepPass for BasicBlockPass {
 
         // These are initially set to an imaginary bblock on the EOF.
         let mut next_exit = BasicBlockExit::Unknown;
-        let mut next_ip = analyzer.runtime.data_ip() + analyzer.runtime.data_len() as u64;
+        let mut next_ip = analyzer.runtime.first_ip + analyzer.runtime.decoder.max_position() as u64;
 
         let mut cross_refs = Vec::with_capacity(blocks_len);
 
@@ -186,8 +187,8 @@ impl AnalyzerStepPass for BasicBlockPass {
                 BasicBlockExit::Unconditionnal { goto_ip } => {
                     cross_refs.push((block.begin_ip, goto_ip, 0));
                 },
-                BasicBlockExit::Conditionnal { then_ip, else_ip } => {
-                    cross_refs.push((block.begin_ip, then_ip, else_ip));
+                BasicBlockExit::Conditionnal { goto_ip, continue_ip } => {
+                    cross_refs.push((block.begin_ip, goto_ip, continue_ip));
                 },
                 BasicBlockExit::Unknown => {},
             }
@@ -196,8 +197,8 @@ impl AnalyzerStepPass for BasicBlockPass {
                 begin_ip: block.begin_ip, 
                 end_ip: next_ip, 
                 entries_from: Vec::new(), 
-                entries_count: block.calls_count, 
-                calls_count: block.calls_count, 
+                entries_count: 0, 
+                function: block.function, 
                 exit: next_exit
             });
 
@@ -207,17 +208,18 @@ impl AnalyzerStepPass for BasicBlockPass {
         }
 
         // The last pass compute back references to callers.
-        // SAFETY: We can unwrap because we expect the goto blocks to be defined.
         for (from_ip, goto0, goto1) in cross_refs {
 
-            let bb0 = analyzer.database.basic_blocks.get_mut(&goto0).unwrap();
-            bb0.entries_count += 1;
-            bb0.entries_from.push(from_ip);
+            if let Some(bb0) = analyzer.database.basic_blocks.get_mut(&goto0) {
+                bb0.entries_count += 1;
+                bb0.entries_from.push(from_ip);
+            }
 
             if goto1 != 0 {
-                let bb1 = analyzer.database.basic_blocks.get_mut(&goto1).unwrap();
-                bb1.entries_count += 1;
-                bb1.entries_from.push(from_ip);
+                if let Some(bb1) = analyzer.database.basic_blocks.get_mut(&goto1) {
+                    bb1.entries_count += 1;
+                    bb1.entries_from.push(from_ip);
+                }
             }
 
         }
