@@ -87,23 +87,6 @@ impl fmt::Debug for BasicBlockExit {
     }
 }
 
-// /// Conditional for a basic block exit statement.
-// #[derive(Debug, Clone)]
-// pub enum BasicBlockExitCondition {
-//     UnsignedGreater,
-//     UnsignedGreaterOrEqual,
-//     UnsignedLower,
-//     UnsignedLowerOrEqual,
-//     /// Jump if carry flag = 1
-//     Carry,
-//     /// Jump if CX = 0
-//     CxZero,
-//     /// Jump if ECX = 0
-//     EcxZero,
-//     /// Jump if RCX = 0
-//     RcxZero,
-// }
-
 /// Function symbol details, signature and return types.
 #[derive(Debug, Clone)]
 pub struct Function {

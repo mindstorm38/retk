@@ -3,17 +3,21 @@
 
 use std::collections::{HashMap, HashSet};
 
-use iced_x86::{Instruction, Code, Register};
-
 use crate::symbol::{BasicBlock, BasicBlockExit, Function, Abi};
 
 use super::{Analyzer, AnalyzerPass};
-use super::abi;
 
 
-/// First pass of functions definition, searching for contiguous 
-/// basic blocks and marking all basic blocks that are jumped-to
-/// by tail/thunk calls.
+/// This pass tries to find all function. A function, as defined by
+/// this pass, consists of a group of contiguous basic blocks where
+/// the first basic block is called (defined below) by other basic
+/// blocks of code.
+/// 
+/// A call to a function can be detected either by a `call` instruction
+/// to an statically-known address and basic block, or a `jmp`/`jcc` 
+/// instruction to an statically-known address that is out of the scope
+/// of the currently analyzed function (before the function's IP or to
+/// a non-contiguous basic block after the function).
 #[derive(Default)]
 pub struct FunctionFindPass { }
 
@@ -55,91 +59,6 @@ impl AnalyzerPass for FunctionFindPass {
             new_functions.extend(func_resolver.iter_called_bbs());
             for bb_ip in &new_functions {
                 analyzer.database.basic_blocks.get_mut(bb_ip).unwrap().function = true;
-            }
-
-        }
-
-    }
-
-}
-
-
-#[derive(Default)]
-pub struct FunctionAbiPass { }
-
-impl AnalyzerPass for FunctionAbiPass {
-
-    fn analyze(&mut self, analyzer: &mut Analyzer) {
-
-        let mut frame_analyzer = FrameAnalyzer::new();
-        let mut inst = Instruction::new();
-
-        // List of basic blocks already analyzed.
-        let mut done_bbs = HashSet::new();
-
-        for func in analyzer.database.functions.values() {
-            
-            frame_analyzer.clear();
-            done_bbs.clear();
-
-            let mut bb = &analyzer.database.basic_blocks[&func.begin_ip];
-
-            'main: 
-            loop {
-
-                analyzer.runtime.goto_ip(bb.begin_ip);
-                done_bbs.insert(bb.begin_ip);
-
-                while analyzer.runtime.decoder.can_decode() && analyzer.runtime.decoder.ip() < bb.end_ip {
-                    
-                    analyzer.runtime.decoder.decode_out(&mut inst);
-                    
-                    // Calls to another procedures stops the frame analysis, 
-                    // because we want to analyze regiters and stack as-is
-                    // without external modifications.
-                    match inst.code() {
-                        Code::Call_rel16 |
-                        Code::Call_rel32_64 |
-                        Code::Call_rm16 |
-                        Code::Call_rm32 |
-                        Code::Call_rm64 |
-                        Code::Call_m1616 |
-                        Code::Call_m1632 |
-                        Code::Call_m1664 => {
-                            break 'main;
-                        }
-                        _ => {}
-                    }
-
-                    frame_analyzer.feed(&inst);
-
-                }
-
-                match bb.exit {
-                    BasicBlockExit::Unconditionnal { goto_ip } => {
-                        let next_bb = &analyzer.database.basic_blocks[&goto_ip];
-                        if next_bb.function || done_bbs.contains(&goto_ip) {
-                            // Same comment as above, we can't accurately analyze
-                            // the register and stack usage after a call.
-                            break;
-                        } else {
-                            bb = next_bb;
-                        }
-                    }
-                    BasicBlockExit::Conditionnal { continue_ip, .. } => {
-                        // Note: For now we only explore the continue branch.
-                        // In the future we may need to explore all branch and merge
-                        // the frame analyzer afterward.
-                        bb = &analyzer.database.basic_blocks[&continue_ip];
-                    }
-                    BasicBlockExit::Unknown => break 'main
-                }
-                
-            }
-
-            if func.begin_ip == 0x14047AA70 {
-                println!("Frame analysis:");
-                println!("{frame_analyzer:#?}");
             }
 
         }
@@ -250,143 +169,4 @@ impl<'db> FunctionTreeResolver<'db> {
         self.called_bbs.iter().copied()
     }
 
-}
-
-
-/// A primitive analyzer for stack and register that can help
-/// defining the framing and calling convention of a function.
-#[derive(Debug)]
-pub struct FrameAnalyzer {
-    /// For each register used in the code, store how it
-    /// is volatile or not.
-    register_usage: HashMap<Register, RegisterUsage>,
-    /// Current stack length from its base.
-    stack_len: u32,
-    /// The maximum stack length (see [`FrameAnalyzer::stack_len`]).
-    max_stack_len: u32,
-}
-
-impl FrameAnalyzer {
-
-    pub fn new() -> Self {
-        Self {
-            register_usage: HashMap::new(),
-            stack_len: 0,
-            max_stack_len: 0,
-        }
-    }
-
-    pub fn clear(&mut self) {
-        self.register_usage.clear();
-        self.stack_len = 0;
-        self.max_stack_len = 0;
-    }
-
-    fn update_max_stack_len(&mut self) {
-        self.max_stack_len = self.max_stack_len.max(self.stack_len);
-    }
-
-    /// Feed the analyzer with an instruction.
-    pub fn feed(&mut self, inst: &Instruction) {
-
-        match inst.code() {
-            Code::Mov_rm64_r64 | 
-            Code::Mov_rm32_r32 | 
-            Code::Mov_rm16_r16 if inst.memory_base() == Register::RSP => {
-                
-                // The instruction manipulate a register and save it to the stack.
-                let reg = inst.op1_register().info();
-                let reg_len = reg.size() as u8;
-                let rsp_off = self.stack_len as i64 + inst.memory_displacement64() as i64;
-
-                // Only get the full register (CX | ECX -> RCX) when saving the register
-                // usage.
-                self.register_usage.entry(reg.full_register())
-                    .or_insert_with(|| RegisterUsage::StackSaved {
-                        offset: rsp_off,
-                        len: reg_len,
-                    });
-
-            }
-            Code::Push_r16 | 
-            Code::Push_r32 | 
-            Code::Push_r64 => {
-
-                let reg = inst.op0_register().info();
-                let reg_len = reg.size() as u8;
-                self.stack_len += reg_len as u32;
-                let rsp_off = self.stack_len;
-                self.update_max_stack_len();
-
-                self.register_usage.entry(reg.full_register())
-                    .or_insert_with(|| RegisterUsage::StackSaved { 
-                        offset: -(rsp_off as i64), 
-                        len: reg_len,
-                    });
-
-            }
-            Code::Sub_rm64_imm8 | 
-            Code::Sub_rm64_imm32 
-            if inst.memory_base() == Register::None && inst.op0_register() == Register::RSP => {
-                self.stack_len += inst.immediate32();
-                self.update_max_stack_len();
-            }
-            Code::Add_rm64_imm8 |
-            Code::Add_rm64_imm32
-            if inst.memory_base() == Register::None && inst.op0_register() == Register::RSP => {
-                self.stack_len = self.stack_len.saturating_sub(inst.immediate32());
-            }
-            _ => {
-
-                if inst.op1_register() != Register::None {
-
-                    // The register is likely a source.
-                    let reg = inst.op1_register().info();
-                    let reg_len = reg.size() as u8;
-                    self.register_usage.entry(reg.full_register())
-                        .or_insert_with(|| RegisterUsage::Read {
-                            len: reg_len,
-                        });
-
-                }
-
-                if inst.op0_register() != Register::None {
-
-                    // In this case the register is a destination, so if it's the
-                    // first write to this register, it is volatile.
-                    let reg = inst.op0_register().info();
-                    self.register_usage.entry(reg.full_register())
-                        .or_insert_with(|| RegisterUsage::Overriden);
-    
-                }
-
-            }
-        }
-
-    }
-
-}
-
-/// Describe how register is handled by a block of code.
-#[derive(Debug)]
-pub enum RegisterUsage {
-    /// The register is overriden without being saved, therefore all callers
-    /// should've save this register if they are using it.
-    Overriden,
-    /// The first operation on this register is a read by an instruction.
-    Read {
-        /// How many bytes were read from the register.
-        len: u8,
-    },
-    /// The register is saved in stack before being overriden, callers don't
-    /// have to save it, but they expect it to be untouched when returning
-    /// to them.
-    StackSaved {
-        /// Offset within the stack where the register has been saved in the
-        /// first place. This offset is calculated from the frame's base 
-        /// (starting at 0).
-        offset: i64,
-        /// How many bytes were saved at the stack offset.
-        len: u8,
-    },
 }

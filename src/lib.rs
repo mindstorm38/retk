@@ -16,6 +16,9 @@ use object::read::pe::PeFile64;
 
 pub mod analyzer;
 pub mod symbol;
+pub mod idr;
+
+pub mod x86;
 
 use analyzer::{
     Analyzer, 
@@ -25,6 +28,10 @@ use analyzer::{
 };
 
 use symbol::{BasicBlock, BasicBlockExit};
+
+use x86::X86IdrAnalyzer;
+
+use crate::idr::{IdrAnalyzer, IdrStatement};
 
 
 pub fn analyse(data: &[u8]) {
@@ -60,13 +67,32 @@ pub fn analyse(data: &[u8]) {
             analyzer.analyze(FunctionFindPass::default());
             println!("done: {} functions", analyzer.database.functions.len());
 
-            print!(" = Function ABI pass... ");
-            std::io::stdout().flush().unwrap();
-            analyzer.analyze(FunctionAbiPass::default());
-            println!("done");
+            // print!(" = Function ABI pass... ");
+            // std::io::stdout().flush().unwrap();
+            // analyzer.analyze(FunctionAbiPass::default());
+            // println!("done");
 
-            let func = &analyzer.database.functions[&0x14047AA70];
-            analyzer.print(func.begin_ip, func.end_ip, false);
+            let func = &analyzer.database.functions[&0x141F31D20];
+            let begin_ip = func.begin_ip;
+            let end_ip = func.end_ip;
+            analyzer.print(begin_ip, end_ip, true);
+
+            analyzer.runtime.goto_ip(begin_ip);
+            let mut idr_analyzer = X86IdrAnalyzer::new(&mut analyzer.runtime.decoder);
+            let mut idr_stmt = IdrStatement::default();
+            loop {
+                let ip = idr_analyzer.ip();
+                if ip > end_ip {
+                    break;
+                }
+                print!("{ip:010X} ");
+                idr_analyzer.decode(&mut idr_stmt);
+                if let IdrStatement::Assign { place, .. } = idr_stmt {
+                    let place_ty = idr_analyzer.place_type(place);
+                    print!("{place_ty} ");
+                }
+                println!("{idr_stmt}");
+            }
 
 
             // println!("== Priting function asm");

@@ -104,33 +104,36 @@ impl AnalyzerStepPass for BasicBlockPass {
         // We only cover x86_64 jumps/calls for now.
         let (target_ip, cond, call) = match inst.code() {
             // Unconditionnal jumps
-            Code::Jmp_rel8_64   => (inst.near_branch64(), false, false),
+            Code::Jmp_rel8_64 |
             Code::Jmp_rel32_64  => (inst.near_branch64(), false, false),
             Code::Jmp_rm64      => (0,                    false, false),
             // Conditional jumps
             code if code.is_jcc_short_or_near() 
                                 => (inst.near_branch64(), true, false),
             // Procedure calls
-            Code::Call_rel16    => (inst.near_branch64(), false, true),
+            Code::Call_rel16 |
             Code::Call_rel32_64 => (inst.near_branch64(), false, true),
             Code::Call_rm64     => return, 
-            Code::Retnq         => (0,                    false, false),
+            Code::Retnq |
+            Code::Retnq_imm16   => (0,                    false, false),
             // Unhandled
             _ => return,
         };
 
-        if target_ip < analyzer.runtime.first_ip() || target_ip >= analyzer.runtime.last_ip() {
-            // For now, we ignore targets that are out of code's range.
-            return;
-        }
-
         // Update the targetted basic block with entries addresses.
         // Target IP=0 if the destination is not statically known.
         if target_ip != 0 {
+
+            // For now, we ignore targets that are out of code's range.
+            if target_ip < analyzer.runtime.first_ip() || target_ip >= analyzer.runtime.last_ip() {
+                return;
+            }
+
             let target_bb = self.ensure_basic_block(target_ip);
             if call {
                 target_bb.function = true;
             }
+
         }
 
         // Don't cut the current basic block for calls.

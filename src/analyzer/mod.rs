@@ -6,20 +6,21 @@ use std::fmt::Write;
 
 use iced_x86::{
     Instruction, Decoder, DecoderOptions, 
-    Formatter, IntelFormatter, FormatterOutput, FormatterTextKind,
+    Formatter, IntelFormatter, FormatterOutput, FormatterTextKind, Register,
 };
 
 use colored::{Color, Colorize};
 
 use crate::symbol::{BasicBlock, Function};
 
-pub mod abi;
-
 mod block;
-pub use block::BasicBlockPass;
-
 mod func;
-pub use func::{FunctionFindPass, FunctionAbiPass};
+mod abi;
+mod dec;
+
+pub use block::BasicBlockPass;
+pub use func::FunctionFindPass;
+pub use abi::FunctionAbiPass;
 
 
 /// A trait usable to run a pass on an [`Analyzer`].
@@ -88,23 +89,34 @@ impl<'data> Analyzer<'data> {
         
         while rt.decoder.can_decode() && rt.decoder.ip() < to_ip {
 
+            let inst_ip = rt.decoder.ip();
             rt.decoder.decode_out(&mut inst);
 
             line.init();
             formatter.format(&inst, &mut line);
-            println!("{:016X} {}", inst.ip(), line.buffer);
+
+            if let Some(bb) = self.database.basic_blocks.get(&inst_ip) {
+                println!("{inst_ip:016X} bb_{:08X}:", bb.begin_ip);
+            }
+
+            println!("{inst_ip:016X}     {}", line.buffer);
 
             if debug {
-                println!("  {:?}, base={:?}, off={}, off_scale={:?}, registers=[{:?}, {:?}, {:?}, {:?}]", 
-                    inst.code(), 
-                    inst.memory_base(), 
-                    inst.memory_displacement64() as i64, 
-                    inst.memory_index_scale(), 
-                    inst.op0_register(),
-                    inst.op1_register(),
-                    inst.op2_register(),
-                    inst.op3_register(),
-                );
+                // println!("                     {:?}, base={:?}, off={}, off_scale={:?}, ops=[{:?} ({:?}), {:?} ({:?}), {:?} ({:?}), {:?} ({:?})]", 
+                //     inst.code(), 
+                //     inst.memory_base(), 
+                //     inst.memory_displacement64() as i64, 
+                //     inst.memory_index_scale(),
+                //     inst.op0_kind(),
+                //     inst.op0_register(),
+                //     inst.op1_kind(),
+                //     inst.op1_register(),
+                //     inst.op2_kind(),
+                //     inst.op2_register(),
+                //     inst.op3_kind(),
+                //     inst.op3_register(),
+                // );
+                println!("                     {inst:?}");
             }
 
         }
