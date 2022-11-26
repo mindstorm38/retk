@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::time::Duration;
 
+use iced_x86::Instruction;
 use object::{Object, ObjectSection, Architecture, SectionKind};
 use object::read::pe::PeFile64;
 
@@ -29,9 +30,9 @@ use analyzer::{
 
 use symbol::{BasicBlock, BasicBlockExit};
 
-use x86::X86IdrAnalyzer;
+use x86::IdrDecoder;
 
-use crate::idr::{IdrAnalyzer, IdrStatement};
+use crate::idr::IdrStatement;
 
 
 pub fn analyse(data: &[u8]) {
@@ -77,21 +78,17 @@ pub fn analyse(data: &[u8]) {
             let end_ip = func.end_ip;
             analyzer.print(begin_ip, end_ip, true);
 
+            let mut idr_analyzer = IdrDecoder::new();
+            let mut inst = Instruction::new();
+
             analyzer.runtime.goto_ip(begin_ip);
-            let mut idr_analyzer = X86IdrAnalyzer::new(&mut analyzer.runtime.decoder);
-            let mut idr_stmt = IdrStatement::default();
-            loop {
-                let ip = idr_analyzer.ip();
-                if ip > end_ip {
-                    break;
-                }
-                print!("{ip:010X} ");
-                idr_analyzer.decode(&mut idr_stmt);
-                if let IdrStatement::Assign { place, .. } = idr_stmt {
-                    let place_ty = idr_analyzer.place_type(place);
-                    print!("{place_ty} ");
-                }
-                println!("{idr_stmt}");
+            while analyzer.runtime.decoder.can_decode() && analyzer.runtime.decoder.ip() < end_ip {
+                analyzer.runtime.decoder.decode_out(&mut inst);
+                idr_analyzer.feed(&inst);
+            }
+
+            for stmt in &idr_analyzer.function.statements {
+                println!("{stmt}");
             }
 
 

@@ -3,281 +3,438 @@
 
 use std::collections::VecDeque;
 
-use iced_x86::{Decoder, Instruction, Code, Register};
+use iced_x86::{Instruction, Code, Register, ConditionCode};
 
-use crate::idr::{IdrAnalyzer, IdrStatement, IdrExpression, IdrType};
+use crate::idr::{
+    IdrStatement, IdrExpression, 
+    IdrVarFactory, IdrVar, IdrFunction, IdrCondition, IdrType,
+};
 
 
-pub struct X86IdrAnalyzer<'dec, 'data> {
-    /// The x86 decoder for decoding machine instructions. 
-    decoder: &'dec mut Decoder<'data>,
-    /// Cached instruction.
-    inst: Instruction,
-    /// Internal data.
-    data: AnalyzerData,
-    /// If some instructions are too complicated to fit in
-    /// a single statement, the additionnal statements are
-    /// pushed to this vector and poped later decoding.
-    pending_stmts: VecDeque<IdrStatement>,
+#[inline]
+fn new_ptr_type(pointed_type: IdrType) -> IdrType {
+    IdrType::Pointer(Box::new(pointed_type), 8)
 }
 
-impl<'dec, 'data> X86IdrAnalyzer<'dec, 'data> {
 
-    pub fn new(decoder: &'dec mut Decoder<'data>) -> Self {
-        Self {
-            decoder,
-            inst: Instruction::new(),
-            data: AnalyzerData::default(),
-            pending_stmts: VecDeque::new(),
-        }
-    }
-
-    pub fn ip(&self) -> u64 {
-        self.decoder.ip()
-    }
-    
+/// A x86 Intermediate Decompilation Representation decoder. 
+/// It needs to be fed with raw x86 instructions and will
+/// internally produce an [`IdrFunction`]. This function
+/// can later be optimized and retyped before actually
+/// producing a more human-readable pseudo-code.
+#[derive(Default)]
+pub struct IdrDecoder {
+    /// Internal registers to track variables binding.
+    registers: AnalyzerRegisters,
+    /// Internal stack to track variables binding.
+    stack: AnalyzerStack,
+    /// Internal factory to create unique variables.
+    var_factory: IdrVarFactory,
+    /// Last comparison, used when a condition (jmp, mov, etc.) is decoded.
+    cmp: Option<AnalyzerCmp>,
+    /// Internal function being decoded.
+    pub function: IdrFunction,
 }
 
-impl<'dec, 'data> IdrAnalyzer for X86IdrAnalyzer<'dec, 'data> {
+impl IdrDecoder {
 
-    fn decode(&mut self, dst: &mut IdrStatement) {
-        
-        if let Some(stmt) = self.pending_stmts.pop_front() {
-            *dst = stmt;
-            return;
-        }
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-        if !self.decoder.can_decode() {
-            *dst = IdrStatement::Error;
-            return;
-        }
-
-        let inst = &mut self.inst;
-        let data = &mut self.data;
-        self.decoder.decode_out(inst);
-
+    pub fn feed(&mut self, inst: &Instruction) {
         match inst.code() {
+            Code::Nopw |
+            Code::Nopd |
+            Code::Nopq |
+            Code::Nop_rm16 |
+            Code::Nop_rm32 |
+            Code::Nop_rm64 => {}
             Code::Push_r64 |
             Code::Push_r32 |
-            Code::Push_r16 => data.decode_push_r(inst),
+            Code::Push_r16 => self.decode_push_r(inst),
+            Code::Pop_r64 |
+            Code::Pop_r32 |
+            Code::Pop_r16 => self.decode_pop_r(inst),
+            Code::Add_rm64_imm8 |
+            Code::Add_rm32_imm8 |
+            Code::Add_rm16_imm8 |
+            Code::Add_rm8_imm8 |
+            Code::Add_rm64_imm32 |
+            Code::Add_rm32_imm32 |
+            Code::Add_rm16_imm16 => self.decode_arith_rm_imm(inst, AnalyzerArithOp::Add),
             Code::Sub_rm64_imm8 |
-            Code::Sub_rm64_imm32 => data.decode_sub_rm_imm(inst),
+            Code::Sub_rm32_imm8 |
+            Code::Sub_rm16_imm8 |
+            Code::Sub_rm8_imm8 |
+            Code::Sub_rm64_imm32 |
+            Code::Sub_rm32_imm32 |
+            Code::Sub_rm16_imm16 => self.decode_arith_rm_imm(inst, AnalyzerArithOp::Sub),
             Code::Mov_r64_rm64 |
             Code::Mov_r32_rm32 |
-            Code::Mov_r16_rm16 => {
-
-                let reg0 = inst.op0_register();
-                let reg0_place = data.create_register_place(reg0);
-
-                let reg1 = inst.op1_register();
-                if reg1 == Register::None {
-                    
-                    let mem_reg = inst.memory_base();
-                    let mem_reg_place = data.ensure_register_place(mem_reg);
-                    let mem_displ = inst.memory_displacement64() as i64;
-                    // let mem_scale = inst.memory_index_scale();
-                    // let mem_index = inst.memory_index();
-
-                    *dst = IdrStatement::Assign { 
-                        place: reg0_place, 
-                        expr: IdrExpression::Deref { 
-                            offset: mem_displ, 
-                            base: mem_reg_place,
-                        }
-                    };
-                    
-                } else {
-                    let reg1_place = data.ensure_register_place(reg1);
-                    *dst = IdrStatement::Assign { 
-                        place: reg0_place, 
-                        expr: IdrExpression::Copy(reg1_place),
-                    };
-                }
-
-            }
+            Code::Mov_r16_rm16 => self.decode_mov_r_rm(inst),
+            Code::Mov_r64_imm64 |
+            Code::Mov_r32_imm32 |
+            Code::Mov_r16_imm16 => self.decode_mov_r_imm(inst),
+            Code::Call_rel16 |
+            Code::Call_rel32_32 |
+            Code::Call_rel32_64 => self.decode_call_rel(inst),
             Code::Call_rm64 |
             Code::Call_rm32 |
-            Code::Call_rm16 => {
-                
-                let ret_place = data.places.create_integer(8);
-
-                let reg0 = inst.op0_register();
-                if reg0 == Register::None {
-
-                } else {
-                    let reg0_place = data.ensure_register_place(reg0);
-                    *dst = IdrStatement::Assign { 
-                        place: ret_place, 
-                        expr: IdrExpression::CallIndirect { 
-                            addr_place: reg0_place, 
-                            args_places: Vec::new(),
-                        }
-                    };
-                }
-
-            }
+            Code::Call_rm16 => self.decode_call_rm(inst),
+            Code::Cmp_rm64_imm8 |
+            Code::Cmp_rm32_imm8 |
+            Code::Cmp_rm16_imm8 |
+            Code::Cmp_rm64_imm32 |
+            Code::Cmp_rm32_imm32 |
+            Code::Cmp_rm16_imm16 => self.decode_cmp_rm_imm(inst),
+            Code::Test_rm64_r64 |
+            Code::Test_rm32_r32 |
+            Code::Test_rm16_r16 |
+            Code::Test_rm8_r8 => self.decode_test_rm_r(inst),
+            code if code.is_jcc_short_or_near() => self.decode_jcc(inst),
             _ => {
-                *dst = IdrStatement::Error;
+                self.function.statements.push(IdrStatement::Error);
             }
         }
-
     }
 
-    fn place_type(&self, place: u32) -> &IdrType {
-        self.data.places.get_type(place)
-    }
-
-    
-
-}
-
-
-#[derive(Debug, Default)]
-struct AnalyzerData {
-    places: AnalyzerPlaces,
-    registers: AnalyzerRegisters,
-    stack: AnalyzerStack,
-    /// Currently decoded statements.
-    statements: VecDeque<IdrStatement>,
-}
-
-impl AnalyzerData {
-
-    /// Ensure that a register has a place, if it's not the case,
-    /// a new place is created with a type set to an integer that
-    /// has the same bytes count as the register.
-    /// 
-    /// The place is returned together with a boolean that indicates
-    /// weither or not the place has just been created.
-    fn ensure_register_place(&mut self, register: Register) -> u32 {
-        if let Some(place) = self.registers.get_place(register) {
-            place
-        } else {
-            let size = register.size() as u16;
-            let place = self.places.create(IdrType::Integer(size, size), true);
-            self.registers.set_place(register, place);
-            place
-        }
-    }
-
-    /// Create a new place initially bound to the register.
-    fn create_register_place(&mut self, register: Register) -> u32 {
-        let place = self.places.create_integer(register.size());
-        self.registers.set_place(register, place);
-        place
+    #[inline]
+    fn push_stmt(&mut self, stmt: IdrStatement) {
+        self.function.statements.push(stmt);
     }
 
     /// Internal function to enqueue a statement
-    #[inline]
-    fn enqueue_assign(&mut self, place: u32, expr: IdrExpression) {
-        self.statements.push_back(IdrStatement::Assign { 
-            place, 
-            expr,
-        });
+    fn push_assign(&mut self, var: IdrVar, ty: IdrType, expr: IdrExpression) {
+        self.push_stmt(IdrStatement::Assign { var, ty, expr });
     }
 
-    fn decode_mem_addr(&mut self, inst: &Instruction) -> IdrExpression {
+    fn push_store(&mut self, pointer: IdrVar, var: IdrVar) {
+        self.push_stmt(IdrStatement::Store { pointer, var });
+    }
 
-        let mem_reg = inst.memory_base();
-        let mem_reg_place = self.ensure_register_place(mem_reg);
-        let mem_displ = inst.memory_displacement64() as i64;
-        // let mem_scale = inst.memory_index_scale();
-        // let mem_index = inst.memory_index();
+    fn push_branch(&mut self, pointer: u64, left_var: IdrVar, right_var: IdrVar, cond: IdrCondition) {
+        self.function.statements.push(IdrStatement::Branch { 
+            pointer, 
+            left_var, 
+            right_var, 
+            cond,
+        })
+    }
 
-        IdrExpression::Deref { 
-            offset: mem_displ, 
-            base: mem_reg_place,
+    /// Ensure that a variable is bound to the given register.
+    /// If the register is not yet bound, it is bound to a
+    /// newly created variable. In such case the variable is
+    /// "externally bound", it can be a non-volatile register
+    /// being saved or a parameter being passed.
+    fn decode_read_register(&mut self, register: Register) -> IdrVar {
+        if let Some(var) = self.registers.get_var(register) {
+            var
+        } else {
+            let var = self.var_factory.create();
+            self.registers.set_var(register, var);
+            var
         }
+    }
+
+    /// Create a new variable bound to the register.
+    fn decode_write_register(&mut self, register: Register) -> IdrVar {
+        let var = self.var_factory.create();
+        self.registers.set_var(register, var);
+        var
+    }
+
+    /// Decode an instruction's memory addressing operand and return
+    /// the variable where the final address is stored. This variable
+    /// can later be used for deref or store.
+    fn decode_mem_addr(&mut self, inst: &Instruction) -> (IdrVar, u16) {
+
+        let mem_base_reg = inst.memory_base();
+        let mut var = self.decode_read_register(mem_base_reg);
+
+        let mem_displ = inst.memory_displacement64() as i64;
+        if mem_displ != 0 {
+            let new_var = self.var_factory.create();
+            self.push_assign(new_var, new_ptr_type(IdrType::VOID), IdrExpression::AddImm(var, mem_displ));
+            var = new_var;
+        }
+
+        let mem_index_reg = inst.memory_index();
+        if mem_index_reg != Register::None {
+
+            let mut index_var = self.decode_read_register(mem_index_reg);
+
+            let mem_scale = inst.memory_index_scale();
+            if mem_scale != 1 {
+                let new_var = self.var_factory.create();
+                self.push_assign(new_var, new_ptr_type(IdrType::VOID), IdrExpression::MulImm(index_var, mem_scale as i64));
+                index_var = new_var;
+            }
+
+            let new_var = self.var_factory.create();
+            self.push_assign(new_var,  new_ptr_type(IdrType::VOID), IdrExpression::Add(var, index_var));
+            var = new_var;
+
+        }
+
+        (var, inst.memory_size().size() as u16)
 
     }
 
     fn decode_push_r(&mut self, inst: &Instruction) {
 
         let reg = inst.op0_register();
-        let reg_place = self.ensure_register_place(reg);
-        let stack_place = self.places.create_integer(reg.size());
+        let reg_var = self.decode_read_register(reg);
+        let reg_size = reg.size() as u16;
 
-        self.stack.stack_pointer -= 8;
-        self.stack.store(self.stack.stack_pointer, 8, stack_place);
+        // This is where the pointer to the stack slot is located.
+        let stack_ptr = self.var_factory.create();
+
+        self.stack.stack_pointer -= reg_size as i32;
+        self.stack.store(self.stack.stack_pointer, reg_size, stack_ptr);
         
-        self.enqueue_assign(stack_place, IdrExpression::Copy(reg_place));
+        self.push_assign(stack_ptr, new_ptr_type(IdrType::integer_aligned(reg_size)), IdrExpression::Alloca(reg_size));
+        self.push_store(stack_ptr, reg_var);
 
     }
 
-    fn decode_sub_rm_imm(&mut self, inst: &Instruction) {
+    fn decode_pop_r(&mut self, inst: &Instruction) {
+
+        let reg = inst.op0_register();
+        let reg_var = self.decode_write_register(reg);
+        let reg_size = reg.size() as u16;
+
+        let stack_ptr = self.stack.get(self.stack.stack_pointer).unwrap();
+        debug_assert!(stack_ptr.offset == 0, "todo");
         
+        self.push_assign(reg_var, 
+            IdrType::integer_aligned(reg_size), 
+            IdrExpression::Deref { base: stack_ptr.var, offset: 0 });
+        
+        self.stack.stack_pointer += reg_size as i32;
+
+    }
+
+    fn decode_arith_rm_imm(&mut self, inst: &Instruction, op: AnalyzerArithOp) {
+        let imm = inst.immediate64() as i64;
         match inst.op0_register() {
             Register::None => {
-                // Memory addressing
-                self.statements.push_back(IdrStatement::Error);
+                let (mem_var, mem_size) = self.decode_mem_addr(inst);
+                let val_var = self.var_factory.create();
+                let val_ty = IdrType::integer_aligned(mem_size);
+                self.push_assign(val_var, val_ty.clone(), IdrExpression::Deref { base: mem_var, offset: 0 });
+                let tmp_var = self.var_factory.create();
+                self.push_assign(tmp_var, val_ty, match op {
+                    AnalyzerArithOp::Add => IdrExpression::AddImm(val_var, imm),
+                    AnalyzerArithOp::Sub => IdrExpression::SubImm(val_var, imm),
+                });
+                self.push_store(mem_var, tmp_var)
             }
             Register::RSP => {
                 // Special handling for RSP
-                self.stack.stack_pointer -= inst.immediate64() as i64 as i32;
+                match op {
+                    AnalyzerArithOp::Add => {
+                        self.stack.stack_pointer += imm as i32;
+                    }
+                    AnalyzerArithOp::Sub => {
+                        self.stack.stack_pointer -= imm as i32;
+                    }
+                }
             }
             reg => {
-                let reg_place = self.ensure_register_place(reg);
-                self.enqueue_assign(reg_place, IdrExpression::AddImm(reg_place, inst.immediate64() as i64));
+                let reg_var = self.decode_read_register(reg);
+                let val_ty = IdrType::integer_aligned(reg.size() as u16);
+                self.push_assign(reg_var, val_ty, match op {
+                    AnalyzerArithOp::Add => IdrExpression::AddImm(reg_var, imm),
+                    AnalyzerArithOp::Sub => IdrExpression::SubImm(reg_var, imm),
+                });
             }
         }
-
     }
 
-}
+    /// Patterns:
+    /// - `mov r0, r1` => `var0 = var1`
+    /// - `mov r0, [r1]` => `var0 = *var1`
+    /// - `mov r0, [r1+imm1]` => `tmp0 = var1 + imm1; var0 = *tmp0`
+    fn decode_mov_r_rm(&mut self, inst: &Instruction) {
+        let reg0 = inst.op0_register();
+        let reg0_ty = IdrType::integer_aligned(reg0.size() as u16);
+        match inst.op1_register() {
+            Register::None => {
+                let (mem_var, _) = self.decode_mem_addr(inst);
+                let reg0_var = self.decode_write_register(reg0);
+                self.push_assign(reg0_var, reg0_ty, IdrExpression::Deref { base: mem_var, offset: 0 });
+            }
+            Register::RSP => {
+                panic!("dynamic mov to RSP is not currently supported")
+            }
+            reg1 => {
+                let reg1_var = self.decode_read_register(reg1);
+                let reg0_var = self.decode_write_register(reg0);
+                self.push_assign(reg0_var, reg0_ty, IdrExpression::Copy(reg1_var));
+            }
+        }
+    }
 
+    /// Patterns:
+    /// - `mov r0, imm0` => `var0 = imm0`
+    fn decode_mov_r_imm(&mut self, inst: &Instruction) {
+        let reg = inst.op0_register();
+        let reg_var = self.decode_write_register(reg);
+        let reg_ty = IdrType::integer_aligned(reg.size() as u16);
+        let imm = inst.immediate64();
+        self.push_assign(reg_var, reg_ty, IdrExpression::Constant(imm as i64));
+    }
 
-/// Used to keep track of each 
-#[derive(Debug, Default)]
-struct AnalyzerPlaces {
-    /// All places.
-    places: Vec<AnalyzerPlace>,
-}
-
-#[derive(Debug)]
-struct AnalyzerPlace {
-    /// Type of the place.
-    ty: IdrType,
-    /// Number of references to this place.
-    ref_count: u32,
-    /// True if the place is external. This means that the place
-    /// was not initialized in the first place by an IDR statement.
-    external: bool,
-
-    // TODO: Add last storage
-}
-
-impl AnalyzerPlaces {
-
-    /// Create a new place with a type and external state.
-    fn create(&mut self, ty: IdrType, external: bool) -> u32 {
-        let idx = self.places.len();
-        assert!(idx <= u32::MAX as usize, "to much idr types");
-        self.places.push(AnalyzerPlace { 
-            ty, 
-            ref_count: 0,
-            external,
+    /// Patterns:
+    /// - `call imm0` => `var0 = imm0()`
+    fn decode_call_rel(&mut self, inst: &Instruction) {
+        let pointer = inst.near_branch64();
+        let ret_var = self.var_factory.create();
+        self.push_assign(ret_var, IdrType::VOID, IdrExpression::Call { 
+            pointer, 
+            args: vec![]
         });
-        idx as u32
     }
 
-    /// Create an integer place of the given size, this size
-    /// will also be the alignment of the type. This place
-    /// will not be defined as "external".
-    #[inline]
-    fn create_integer(&mut self, int_size: usize) -> u32 {
-        let int_size = int_size as u16;
-        self.create(IdrType::Integer(int_size, int_size), false)
+    fn decode_call_rm(&mut self, inst: &Instruction) {
+        let ret_var = self.var_factory.create();
+        let pointer_var = match inst.op0_register() {
+            Register::None => self.decode_mem_addr(inst).0,
+            reg => self.decode_read_register(reg),
+        };
+        self.push_assign(ret_var, IdrType::VOID, IdrExpression::CallIndirect { 
+            pointer: pointer_var, 
+            args: vec![],
+        });
     }
 
-    /// Increment reference count of a place.
-    fn inc_ref_count(&mut self, place: u32) {
-        self.places[place as usize].ref_count += 1;
+    fn decode_cmp_rm_imm(&mut self, inst: &Instruction) {
+
+        let (left_var, var_ty) = match inst.op0_register() {
+            Register::None => {
+                let (mem_var, mem_size) = self.decode_mem_addr(inst);
+                let var = self.var_factory.create();
+                let var_ty = IdrType::integer_aligned(mem_size);
+                self.push_assign(var, var_ty.clone(), IdrExpression::Deref { base: mem_var, offset: 0 });
+                (var, var_ty)
+            }
+            reg => {
+                (self.decode_read_register(reg), IdrType::integer_aligned(reg.size() as u16))
+            },
+        };
+
+        let right_var = self.var_factory.create();
+
+        self.push_assign(right_var, var_ty.clone(), IdrExpression::Constant(inst.immediate64() as i64));
+
+        self.cmp = Some(AnalyzerCmp { 
+            left_var, 
+            right_var, 
+            ty: var_ty,
+            kind: AnalyzerCmpKind::Cmp,
+        });
+
     }
 
-    /// Get the type of a place.
-    fn get_type(&self, place: u32) -> &IdrType {
-        &self.places[place as usize].ty
+    fn decode_test_rm_r(&mut self, inst: &Instruction) {
+
+        let right_reg = inst.op1_register();
+        let right_reg_ty = IdrType::integer_aligned(right_reg.size() as u16);
+        let right_var = self.decode_read_register(right_reg);
+
+        let left_var = match inst.op0_register() {
+            Register::None => {
+                let (mem_var, _) = self.decode_mem_addr(inst);
+                let var = self.var_factory.create();
+                self.push_assign(var, right_reg_ty.clone(), IdrExpression::Deref { base: mem_var, offset: 0 });
+                var
+            }
+            reg => self.decode_read_register(reg)
+        };
+
+        self.cmp = Some(AnalyzerCmp {
+            left_var,
+            right_var,
+            ty: right_reg_ty,
+            kind: AnalyzerCmpKind::Test,
+        });
+
     }
+
+    fn decode_jcc(&mut self, inst: &Instruction) {
+
+        // Note that we take the comparison, so it is replaced 
+        // with none. Even if jump instructions doesn't clear
+        // the comparison flags, because of the switch of
+        // basic blocks, we should clear it (at least for now). 
+        if let Some(cmp) = self.cmp.take() {
+
+            let pointer = inst.near_branch64();
+
+            match cmp.kind {
+                AnalyzerCmpKind::Cmp => {
+
+                    let idr_cond = match inst.condition_code() {
+                        ConditionCode::None => unreachable!(),
+                        ConditionCode::o => todo!(),
+                        ConditionCode::no => todo!(),
+                        ConditionCode::b => IdrCondition::UnsignedLower,
+                        ConditionCode::ae => IdrCondition::UnsignedGreaterOrEqual,
+                        ConditionCode::e => IdrCondition::Equal,
+                        ConditionCode::ne => IdrCondition::NotEqual,
+                        ConditionCode::be => IdrCondition::UnsignedLowerOrEqual,
+                        ConditionCode::a => IdrCondition::UnsignedGreater,
+                        ConditionCode::s => todo!(),
+                        ConditionCode::ns => todo!(),
+                        ConditionCode::p => todo!(),
+                        ConditionCode::np => todo!(),
+                        ConditionCode::l => IdrCondition::SignedLower,
+                        ConditionCode::ge => IdrCondition::SignedGeaterOrEqual,
+                        ConditionCode::le => IdrCondition::SignedLowerOrEqual,
+                        ConditionCode::g => IdrCondition::SignedGreater,
+                    };
+    
+                    self.push_branch(pointer, cmp.left_var, cmp.right_var, idr_cond);
+
+                }
+                AnalyzerCmpKind::Test => {
+
+                    let test_var;
+
+                    // A common usage for test is to test if a variable 
+                    // is equal to 0 or not, in this case the pattern is
+                    // > test r0, r0
+                    // > JE  => if r0 == 0
+                    // > JNE => if r0 != 0
+                    if cmp.left_var == cmp.right_var {
+                        test_var = cmp.left_var;
+                    } else {
+                        test_var = self.var_factory.create();
+                        self.push_assign(test_var, cmp.ty.clone(), IdrExpression::And(cmp.left_var, cmp.right_var));
+                    }
+
+                    let idr_cond = match inst.condition_code() {
+                        ConditionCode::e => IdrCondition::Equal,
+                        ConditionCode::ne => IdrCondition::NotEqual,
+                        _ => todo!("unsupported condition code with 'test'"),
+                    };
+
+                    let zero_var = self.var_factory.create();
+                    self.push_assign(zero_var, cmp.ty, IdrExpression::Constant(0));
+
+                    self.push_branch(pointer, test_var, zero_var, idr_cond);
+
+                }
+            }
+
+        } else {
+            // No preceding comparison, error.
+            self.function.statements.push(IdrStatement::Error);
+        }
+
+    }   
 
 }
 
@@ -286,60 +443,90 @@ impl AnalyzerPlaces {
 #[derive(Debug, Default)]
 struct AnalyzerRegisters {
     /// RAX/RCX/RDX/RBX/RSI/RDI/R8-R15
-    gp: [AnalyzerGpRegister; 16],
+    gp: [AnalyzerRegister; 16],
 }
 
-#[derive(Debug, Default)]
-struct AnalyzerGpRegister {
-    /// Place index stored at this location
-    place: u32,
-    /// Byte length actually used in this register.
-    len: u16,
+#[derive(Debug)]
+enum AnalyzerRegister {
+    /// The register is currently unused.
+    Uninit,
+    /// The register is currently bound to a variable
+    /// and a specific length is used.
+    Init {
+        var: IdrVar,
+        len: u16,
+    }
+}
+
+impl Default for AnalyzerRegister {
+    fn default() -> Self {
+        Self::Uninit
+    }
+}
+
+impl AnalyzerRegister {
+
+    fn var(&self) -> Option<IdrVar> {
+        match *self {
+            Self::Uninit => None,
+            Self::Init { var, .. } => Some(var),
+        }
+    }
+
 }
 
 impl AnalyzerRegisters {
 
-    fn get_place(&self, register: Register) -> Option<u32> {
+    fn get_var(&self, register: Register) -> Option<IdrVar> {
         if register.is_gpr() {
-            let gp = &self.gp[register.number()];
-            (gp.len > 0).then_some(gp.place) 
+            self.gp[register.number()].var()
         } else {
-            None
+            unimplemented!("this kind of register '{register:?}' is not yet supported");
         }
     }
 
-    fn set_place(&mut self, register: Register, place: u32) {
+    fn set_var(&mut self, register: Register, var: IdrVar) {
         if register.is_gpr() {
-            let gp = &mut self.gp[register.number()];
-            gp.len = register.size() as u16;
-            gp.place = place;
+            self.gp[register.number()] = AnalyzerRegister::Init { 
+                var, 
+                len: register.size() as u16,
+            };
         } else {
-            unimplemented!("this kind of register is not yet supported");
+            unimplemented!("this kind of register '{register:?}' is not yet supported");
         }
     }
 
 }
 
 
-/// Simulation of the stack, used to track which place is used
+/// Simulation of the stack, used to track which slot is used
 /// for which variable.
 #[derive(Debug, Default)]
 struct AnalyzerStack {
     /// Associate to each stack byte a place.
-    stack: VecDeque<u32>,
+    stack: VecDeque<Option<AnalyzerStackSlot>>,
     /// Address of the first byte in the stack.
     stack_base: i32,
     /// Current stack pointer.
     stack_pointer: i32,
 }
 
+#[derive(Debug)]
+struct AnalyzerStackSlot {
+    /// The variable store here. Actually, the given variable is
+    /// a pointer to the slot.
+    var: IdrVar,
+    /// The byte offset within the variable.
+    offset: u16,
+}
+
 impl AnalyzerStack {
 
-    fn store(&mut self, addr: i32, len: u32, place: u32) {
+    fn store(&mut self, addr: i32, len: u16, var: IdrVar) {
 
         if addr < self.stack_base {
             for _ in addr..self.stack_base {
-                self.stack.push_front(0);
+                self.stack.push_front(None);
                 self.stack_base -= 1;
             }
         }
@@ -349,15 +536,44 @@ impl AnalyzerStack {
 
         if end_addr > current_end_addr {
             for _ in current_end_addr..end_addr {
-                self.stack.push_back(0);
+                self.stack.push_back(None);
             }
         }
 
-        for i in addr..(addr + len as i32) {
-            let idx = (i - self.stack_base) as usize;
-            self.stack[idx] = place;
+        for offset in 0..len {
+            let idx = (addr + offset as i32 - self.stack_base) as usize;
+            self.stack[idx] = Some(AnalyzerStackSlot {
+                var,
+                offset,
+            });
         }
 
     }
 
+    fn get(&self, addr: i32) -> Option<&AnalyzerStackSlot> {
+        self.stack[(addr - self.stack_base) as usize].as_ref()
+    }
+
+}
+
+
+/// Internal structure used to track possible comparisons.
+#[derive(Debug, Clone)]
+struct AnalyzerCmp {
+    left_var: IdrVar,
+    right_var: IdrVar,
+    ty: IdrType,
+    kind: AnalyzerCmpKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnalyzerCmpKind {
+    Cmp,
+    Test,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnalyzerArithOp {
+    Add,
+    Sub,
 }

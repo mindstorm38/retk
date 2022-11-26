@@ -23,21 +23,26 @@ pub enum IdrType {
     /// *Note that [`Type::struct_aligned`] can be used to create an
     /// automatically aligned structure.*
     Struct(Vec<(String, IdrType)>, u32),
+    /// A pointer to a specific type and of a specific size.
+    /// The pointer's alignment is equal to its size.
+    Pointer(Box<IdrType>, u16),
 }
 
 impl IdrType {
 
+    pub const VOID: Self = Self::integer_aligned(0);
+
     /// A single-byte type. Usually an octet on modern architures.
-    pub const BYTE: Self = Self::Integer(1, 1);
+    pub const BYTE: Self = Self::integer_aligned(1);
 
     /// A double-byte type (2 bytes).
-    pub const WORD: Self = Self::Integer(2, 2);
+    pub const WORD: Self = Self::integer_aligned(2);
 
     /// A double-word type (4 bytes).
-    pub const DWORD: Self = Self::Integer(4, 4);
+    pub const DWORD: Self = Self::integer_aligned(4);
 
     /// A quad-word type (8 bytes).
-    pub const QWORD: Self = Self::Integer(8, 8);
+    pub const QWORD: Self = Self::integer_aligned(8);
 
     /// A single-precision floating point type (4 bytes).
     pub const FLOAT: Self = Self::Float(4, 4);
@@ -76,12 +81,18 @@ impl IdrType {
 
     }
 
+    #[inline]
+    pub const fn integer_aligned(size: u16) -> IdrType {
+        IdrType::Integer(size, size)
+    }
+
     pub const fn alignment(&self) -> u32 {
         match *self {
             Self::Integer(_, align) |
             Self::Float(_, align) => align as u32,
             Self::Array(ref ty, _) => ty.alignment(),
             Self::Struct(_, align) => align,
+            Self::Pointer(_, size) => size as u32,
         }
     }
 
@@ -93,6 +104,7 @@ impl IdrType {
             Self::Struct(ref tys, _) => {
                 tys.iter().map(|(_, t)| t.size()).sum()
             }
+            Self::Pointer(_, size) => size as u32,
         }
     }
 
@@ -101,10 +113,23 @@ impl IdrType {
 impl fmt::Display for IdrType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            IdrType::Integer(n, _) => write!(f, "i{n}"),
-            IdrType::Float(n, _) => write!(f, "f{n}"),
-            IdrType::Array(ref ty, len) => write!(f, "[{ty}; {len}]"),
-            IdrType::Struct(_, _) => write!(f, "/*struct(todo)*/"),
+            Self::Integer(0, 0) => write!(f, "void"),
+            Self::Integer(n, _) => write!(f, "i{n}"),
+            Self::Float(n, _) => write!(f, "f{n}"),
+            Self::Array(ref ty, len) => write!(f, "[{ty}; {len}]"),
+            Self::Struct(ref fields, _) => {
+                write!(f, "struct {{")?;
+                for (i, (name, ty)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{name}: {ty}")?;
+                }
+                write!(f, "}}")
+            }
+            Self::Pointer(ref ty, size) => {
+                write!(f, "{ty}*")
+            }
         }
     }
 }
