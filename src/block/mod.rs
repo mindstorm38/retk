@@ -1,7 +1,13 @@
-//! A module providing high-level symbols that helps understanding
-//! the code. They are produce by analyzer passes.
+//! Basic blocks related utilities.
 
 use std::fmt;
+
+
+mod graph;
+pub use graph::ContiguousGraphResolver;
+
+mod list;
+pub use list::ListResolver;
 
 
 /// A "basic block" of code. In the analyzer code, a basic block is 
@@ -85,32 +91,4 @@ impl fmt::Debug for BasicBlockExit {
             Self::Unknown => write!(f, "Unknown"),
         }
     }
-}
-
-/// Function symbol details, signature and return types.
-#[derive(Debug, Clone)]
-pub struct Function {
-    /// First basic block of the function.
-    pub begin_ip: u64,
-    /// End IP of the function (exclusive).
-    pub end_ip: u64,
-    /// Calling convention's ABI.
-    pub abi: Abi,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Abi {
-    /// Unknown ABI.
-    Unknown,
-    /// Unix C x86.
-    Cdecl,
-    /// WINAPI.
-    Stdcall,
-    /// Windows x86.
-    Fastcall,
-    /// Windows x64.
-    Win64,
-    /// For leaf function calling convention, no 
-    /// argument or framing.
-    Leaf,
 }

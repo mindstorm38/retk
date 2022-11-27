@@ -59,6 +59,7 @@ impl fmt::Display for IdrExpression {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use IdrExpression::*;
         match *self {
+            Extern => write!(f, "<extern>"),
             Constant(n) => write!(f, "{n}"),
             Copy(place) => write!(f, "{place}"),
             Alloca(n) => {

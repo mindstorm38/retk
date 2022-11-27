@@ -13,7 +13,8 @@
 //! 
 //! This representation is mainly used to find and guess
 //! data types and structures. Code folding and branch/loops
-//! representation should be done after all these passes.
+//! representation should be done after all these passes for
+//! the final pseudo-code representation.
 
 use std::num::NonZeroU32;
 
@@ -81,6 +82,8 @@ impl Default for IdrStatement {
 /// An expression that produce a value that is then assigned
 #[derive(Debug, Clone)]
 pub enum IdrExpression {
+    /// Externally defined value.
+    Extern,
     /// Constant value.
     Constant(i64),
     /// Copy the value of another variable.

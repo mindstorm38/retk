@@ -133,6 +133,7 @@ impl IdrDecoder {
             var
         } else {
             let var = self.var_factory.create();
+            self.push_assign(var, IdrType::VOID, IdrExpression::Extern);
             self.registers.set_var(register, var);
             var
         }

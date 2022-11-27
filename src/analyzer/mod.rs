@@ -16,7 +16,6 @@ use crate::symbol::{BasicBlock, Function};
 mod block;
 mod func;
 mod abi;
-mod dec;
 
 pub use block::BasicBlockPass;
 pub use func::FunctionFindPass;
