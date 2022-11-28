@@ -127,7 +127,7 @@ impl fmt::Display for IdrType {
                 }
                 write!(f, "}}")
             }
-            Self::Pointer(ref ty, size) => {
+            Self::Pointer(ref ty, _) => {
                 write!(f, "{ty}*")
             }
         }

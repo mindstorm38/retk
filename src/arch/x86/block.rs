@@ -1,8 +1,8 @@
 //! Basic block analysis specific to x86.
 
-use iced_x86::{Code, Instruction};
+use iced_x86::Code;
 
-use crate::analyzer_::{Analysis, Analyzer};
+use crate::analyzer::{Analysis, Analyzer};
 use crate::block::ListResolver;
 
 use crate::arch::x86;
@@ -18,7 +18,7 @@ impl<'data> Analysis<x86::Runtime<'data>> for BasicBlockAnalysis {
 
     fn analyze(&mut self, analyzer: &mut Analyzer<x86::Runtime<'data>>) {
         
-        let mut decoder = &mut analyzer.runtime.decoder;
+        let decoder = &mut analyzer.runtime.decoder;
 
         for section in &analyzer.runtime.sections.code {
 

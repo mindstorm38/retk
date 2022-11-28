@@ -11,6 +11,37 @@ use super::{BasicBlock, BasicBlockExit};
 /// basic blocks linked by exit branches. This means that if
 /// a basic block is linked to but not contiguous to another
 /// block, it will not be included in the contiguous graph.
+/// 
+/// ## By example
+/// ```
+/// bb0:
+/// bb1:  <- our function's entry point
+///   [...]
+///   jcc bb5
+/// bb2:
+///   [...]
+///   jcc bb0
+/// bb3:
+///   ret
+/// bb4:
+///   [...]
+/// bb5:
+///   ret
+/// ```
+/// 
+/// This example produce the following graph for the function starting at `bb1`:
+/// ```text
+/// bb1─[cc]──bb5
+///  └──[!cc]─bb2─[cc]──bb0──bb1──[..loop..]
+///            └──[!cc]─bb3
+/// ```
+/// 
+/// *Note that `bb4` is not present in this function's graph.*
+/// 
+/// In the graph we can see the basic blocks `bb5` and `bb0`, but these are not
+/// contiguous to the other blocks. Block 0 is before the function's entry point,
+/// so it's elided, and block 5 is not contiguous with block 3, which is the last 
+/// block in the function's graph.
 pub struct ContiguousGraphResolver<'db> {
     /// Database's basic blocks.
     bbs: &'db HashMap<u64, BasicBlock>,

@@ -12,8 +12,7 @@ use std::io::Write;
 use object::{Object, ObjectSection, Architecture, SectionKind};
 use object::read::pe::PeFile64;
 
-// pub mod analyzer;
-pub mod analyzer_;
+pub mod analyzer;
 pub mod block;
 pub mod func;
 pub mod idr;
@@ -29,7 +28,7 @@ pub fn analyse(data: &[u8]) {
         return;
     }
 
-    use analyzer_::Analyzer;
+    use analyzer::Analyzer;
     use arch::{common, x86};
 
     let mut analyzer = Analyzer::new(x86::Runtime::new(file.data(), 64));

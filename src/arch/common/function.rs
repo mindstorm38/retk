@@ -2,7 +2,7 @@
 //! because the analysis just consist of reading the basic blocks
 //! (themselves produced by architecture-specific code).
 
-use crate::analyzer_::{Analysis, Analyzer};
+use crate::analyzer::{Analysis, Analyzer};
 use crate::block::ContiguousGraphResolver;
 use crate::func::Function;
 

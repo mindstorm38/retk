@@ -455,7 +455,7 @@ enum AnalyzerRegister {
     /// and a specific length is used.
     Init {
         var: IdrVar,
-        len: u16,
+        _len: u16,
     }
 }
 
@@ -490,7 +490,7 @@ impl AnalyzerRegisters {
         if register.is_gpr() {
             self.gp[register.number()] = AnalyzerRegister::Init { 
                 var, 
-                len: register.size() as u16,
+                _len: register.size() as u16,
             };
         } else {
             unimplemented!("this kind of register '{register:?}' is not yet supported");

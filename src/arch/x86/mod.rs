@@ -13,6 +13,8 @@ pub use idr::IdrDecoder;
 pub struct Runtime<'data> {
     /// The underlying bytes of data.
     pub data: &'data [u8],
+    /// Bitness of the instruction's decoder (16, 32, 64).
+    pub bitness: u32,
     /// The x86 instruction decoder.
     pub decoder: RangeDecoder<'data>,
     /// Sections and their metadata.
@@ -24,6 +26,7 @@ impl<'data> Runtime<'data> {
     pub fn new(data: &'data [u8], bitness: u32) -> Self {
         Self {
             data,
+            bitness,
             decoder: RangeDecoder::new(data, bitness),
             sections: Sections::default(),
         }
