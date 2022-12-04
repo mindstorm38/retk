@@ -32,6 +32,16 @@ impl<'data> Runtime<'data> {
         }
     }
 
+    pub fn goto(&mut self, begin_ip: u64, end_ip: u64) {
+
+        let section = self.sections.get_code_section_at(begin_ip)
+            .expect("the given ip is not in a code section");
+
+        let offset = begin_ip - section.begin_addr;
+        self.decoder.goto_range_at(section.pos + offset as usize, begin_ip, end_ip);
+
+    }
+
 }
 
 
@@ -49,14 +59,21 @@ impl Sections {
         self.code.push(Section { pos, begin_addr: first_addr, end_addr: last_addr });
     }
 
-    /// Returns true if the given address is in code range.
-    pub fn in_code_range(&self, addr: u64) -> bool {
-        self.code.iter().any(|s| addr >= s.begin_addr && addr < s.end_addr)
-    }
-
     /// Returns the maximum code address, 0 if no code sections is set.
     pub fn max_code_addr(&self) -> u64 {
         self.code.iter().map(|s| s.end_addr).max().unwrap_or(0)
+    }
+
+    /// Returns the section that contains the given address, if existing.
+    pub fn get_code_section_at(&self, addr: u64) -> Option<&Section> {
+        self.code.iter()
+            .filter(|s| addr >= s.begin_addr && addr < s.end_addr)
+            .next()
+    }
+
+    /// Returns true if the given address is in code range.
+    pub fn in_code_range(&self, addr: u64) -> bool {
+        self.get_code_section_at(addr).is_some()
     }
 
 }
@@ -100,8 +117,12 @@ impl<'data> RangeDecoder<'data> {
 
     /// Set the decoder to start to a new data position and IP 
     /// and ends at a end IP.
-    pub fn goto_range(&mut self, pos: usize, begin_ip: u64, end_ip: u64) {
+    pub fn goto_range_at(&mut self, pos: usize, begin_ip: u64, end_ip: u64) {
         self.decoder.set_position(pos).unwrap();
+        self.goto_range(begin_ip, end_ip);
+    }
+
+    pub fn goto_range(&mut self, begin_ip: u64, end_ip: u64) {
         self.decoder.set_ip(begin_ip);
         self.end_ip = end_ip;
     }

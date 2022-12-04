@@ -22,7 +22,7 @@ impl<'data> Analysis<x86::Runtime<'data>> for BasicBlockAnalysis {
 
         for section in &analyzer.runtime.sections.code {
 
-            decoder.goto_range(section.pos, section.begin_addr, section.end_addr);
+            decoder.goto_range_at(section.pos, section.begin_addr, section.end_addr);
 
             while let Some(inst) = decoder.decode() {
 

@@ -18,8 +18,10 @@
 
 use std::num::NonZeroU32;
 
-mod ty;
-pub use ty::IdrType;
+use crate::ty::Type;
+
+// mod ty;
+// pub use ty::IdrType;
 
 mod fmt;
 
@@ -49,7 +51,7 @@ pub enum IdrStatement {
         /// The variable where the expression is assigned.
         var: IdrVar,
         /// Type of the variable.
-        ty: IdrType,
+        ty: Type,
         /// The expression that computes the value that will
         /// be assigned to the place.
         expr: IdrExpression,

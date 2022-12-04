@@ -45,7 +45,7 @@ impl<R> Analysis<R> for FunctionGraphAnalysis {
                 for bb in db.basic_blocks.values() {
                     if bb.function {
                         let (begin_ip, end_ip) = func_resolver.resolve_graph(bb);
-                        db.functions.insert(begin_ip, Function::new(begin_ip, end_ip));
+                        db.functions.insert(begin_ip, Function::with_body_range(begin_ip, end_ip));
                     }
                 }
                 first_it = false;
@@ -53,7 +53,7 @@ impl<R> Analysis<R> for FunctionGraphAnalysis {
                 for bb_ip in new_functions.drain(..) {
                     let bb = &db.basic_blocks[&bb_ip];
                     let (begin_ip, end_ip) = func_resolver.resolve_graph(bb);
-                    db.functions.insert(begin_ip, Function::new(begin_ip, end_ip));
+                    db.functions.insert(begin_ip, Function::with_body_range(begin_ip, end_ip));
                 }
             }
 

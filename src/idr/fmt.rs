@@ -30,7 +30,7 @@ impl fmt::Display for IdrStatement {
             Self::Error => write!(f, "/*error*/"),
             Self::Asm => write!(f, "/*asm(todo)*/"),
             Self::Assign { var, ref ty, ref expr } => {
-                write!(f, "{var}: {ty} = {expr}")
+                write!(f, "{var}: {ty:?} = {expr}")
             }
             Self::Store { pointer, var } => {
                 write!(f, "*{pointer} = {var}")
