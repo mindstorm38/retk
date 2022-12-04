@@ -47,6 +47,11 @@ pub struct IdrDecoder {
     var_factory: IdrVarFactory,
     /// Last comparison, used when a condition (jmp, mov, etc.) is decoded.
     cmp: Option<AnalyzerCmp>,
+
+    /// Prolog.
+    prolog: bool,
+    extern_reg: HashMap<Register, IdrVar>,
+
     /// Internal function being decoded.
     pub function: IdrFunction,
 }
@@ -167,7 +172,7 @@ impl IdrDecoder {
             var
         } else {
             let var = self.var_factory.create();
-            self.push_assign(var, Type::VOID, IdrExpression::Extern);
+            self.extern_reg.insert(register, var);
             self.reg_tracker.set_var(register, var);
             var
         }
@@ -207,16 +212,15 @@ impl IdrDecoder {
                         var = slot.var;
                     }
                     None => {
+
                         var = self.var_factory.create();
-                        if addr > 0 {
-                            // If the stack address goes before the frame, it's
-                            // an external parameter for sure.
-                            // TMaybe use a "Parameter" expression in the future.
-                            self.push_assign(var, Type::VOID.to_pointer(1), IdrExpression::Extern);
+                        let var_ty = if mem_size == 0 {
+                            Type::VOID
                         } else {
-                            // Else, it's just a local stack allocation.
-                            self.push_assign(var, Type::VOID.to_pointer(1), IdrExpression::Alloca(mem_size));
-                        }
+                            Type::from_integer_size(mem_size)
+                        };
+                        
+                        self.push_assign(var, var_ty.to_pointer(1), IdrExpression::Alloca(mem_size));
                         self.stack_tracker.store(addr, mem_size, var);
                         self.const_tracker.set(var, addr as i64);
                     }
@@ -297,12 +301,6 @@ impl IdrDecoder {
         let reg0 = inst.op0_register();
         self.reg_tracker.set_var(reg0, mem_var);
 
-        // let reg0_var = self.decode_write_register(reg0);
-
-        // self.push_assign(reg0_var,
-        //     Type::from_integer_size(reg0.size() as u16),
-        //     IdrExpression::Copy(mem_var));
-
     }
 
     fn decode_arith_rm_imm(&mut self, inst: &Instruction, op: AnalyzerArithOp) {
@@ -357,13 +355,17 @@ impl IdrDecoder {
     /// - `mov r0, [r1]` => `var0 = *var1`
     /// - `mov r0, [r1+imm1]` => `tmp0 = var1 + imm1; var0 = *tmp0`
     fn decode_mov_r_rm(&mut self, inst: &Instruction) {
+
         let reg0 = inst.op0_register();
         let reg0_ty = Type::from_integer_size(reg0.size() as u16);
+
         match inst.op1_register() {
             Register::None => {
+
                 let (mem_var, _) = self.decode_mem_addr(inst);
                 let reg0_var = self.decode_write_register(reg0);
                 self.push_assign(reg0_var, reg0_ty, IdrExpression::Deref { base: mem_var, offset: 0 });
+
             }
             Register::RSP => {
                 panic!("dynamic mov from RSP is unsupported")
@@ -380,26 +382,42 @@ impl IdrDecoder {
                     self.stack_tracker.stack_pointer = reg1_val as i32;
 
                 } else {
-                    // let reg0_var = self.decode_write_register(reg0);
                     let reg1_var = self.decode_read_register(reg1);
                     self.reg_tracker.set_var(reg0, reg1_var);
-                    // self.push_assign(reg0_var, reg0_ty, IdrExpression::Copy(reg1_var));
                 }
 
             }
         }
+
     }
 
     /// Patterns:
     /// - `mov r0, r1` => `var0 = var1`
     /// - `mov [r0], r1` => `*var0 = var1`
     fn decode_mov_rm_r(&mut self, inst: &Instruction) {
+
         let reg1 = inst.op1_register();
+
         match inst.op0_register() {
             Register::None => {
+
+                // if !self.prolog {
+
+                //     if let Register::SP | Register::ESP | Register::RSP = inst.memory_base() {
+                //         if let Register::None = inst.memory_index() {
+
+                //             let param = self.var_factory.create();
+                //             self.
+
+                //         }
+                //     }
+
+                // }
+
                 let (mem_var, _) = self.decode_mem_addr(inst);
                 let reg1_var = self.decode_read_register(reg1);
                 self.push_store(mem_var, reg1_var);
+
             }
             Register::SP |
             Register::ESP |
@@ -411,13 +429,11 @@ impl IdrDecoder {
                 self.stack_tracker.stack_pointer = reg1_val as i32;
             }
             reg0 => {
-                // let reg0_ty = Type::from_integer_size(reg0.size() as u16);
-                // let reg0_var = self.decode_write_register(reg0);
                 let reg1_var = self.decode_read_register(reg1);
                 self.reg_tracker.set_var(reg0, reg1_var);
-                // self.push_assign(reg0_var, reg0_ty, IdrExpression::Copy(reg1_var));
             }
         }
+
     }
 
     /// Patterns:
@@ -818,4 +834,136 @@ enum AnalyzerCmpKind {
 enum AnalyzerArithOp {
     Add,
     Sub,
+}
+
+
+/// # Windows x64 ABI and calling convention.
+/// 
+/// ## Links
+/// - https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention
+/// - https://learn.microsoft.com/en-us/cpp/build/stack-usage
+/// - https://learn.microsoft.com/en-us/cpp/build/prolog-and-epilog
+/// - https://learn.microsoft.com/en-us/cpp/build/exception-handling-x64
+/// 
+/// ## Register volatility
+/// Volatile registers: `RAX`, `RCX`, `RDX`, `R8-R11`, `XMM0-XMM5`.
+/// 
+/// Non-volatile registers: `RBX`, `RBP`, `RDI`, `RSI`, `RSP`, `R12-R15`, `XMM6-XMM15`.
+/// 
+/// Volatile registers should be considered destroyed when calling a function, and
+/// must be saved by the caller if needed. Non-volatile registers should not and 
+/// therefore should be saved/restored by callee.
+/// 
+/// ## Stack overview
+/// Here is an overview of the stack of such calling convention.
+/// 
+/// ```txt
+///  ╒═ func A ═══════════════╕
+///  │ Local variables and    │
+///  │ saved non-volatile     │
+///  │ registers.             │
+///  ├────────────────────────┤
+///  │ Space for alloca,      │
+///  │ if relevant.           │
+///  ├───────┬────────────────┤
+///  │ Stack │ Nth            │ (1)(2) 
+///  │ args  ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+///  │       │ 5th            │
+///  ├───────┼────────────────┤
+///  │ Reg   │ R9 home (4th)  │ (3)
+///  │ args  ├────────────────┤
+///  │ homes │ R8 home (3rd)  │ 
+///  │       ├────────────────┤
+///  │       │ RDX home (2nd) │
+///  │       ├────────────────┤       
+///  │       │ RCX home (1st) │
+///  ├───────┴────────────────┤ ← 16-bytes align 
+///  │ Caller return addr     │ ← call B
+///  ╞═ func B ═══════════════╡ 
+///  │                        │
+///  │ ... same as above      │
+///  │                        │
+///  └────────────────────────┘
+/// 
+/// (1) Each slot is 8-bytes wide and aligned,
+///     if an argument is smaller than 8 bytes,
+///     it is right-aligned and if greater,
+///     a pointer to it is used.
+/// (2) The number N of slots is the maximum
+///     number of arguments needed for a call
+///     in the function body.
+/// (3) Even if less than 4 arguments are needed,
+///     the 4 "home" slots are guaranteed to be 
+///     present. They are allocated in the caller 
+///     but owned/used by the callee.
+/// ```
+struct Win64 {
+    state: Win64State,
+    /// True if the parent "home" stack slots are used.
+    stack_home_used: bool,
+    /// Number of parameters likelly used by this function.
+    parameters_count: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Win64State {
+    Invalid,
+    StackSaving,
+}
+
+impl Win64 {
+
+    /// Pattersn:
+    /// - `mov [rsp+ADDR], reg`.
+    /// - `push reg`
+    fn stack_saved(&mut self, addr: i32, reg: Register) {
+
+        if self.state != Win64State::StackSaving {
+            return;
+        }
+
+        let mut new_parameters_count = 0;
+
+        match reg {
+            // Saved a non-volatile register.
+            Register::RBX |
+            Register::RBP |
+            Register::RDI |
+            Register::RSI |
+            Register::R12 |
+            Register::R13 |
+            Register::R14 |
+            Register::R15 => {
+                
+            }
+            // Saved a parameter register. 
+            // This implies that these registers are used for arguments.
+            Register::RCX => new_parameters_count = 1,
+            Register::RDX => new_parameters_count = 2,
+            Register::R8 => new_parameters_count = 3,
+            Register::R9 => new_parameters_count = 4,
+            // When unexpected registers are saved, the state is invalid.
+            _ => {
+                self.state = Win64State::Invalid;
+                return;
+            }
+        }
+
+        if addr >= 8 {
+            self.stack_home_used = true;
+            if addr > 40 {
+                // Out of range home stack access.
+                self.state = Win64State::Invalid;
+                return;
+            }
+        }
+
+        self.parameters_count = self.parameters_count.max(new_parameters_count);
+
+    }
+
+    fn reg_read(&mut self) {
+
+    }
+
 }

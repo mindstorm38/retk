@@ -31,11 +31,20 @@ mod fmt;
 /// last statement of the basic block is an exit statement.
 #[derive(Debug, Default)]
 pub struct IdrFunction {
+    pub parameters: Vec<IdrParameter>,
     /// All statements of this function.
     pub statements: Vec<IdrStatement>,
     /// Indices of labels, labels are the beginning of
     /// basic blocks.
     pub labels: Vec<usize>,
+}
+
+
+/// Represent a parameter.
+#[derive(Debug)]
+pub struct IdrParameter {
+    pub var: IdrVar,
+    pub ty: Type,
 }
 
 
