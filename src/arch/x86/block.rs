@@ -57,13 +57,19 @@ impl<'data> Analysis<x86::Runtime<'data>> for BasicBlockAnalysis {
                     Code::Retnw |
                     Code::Retnq_imm16 |
                     Code::Retnd_imm16 |
-                    Code::Retnw_imm16 => 
+                    Code::Retnw_imm16 |
+                    Code::Retfq |
+                    Code::Retfd |
+                    Code::Retfw |
+                    Code::Retfq_imm16 |
+                    Code::Retfd_imm16 |
+                    Code::Retfw_imm16 => 
                         (0, false, false),
                     // Unhandled
                     _ => continue
                 };
     
-                if analyzer.runtime.sections.in_code_range(goto_ip) {
+                if goto_ip == 0 || analyzer.runtime.sections.in_code_range(goto_ip) {
                     self.resolver.push_branch(goto_ip, inst.next_ip(), cond, call);
                 }
 

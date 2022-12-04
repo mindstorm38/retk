@@ -74,7 +74,7 @@ impl ListResolver {
     /// Push a new branch to the basic blocks.
     /// The branch consists of:
     /// - A goto instruction pointer (IP) where to branch goto if entered.
-    ///   Can be zero if the branch has an statically unknown return address (typically
+    ///   **Can be zero** if the branch has a statically unknown return address (typically
     ///   a function's return or indirect addressed jumps).
     ///   ***You should not** call this function if the goto IP is out of the code's
     ///   range.*
