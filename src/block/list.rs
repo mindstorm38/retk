@@ -149,6 +149,8 @@ impl ListResolver {
     /// 
     /// The caller should give the maximum possible instruction pointer,
     /// it's used to correctly define the last basic block.
+    /// 
+    /// **This function clear the internal state.**
     pub fn finalize(&mut self, max_ip: u64, bbs: &mut HashMap<u64, BasicBlock>) {
 
         if self.blocks.is_empty() {
@@ -212,6 +214,8 @@ impl ListResolver {
             }
 
         }
+
+        self.blocks_map.clear();
 
     }
 

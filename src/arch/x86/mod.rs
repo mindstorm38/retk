@@ -5,6 +5,9 @@ use iced_x86::{Decoder, DecoderOptions, Instruction};
 mod block;
 pub use block::BasicBlockAnalysis;
 
+mod abi;
+pub use abi::AbiAnalysis;
+
 mod idr;
 pub use idr::IdrDecoder;
 
@@ -83,14 +86,14 @@ impl Sections {
 /// 
 /// **NOTE**: Later, this might be generalized in a common 
 /// structure for all runtimes. 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Section {
     /// Offset of the code in the file.
-    pos: usize,
+    pub pos: usize,
     /// First virtual address of the section.
-    begin_addr: u64,
+    pub begin_addr: u64,
     /// Last virtual address of the section (exclusive).
-    end_addr: u64,
+    pub end_addr: u64,
 }
 
 

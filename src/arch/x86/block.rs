@@ -75,9 +75,10 @@ impl<'data> Analysis<x86::Runtime<'data>> for BasicBlockAnalysis {
 
             }
 
+            // This also clear the resolver, so we can continue in the new section.
+            self.resolver.finalize(section.end_addr, &mut analyzer.database.basic_blocks);
+
         }
-        
-        self.resolver.finalize(analyzer.runtime.sections.max_code_addr(), &mut analyzer.database.basic_blocks);
 
     }
 

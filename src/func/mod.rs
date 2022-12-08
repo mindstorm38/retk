@@ -134,6 +134,7 @@ impl fmt::Debug for Signature {
             Abi::Stdcall => "stdcall ",
             Abi::Fastcall => "fastcall ",
             Abi::Win64 => "win64 ",
+            Abi::Amd64 => "sysv ",
             Abi::Leaf => "leaf ",
         };
 
@@ -177,6 +178,8 @@ pub enum Abi {
     Fastcall,
     /// Windows x64.
     Win64,
+    /// System V AMD 64.
+    Amd64,
     /// For leaf function calling convention, no 
     /// argument or framing.
     Leaf,

@@ -320,6 +320,7 @@ pub struct Type {
 impl Type {
 
     pub const VOID: Self = DataType::Void.to_type();
+    pub const VOIDP: Self = Self::VOID.to_pointer(1);
     pub const BYTE: Self = DataType::Byte.to_type();
     pub const CHAR: Self = Self::BYTE; // Alias
     pub const BOOL: Self = Self::BYTE; // Alias

@@ -20,10 +20,12 @@ use std::num::NonZeroU32;
 
 use crate::ty::Type;
 
-// mod ty;
-// pub use ty::IdrType;
-
 mod fmt;
+
+pub mod new;
+
+
+// TODO: Check out BLOCK ARGUMENTS concept.
 
 
 /// A function is composed of statements and labels,
@@ -192,6 +194,7 @@ impl IdrVarFactory {
         Self::default()
     }
 
+    /// Create a new IDR variable unique to this factory.
     pub fn create(&mut self) -> IdrVar {
         let index = self.index;
         self.index = self.index.checked_add(1)

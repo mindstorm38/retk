@@ -16,6 +16,7 @@ use object::pe::ImageNtHeaders64;
 use object::LittleEndian as LE;
 
 use crate::func::{Function, ImportSymbol};
+use crate::idr::new::Statement;
 
 pub mod analyzer;
 pub mod block;
@@ -102,13 +103,40 @@ pub fn analyse(data: &[u8]) {
     println!("{begin_ip:08X} -> {end_ip:08X}");
     let mut idr_analyzer = x86::IdrDecoder::new();
     analyzer.runtime.goto(begin_ip, end_ip);
+    idr_analyzer.init();
     while let Some(inst) = analyzer.runtime.decoder.decode() {
         idr_analyzer.feed(&inst);
     }
-    for stmt in &idr_analyzer.function.statements {
-        println!("{stmt}");
-    }
+    
+    let func = idr_analyzer.function();
+    for (i, line) in func.lines().iter().enumerate() {
 
+        if let Some(bb) = &line.basic_block {
+            print!("bb{i}(");
+            for (i, (var, ty)) in bb.parameters().iter().enumerate() {
+                if i != 0 {
+                    print!(", ");
+                }
+                print!("{var}: {ty:?}");
+            }
+            println!(")");
+        }
+
+        if let Some(stmt) = &line.statement {
+            match stmt {
+                Statement::Store(store) => {
+                    println!(" *{}           = {}", store.ptr, store.var);
+                }
+                Statement::Assign(assign) => {
+                    println!("  {}: {:8} = {:?}", assign.var, format!("{:?}", assign.ty), assign.val);
+                }
+                Statement::Asm(asm) => {
+                    println!("                {asm}");
+                }
+            }
+        }
+
+    }
 
 
     // let section_name = section.name().unwrap();
