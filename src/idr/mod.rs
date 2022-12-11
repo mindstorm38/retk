@@ -20,154 +20,39 @@ use std::num::NonZeroU32;
 
 use crate::ty::Type;
 
-mod fmt;
-
-pub mod new;
+pub mod print;
 
 
-// TODO: Check out BLOCK ARGUMENTS concept.
-
-
-/// A function is composed of statements and labels,
-/// these labels are used to delimit basic blocks and the
-/// last statement of the basic block is an exit statement.
+/// An IDR function.
 #[derive(Debug, Default)]
 pub struct IdrFunction {
-    pub parameters: Vec<IdrParameter>,
-    /// All statements of this function.
-    pub statements: Vec<IdrStatement>,
-    /// Indices of labels, labels are the beginning of
-    /// basic blocks.
-    pub labels: Vec<usize>,
+    /// All lines/statements of the function.
+    pub basic_blocks: Vec<IdrBasicBlock>,
 }
 
 
-/// Represent a parameter.
+/// A basic block.
 #[derive(Debug)]
-pub struct IdrParameter {
-    pub var: IdrVar,
-    pub ty: Type,
+pub struct IdrBasicBlock {
+    /// Variables defined as parameters for the rest of the basic block.
+    pub parameters: Vec<(IdrVar, Type)>,
+    /// The statement of this line. If none this line is empty and
+    /// should be replaced by the next added statement.
+    pub statements: Vec<Statement>,
+    /// The branch to exit this basic block.
+    pub branch: Branch,
 }
 
-
-/// An IDR statement.
-#[derive(Debug, Clone)]
-pub enum IdrStatement {
-    /// An error happened while producing IDR statement.
-    Error,
-    /// Inline assembly statement.
-    Asm,
-    /// Assignement of an expression's result to a variable.
-    Assign {
-        /// The variable where the expression is assigned.
-        var: IdrVar,
-        /// Type of the variable.
-        ty: Type,
-        /// The expression that computes the value that will
-        /// be assigned to the place.
-        expr: IdrExpression,
-    },
-    /// Store a variable's value to a slot pointed to by 
-    /// another var.
-    Store {
-        /// The pointer to the slot where the variable's value
-        /// will be copied.
-        pointer: IdrVar,
-        /// The variable to store in the 
-        var: IdrVar,
-    },
-    /// A branch to another statement.
-    Branch {
-        pointer: u64,
-        left_var: IdrVar,
-        right_var: IdrVar,
-        cond: IdrCondition,
-    }
-}
-
-impl Default for IdrStatement {
+impl Default for IdrBasicBlock {
     fn default() -> Self {
-        Self::Error
+        Self { 
+            parameters: Vec::new(), 
+            statements: Vec::new(),
+            branch: Branch::Unknown,
+        }
     }
 }
 
-
-/// An expression that produce a value that is then assigned
-#[derive(Debug, Clone)]
-pub enum IdrExpression {
-    /// Externally defined value.
-    Extern,
-    /// Constant value.
-    Constant(i64),
-    /// Copy the value of another variable.
-    Copy(IdrVar),
-    /// Allocating a slot on the stack and return a pointer
-    /// to this slot, the given length is allocated.
-    Alloca(u16),
-    /// Interpret the given place as an pointer-sized integer
-    /// type and dereference it.
-    Deref {
-        /// The variable used as the base value to deref.
-        base: IdrVar,
-        /// The offset applied to the base value before deref.
-        offset: i64,
-    },
-    DerefIndexed {
-        /// The variable used as the base value to deref.
-        base: IdrVar,
-        /// The offset applied to the base value before deref.
-        offset: i32,
-        /// The variable used as the index, added to base and
-        /// offset and multiplied by scale before deref.
-        index: IdrVar,
-        /// Scale to apply to the index, usually a power of two.
-        scale: u8,
-    }, 
-    /// An absolute call to a function.
-    Call {
-        /// Address of the function to call.
-        pointer: u64,
-        /// Variables to pass as function's arguments.
-        args: Vec<IdrVar>,
-    },
-    /// An indirect call to a function.
-    CallIndirect {
-        /// The variable that contains the function's pointer 
-        /// to call.
-        pointer: IdrVar,
-        /// Variables to pass as function's arguments.
-        args: Vec<IdrVar>,
-    },
-    Add(IdrVar, IdrVar),
-    AddImm(IdrVar, i64),
-    Sub(IdrVar, IdrVar),
-    SubImm(IdrVar, i64),
-    Mul(IdrVar, IdrVar),
-    MulImm(IdrVar, i64),
-    Div(IdrVar, IdrVar),
-    DivImm(IdrVar, i64),
-    And(IdrVar, IdrVar),
-    AndImm(IdrVar, i64),
-    Or(IdrVar, IdrVar),
-    OrImm(IdrVar, i64),
-    Xor(IdrVar, IdrVar),
-    XorImm(IdrVar, i64),
-}
-
-
-#[derive(Debug, Clone, PartialEq, Eq, Copy)]
-pub enum IdrCondition {
-    Equal,
-    NotEqual,
-    UnsignedLower,
-    UnsignedLowerOrEqual,
-    UnsignedGreater,
-    UnsignedGreaterOrEqual,
-    SignedLower,
-    SignedLowerOrEqual,
-    SignedGreater,
-    SignedGeaterOrEqual,
-}
 
 /// Represent a variable in the 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -203,3 +88,191 @@ impl IdrVarFactory {
     }
 
 }
+
+
+/// A statement.
+#[derive(Debug)]
+pub enum Statement {
+    /// Store an expression's value to a pointed value.
+    Store(Store),
+    /// Create a new variable assignment.
+    /// 
+    /// The variable is guaranteed to be unique within
+    /// the statement's basic block.
+    Assign(Assign),
+    /// A raw assembly instruction, **currently** just string.
+    Asm(String),
+}
+
+#[derive(Debug)]
+pub struct Store {
+    /// The variable that is the pointer.
+    pub ptr: IdrVar,
+    /// The variable that has the value to store in the pointer.
+    pub var: IdrVar,
+}
+
+#[derive(Debug)]
+pub struct Assign {
+    /// Variable assigned.
+    pub var: IdrVar,
+    /// Type of the variable.
+    pub ty: Type,
+    /// The expression used that calculate the value to assign.
+    pub val: Expression,
+}
+
+impl Statement {
+
+    /// Get all variables read by the statement.
+    pub fn get_read_variables(&self, variables: &mut Vec<IdrVar>) {
+        match self {
+            Statement::Store(store) => {
+                variables.push(store.ptr);
+                variables.push(store.var);
+            }
+            Statement::Assign(assign) => {
+                match assign.val {
+                    Expression::Constant(_) => {}
+                    Expression::Load(var) => variables.push(var),
+                    Expression::Alloca(_) => {}
+                    Expression::Call { pointer, ref arguments } => {
+
+                        if let Value::Var(pointer) = pointer {
+                            variables.push(pointer);
+                        }
+
+                        variables.extend(arguments.iter().filter_map(|val| {
+                            match val {
+                                Value::Var(var) => Some(*var),
+                                _ => None,
+                            }
+                        }));
+
+                    }
+                    Expression::GetElementPointer { pointer, index, stride: _ } => {
+                        variables.push(pointer);
+                        variables.push(index);
+                    }
+                    Expression::Cmp(_, var, val) |
+                    Expression::Add(var, val) |
+                    Expression::Sub(var, val) |
+                    Expression::Mul(var, val) |
+                    Expression::Div(var, val) |
+                    Expression::Xor(var, val) => {
+                        variables.push(var);
+                        if let Value::Var(val) = val {
+                            variables.push(val);
+                        }
+                    }
+                }
+            }
+            Statement::Asm(_) => {}
+        }
+    }
+
+}
+
+
+/// An exit branch for a basic block.
+#[derive(Debug)]
+pub enum Branch {
+    /// Unknown branching, usually impossible after a full analysis.
+    Unknown,
+    /// Unconditionnal branch to the given basic block.
+    Unconditionnal {
+        /// Index of the basic block to goto.
+        index: usize,
+        /// Arguments of the basic block.
+        args: Vec<IdrVar>,
+    },
+    /// Conditinnal branch depending on a boolean variable.
+    Conditionnal {
+        var: IdrVar,
+        /// Index of the basic block to goto if the condition is met.
+        then_index: usize,
+        /// Arguments of the basic block to goto if the condition is met.
+        then_args: Vec<IdrVar>,
+        /// Index of the basic block to goto if the condition is not met.
+        else_index: usize,
+        /// Arguments of the basic block to goto if the condition is not met.
+        else_args: Vec<IdrVar>,
+    },
+    /// Returning from the function.
+    Ret,
+}
+
+
+/// Represent an rvalue in an assignment or store.
+#[derive(Debug)]
+pub enum Expression {
+    /// A constant value.
+    Constant(i64),
+    /// Load a value by dereferencing the given variable.
+    Load(IdrVar),
+    /// Stack allocation of a given size. *Value type is a pointer.*
+    Alloca(u16),
+    /// A call to another function.
+    Call {
+        /// The value of the pointer.
+        pointer: Value,
+        /// Arguments given to the function.
+        arguments: Vec<Value>,
+    },
+    /// Offset a given pointer by a given index and stride.
+    GetElementPointer {
+        pointer: IdrVar, 
+        index: IdrVar, 
+        stride: u8
+    },
+    /// Compare two values and place return a boolean.
+    Cmp(Comparison, IdrVar, Value),
+    /// Add a value to a variable. Both values should have the same 
+    /// type, *and this is the returned type*.
+    Add(IdrVar, Value),
+    /// Sub a value from a variable. Both values should have the same 
+    /// type, *and this is the returned type*.
+    Sub(IdrVar, Value),
+    /// Mul a value to a variable. Both values should have the same 
+    /// type, *and this is the returned type*.
+    Mul(IdrVar, Value),
+    /// Div a value to a variable. Both values should have the same 
+    /// type, *and this is the returned type*.
+    Div(IdrVar, Value),
+    /// XOR a value to a variable. Both values should have the same 
+    /// type, *and this is the returned type*.
+    Xor(IdrVar, Value),
+}
+
+/// Kind of comparison
+#[derive(Debug)]
+pub enum Comparison {
+    Equal,
+    NotEqual,
+}
+
+
+/// Describe the effective value for an expression,
+/// can be either a variable or a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Value {
+    /// The value is a variable.
+    Var(IdrVar),
+    /// A constant value.
+    Val(i64)
+}
+
+
+// #[derive(Debug, Clone, PartialEq, Eq, Copy)]
+// pub enum IdrCondition {
+//     Equal,
+//     NotEqual,
+//     UnsignedLower,
+//     UnsignedLowerOrEqual,
+//     UnsignedGreater,
+//     UnsignedGreaterOrEqual,
+//     SignedLower,
+//     SignedLowerOrEqual,
+//     SignedGreater,
+//     SignedGeaterOrEqual,
+// }

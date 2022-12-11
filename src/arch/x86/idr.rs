@@ -2,19 +2,14 @@
 
 
 use std::collections::hash_map::Entry;
-use std::collections::{VecDeque, HashMap};
+use std::collections::HashMap;
 
 use iced_x86::{Instruction, Code, Register, ConditionCode};
 
 use crate::idr::{
-    // IdrFunction, IdrCondition,
-    // IdrStatement, IdrExpression, 
     IdrVarFactory, IdrVar, 
-};
-
-use crate::idr::new::{
-    Function, 
-    Statement, Expression, Value, Assign, Store
+    IdrFunction, IdrBasicBlock,
+    Statement, Expression, Value, Assign, Store, Branch, Comparison
 };
 
 use crate::ty::Type;
@@ -51,22 +46,16 @@ use crate::ty::Type;
 /// In this second step, the decoder fixes 
 /// 
 pub struct IdrDecoder {
-    /// The IDR function being decoded, which is architecture
-    /// independent. For the decoding, we need to keep track
-    /// of some architecture-specific informations, these
-    /// are kept in this structure.
-    function: Function,
+    /// Tracker for the current function and its basic blocks.
+    function: FunctionTracker,
+    /// Tracker for constant value stored in variables.
+    constants: ConstantTracker,
+
+    /// Internal factory to create unique variables.
+    var_factory: IdrVarFactory,
     /// Current stack pointer. It is common through all of the
     /// function.
     stack_pointer: i32,
-    /// Individual basic blocks trackers.
-    basic_blocks: HashMap<usize, Box<BasicBlockTracker>>,
-    /// The current basic block being built.
-    basic_block: Option<Box<BasicBlockTracker>>,
-    /// Tracker for constant value stored in variables.
-    constants: ConstantTracker,
-    /// Internal factory to create unique variables.
-    var_factory: IdrVarFactory,
     /// Track the last comparison that might be used in a lated
     /// conditionnal jump.
     cmp: Option<Cmp>,
@@ -77,33 +66,32 @@ impl IdrDecoder {
     #[inline]
     pub fn new() -> Self {
         Self {
-            function: Function::default(),
-            stack_pointer: 0,
-            basic_blocks: HashMap::new(),
-            basic_block: None,
+            function: FunctionTracker::default(),
             constants: ConstantTracker::default(),
             var_factory: IdrVarFactory::new(),
+            stack_pointer: 0,
             cmp: None,
         }
     }
 
     /// Initialize the IDR decoder to prepare for a new function.
     pub fn init(&mut self) {
+        self.function.init();
+    }
 
-        // Clear the function and add an initial line for the first
-        // basic block.
-        self.function.clear();
-        self.function.add_line(); // At index 0 ofc
-        self.function.set_basic_block(0);
-        self.basic_block = Some(Box::new(BasicBlockTracker::new(0)));
+    pub fn finish(&mut self) {
 
     }
 
     pub fn feed(&mut self, inst: &Instruction) {
-        
+
         println!("- {inst}");
+
+        let ip = inst.ip();
+        self.function.forward(ip);
         
         match inst.code() {
+            // NOP
             Code::Nopw |
             Code::Nopd |
             Code::Nopq |
@@ -111,38 +99,89 @@ impl IdrDecoder {
             Code::Nop_rm32 |
             Code::Nop_rm64 |
             Code::Int3 => {}
+            // PUSH
             Code::Push_r64 |
             Code::Push_r32 |
             Code::Push_r16 => self.decode_push_r(inst),
+            // POP
             Code::Pop_r64 |
             Code::Pop_r32 |
             Code::Pop_r16 => self.decode_pop_r(inst),
+            // LEA
             Code::Lea_r64_m |
             Code::Lea_r32_m |
             Code::Lea_r16_m => self.decode_lea_r_m(inst),
+            // ADD
             Code::Add_rm64_imm8 |
             Code::Add_rm32_imm8 |
             Code::Add_rm16_imm8 |
             Code::Add_rm8_imm8 |
             Code::Add_rm64_imm32 |
             Code::Add_rm32_imm32 |
-            Code::Add_rm16_imm16 => self.decode_int_op_rm_imm(inst, IntOp::Add),
+            Code::Add_rm16_imm16  => self.decode_int_op_rm_imm(inst, NumOp::Add),
+            Code::Add_r64_rm64 |
+            Code::Add_r32_rm32 |
+            Code::Add_r16_rm16 |
+            Code::Add_r8_rm8 |
+            Code::Add_rm64_r64 |
+            Code::Add_rm32_r32 |
+            Code::Add_rm16_r16 |
+            Code::Add_rm8_r8 => self.decode_int_op_rm_rm(inst, NumOp::Add),
+            // SUB
             Code::Sub_rm64_imm8 |
             Code::Sub_rm32_imm8 |
             Code::Sub_rm16_imm8 |
             Code::Sub_rm8_imm8 |
             Code::Sub_rm64_imm32 |
             Code::Sub_rm32_imm32 |
-            Code::Sub_rm16_imm16 => self.decode_int_op_rm_imm(inst, IntOp::Sub),
+            Code::Sub_rm16_imm16  => self.decode_int_op_rm_imm(inst, NumOp::Sub),
+            Code::Sub_r64_rm64 |
+            Code::Sub_r32_rm32 |
+            Code::Sub_r16_rm16 |
+            Code::Sub_r8_rm8 |
+            Code::Sub_rm64_r64 |
+            Code::Sub_rm32_r32 |
+            Code::Sub_rm16_r16 |
+            Code::Sub_rm8_r8 => self.decode_int_op_rm_rm(inst, NumOp::Sub),
+            // SUB
+            Code::Xor_rm64_imm8 |
+            Code::Xor_rm32_imm8 |
+            Code::Xor_rm16_imm8 |
+            Code::Xor_rm8_imm8 |
+            Code::Xor_rm64_imm32 |
+            Code::Xor_rm32_imm32 |
+            Code::Xor_rm16_imm16  => self.decode_int_op_rm_imm(inst, NumOp::Xor),
+            Code::Xor_r64_rm64 |
+            Code::Xor_r32_rm32 |
+            Code::Xor_r16_rm16 |
+            Code::Xor_r8_rm8 |
+            Code::Xor_rm64_r64 |
+            Code::Xor_rm32_r32 |
+            Code::Xor_rm16_r16 |
+            Code::Xor_rm8_r8 => self.decode_int_op_rm_rm(inst, NumOp::Xor),
+            // MOV
             Code::Mov_r64_imm64 |
             Code::Mov_r32_imm32 |
-            Code::Mov_r16_imm16 => self.decode_mov_r_imm(inst),
+            Code::Mov_r16_imm16 |
+            Code::Mov_r8_imm8 |
+            Code::Mov_rm64_imm32 |
+            Code::Mov_rm32_imm32 |
+            Code::Mov_rm16_imm16 |
+            Code::Mov_rm8_imm8 => self.decode_mov_rm_imm(inst),
             Code::Mov_r64_rm64 |
             Code::Mov_r32_rm32 |
-            Code::Mov_r16_rm16 => self.decode_mov_r_rm(inst),
+            Code::Mov_r16_rm16 |
+            Code::Mov_r8_rm8 => self.decode_mov_r_rm(inst),
             Code::Mov_rm64_r64 |
             Code::Mov_rm32_r32 |
-            Code::Mov_rm16_r16 => self.decode_mov_rm_r(inst),
+            Code::Mov_rm16_r16 |
+            Code::Mov_rm8_r8 => self.decode_mov_rm_r(inst),
+            // MOVSS/MOVSD
+            Code::Movss_xmm_xmmm32 => self.decode_movs_r_rm(inst, false),
+            Code::Movss_xmmm32_xmm => self.decode_movs_rm_r(inst, false),
+            Code::Movsd_xmm_xmmm64 => self.decode_movs_r_rm(inst, true),
+            Code::Movsd_xmmm64_xmm => self.decode_movs_rm_r(inst, true),
+            // CALL
             Code::Call_rel16 |
             Code::Call_rel32_32 |
             Code::Call_rel32_64 => self.decode_call_rel(inst),
@@ -155,21 +194,41 @@ impl IdrDecoder {
             // Code::Cmp_rm64_imm32 |
             // Code::Cmp_rm32_imm32 |
             // Code::Cmp_rm16_imm16 => self.decode_cmp_rm_imm(inst),
+            // TEST
             Code::Test_rm64_r64 |
             Code::Test_rm32_r32 |
             Code::Test_rm16_r16 |
             Code::Test_rm8_r8 => self.decode_test_rm_r(inst),
-            // code if code.is_jcc_short_or_near() => self.decode_jcc(inst),
+            // Jcc
+            code if code.is_jcc_short_or_near() => self.decode_jcc(inst),
+            // JMP
+            Code::Jmp_rel8_64 |
+            Code::Jmp_rel8_32 |
+            Code::Jmp_rel8_16 |
+            Code::Jmp_rel32_64 |
+            Code::Jmp_rel32_32 => self.decode_jmp(inst),
+            // RET
+            Code::Retnq |
+            Code::Retnd |
+            Code::Retnw |
+            Code::Retnq_imm16 |
+            Code::Retnd_imm16 |
+            Code::Retnw_imm16 |
+            Code::Retfq |
+            Code::Retfd |
+            Code::Retfw |
+            Code::Retfq_imm16 |
+            Code::Retfd_imm16 |
+            Code::Retfw_imm16 => self.decode_ret(inst),
             _ => {
                 self.push_stmt(Statement::Asm(inst.to_string()));
             }
         }
-
     }
 
     #[inline]
-    pub fn function(&self) -> &Function {
-        &self.function
+    pub fn function(&self) -> &IdrFunction {
+        &self.function.function
     }
 
     fn sub_sp(&mut self, delta: i32) -> i32 {
@@ -188,52 +247,50 @@ impl IdrDecoder {
 
     /// Read a stack pointer variable, ensuring that it already exists.
     fn read_stack_var(&mut self, addr: i32) -> IdrVar {
-        let bb = self.basic_block.as_mut().unwrap();
+        let (bb, bb_tracker) = self.function.basic_block_mut();
         let param = FunctionParam::Stack(addr);
-        match bb.vars.entry(param) {
+        match bb_tracker.variables.entry(param) {
             Entry::Occupied(o) => *o.into_mut(),
             Entry::Vacant(v) => {
                 let var = self.var_factory.create();
-                self.function.get_basic_block_mut(bb.index).unwrap()
-                    .add_param(var, Type::VOIDP);
-                bb.params.push(param);
+                bb.parameters.push((var, Type::VOIDP));
+                bb_tracker.parameters.push(param);
                 *v.insert(var)
             }
         }
     }
 
     fn read_reg_var(&mut self, reg: Register, ty: Type) -> IdrVar {
-        let bb = self.basic_block.as_mut().unwrap();
+        let (bb, bb_tracker) = self.function.basic_block_mut();
         let param = FunctionParam::Reg(reg);
-        match bb.vars.entry(param) {
+        match bb_tracker.variables.entry(param) {
             Entry::Occupied(o) => *o.into_mut(),
             Entry::Vacant(v) => {
                 let var = self.var_factory.create();
-                self.function.get_basic_block_mut(bb.index).unwrap()
-                    .add_param(var, ty);
-                bb.params.push(param);
+                bb.parameters.push((var, ty));
+                bb_tracker.parameters.push(param);
                 *v.insert(var)
             }
         }
     }
 
     fn write_reg_var(&mut self, reg: Register) -> IdrVar {
-        let bb = self.basic_block.as_mut().unwrap();
+        let (_, bb_tracker) = self.function.basic_block_mut();
         let param = FunctionParam::Reg(reg);
         let var = self.var_factory.create();
-        bb.vars.insert(param, var);
+        bb_tracker.variables.insert(param, var);
         var
     }
 
     fn get_reg_var(&self, reg: Register) -> Option<IdrVar> {
-        let bb = self.basic_block.as_ref().unwrap();
-        bb.vars.get(&FunctionParam::Reg(reg)).copied()
+        let (_, bb_tracker) = self.function.basic_block();
+        bb_tracker.variables.get(&FunctionParam::Reg(reg)).copied()
     }
 
     fn set_reg_var(&mut self, reg: Register, var: IdrVar) {
-        let bb = self.basic_block.as_mut().unwrap();
+        let (_, bb_tracker) = self.function.basic_block_mut();
         let param = FunctionParam::Reg(reg);
-        bb.vars.insert(param, var);
+        bb_tracker.variables.insert(param, var);
     }
 
     /// Utility method for fast query of constant value stored in
@@ -245,7 +302,8 @@ impl IdrDecoder {
 
     #[inline]
     fn push_stmt(&mut self, stmt: Statement) {
-        self.function.add_statement(stmt);
+        let (bb, _) = self.function.basic_block_mut();
+        bb.statements.push(stmt);
     }
 
     /// Internal function to enqueue a statement
@@ -365,61 +423,131 @@ impl IdrDecoder {
 
     }
 
-    fn decode_int_op_rm_imm(&mut self, inst: &Instruction, op: IntOp) {
-        let imm = inst.immediate64() as i64;
+    fn decode_int_op_rm_imm(&mut self, inst: &Instruction, op: NumOp) {
+        let imm = inst.immediate32to64();
         match inst.op0_register() {
             Register::None => {
                 // <op> [], imm
                 let mem_size = inst.memory_size().size() as u16;
-                let mem_ty = Type::from_integer_size(mem_size);
-                let mem_var = self.decode_mem_addr(inst, mem_ty);
+                let ty = Type::from_integer_size(mem_size);
+                let mem_var = self.decode_mem_addr(inst, ty);
                 // Temp variable to store loaded value.
                 let val_var = self.create_dummy_var();
-                self.push_assign(val_var, mem_ty, Expression::Load(mem_var));
+                self.push_assign(val_var, ty, Expression::Load(mem_var));
                 // Temp variable to store result of operation.
                 let tmp_var = self.create_dummy_var();
-                self.push_assign(tmp_var, mem_ty, match op {
-                    IntOp::Add => Expression::Add(val_var, Value::Val(imm)),
-                    IntOp::Sub => Expression::Sub(val_var, Value::Val(imm)),
+                self.push_assign(tmp_var, ty, match op {
+                    NumOp::Add => Expression::Add(val_var, Value::Val(imm)),
+                    NumOp::Sub => Expression::Sub(val_var, Value::Val(imm)),
+                    NumOp::Xor => Expression::Xor(val_var, Value::Val(imm)),
                 });
                 // Store the final value back on mem pointer.
                 self.push_store(mem_var, tmp_var)
             }
+            Register::SP |
+            Register::ESP |
             Register::RSP => {
                 // <op> rsp, imm
                 match op {
-                    IntOp::Add => self.add_sp(imm as i32),
-                    IntOp::Sub => self.sub_sp(imm as i32),
+                    NumOp::Add => self.add_sp(imm as i32),
+                    NumOp::Sub => self.sub_sp(imm as i32),
+                    _ => panic!("operation {op:?} no support on sp")
                 };
             }
             reg => {
                 // <op> <reg>, imm
                 let reg_size = reg.size() as u16;
                 let reg_ty = Type::from_integer_size(reg_size);
-                let reg_var = self.read_reg_var(reg, reg_ty);
-                self.push_assign(reg_var, reg_ty, match op {
-                    IntOp::Add => Expression::Add(reg_var, Value::Val(imm)),
-                    IntOp::Sub => Expression::Sub(reg_var, Value::Val(imm)),
+                let reg_read_var = self.read_reg_var(reg, reg_ty);
+                let reg_write_var = self.write_reg_var(reg);
+                self.push_assign(reg_write_var, reg_ty, match op {
+                    NumOp::Add => Expression::Add(reg_read_var, Value::Val(imm)),
+                    NumOp::Sub => Expression::Sub(reg_read_var, Value::Val(imm)),
+                    NumOp::Xor => Expression::Xor(reg_read_var, Value::Val(imm)),
                 });
             }
         }
     }
 
-    fn decode_mov_r_imm(&mut self, inst: &Instruction) {
-
-        let reg = inst.op0_register();
-        let imm = inst.immediate64();
-
-        if let Register::SP | Register::ESP | Register::RSP = reg {
-            // mov rsp, imm
-            panic!("move to sp cause undefined final address");
-        } else {
-            // mov <reg>, imm
-            let reg_var = self.write_reg_var(reg);
-            let reg_ty = Type::from_integer_size(reg.size() as u16);
-            self.push_assign(reg_var, reg_ty, Expression::Constant(imm as i64));
+    fn decode_int_op_rm_rm(&mut self, inst: &Instruction, op: NumOp) {
+        match (inst.op0_register(), inst.op1_register()) {
+            (Register::None, reg1) => {
+                // <op> [], <reg1>
+                let ty = Type::from_integer_size(reg1.size() as u16);
+                let mem_var = self.decode_mem_addr(inst, ty);
+                // Temp variable to store loaded value.
+                let val_var = self.create_dummy_var();
+                self.push_assign(val_var, ty, Expression::Load(mem_var));
+                // Temp variable to store result of operation.
+                let tmp_var = self.create_dummy_var();
+                let reg1_var = self.read_reg_var(reg1, ty);
+                self.push_assign(tmp_var, ty, match op {
+                    NumOp::Add => Expression::Add(val_var, Value::Var(reg1_var)),
+                    NumOp::Sub => Expression::Sub(val_var, Value::Var(reg1_var)),
+                    NumOp::Xor => Expression::Xor(val_var, Value::Var(reg1_var)),
+                    
+                });
+                // Store the final value back on mem pointer.
+                self.push_store(mem_var, tmp_var);
+            }
+            (reg0, Register::None) => {
+                let ty = Type::from_integer_size(reg0.size() as u16);
+                let mem_var = self.decode_mem_addr(inst, ty);
+                // Temp variable to store loaded value.
+                let val_var = self.create_dummy_var();
+                self.push_assign(val_var, ty, Expression::Load(mem_var));
+                // Temp variable to store result of operation.
+                let reg0_read_var = self.read_reg_var(reg0, ty);
+                let reg0_write_var = self.write_reg_var(reg0);
+                self.push_assign(reg0_write_var, ty, match op {
+                    NumOp::Add => Expression::Add(reg0_read_var, Value::Var(val_var)),
+                    NumOp::Sub => Expression::Sub(reg0_read_var, Value::Var(val_var)),
+                    NumOp::Xor => Expression::Xor(reg0_read_var, Value::Var(val_var)),
+                });
+            }
+            (reg0, reg1) if op == NumOp::Xor && reg0 == reg1 => {
+                let ty = Type::from_integer_size(reg0.size() as u16);
+                let reg_var = self.write_reg_var(reg0);
+                self.push_assign(reg_var, ty, Expression::Constant(0));
+            }
+            (reg0, reg1) => {
+                let ty = Type::from_integer_size(reg0.size() as u16);
+                let reg1_var = self.read_reg_var(reg1, ty);
+                let reg0_read_var = self.read_reg_var(reg0, ty);
+                let reg0_write_var = self.write_reg_var(reg0);
+                self.push_assign(reg0_write_var, ty, match op {
+                    NumOp::Add => Expression::Add(reg0_read_var, Value::Var(reg1_var)),
+                    NumOp::Sub => Expression::Sub(reg0_read_var, Value::Var(reg1_var)),
+                    NumOp::Xor => Expression::Xor(reg0_read_var, Value::Var(reg1_var)),
+                });
+            }
         }
+    }
 
+    fn decode_mov_rm_imm(&mut self, inst: &Instruction) {
+        let imm = inst.immediate32to64();
+        match inst.op0_register() {
+            Register::None => {
+                // mov [], imm
+                let ty = Type::from_integer_size(inst.memory_size().size() as u16);
+                let mem_var = self.decode_mem_addr(inst, ty);
+                let val_var = self.var_factory.create();
+                self.push_assign(val_var, ty, Expression::Constant(imm));
+                self.push_store(mem_var, val_var);
+            }
+            Register::SP |
+            Register::ESP |
+            Register::RSP => {
+                // mov rsp, imm
+                panic!("move to sp cause undefined final address");
+            }
+            reg => {
+                // mov <reg>, imm
+                let reg_var = self.write_reg_var(reg);
+                let ty = Type::from_integer_size(reg.size() as u16);
+                self.push_assign(reg_var, ty, Expression::Constant(imm));
+            }
+        }
     }
 
     fn decode_mov_r_rm(&mut self, inst: &Instruction) {
@@ -449,7 +577,6 @@ impl IdrDecoder {
                     let reg1_var = self.read_reg_var(reg1, reg0_ty);
                     self.set_reg_var(reg0, reg1_var);
                 }
-
             }
         }
 
@@ -482,6 +609,41 @@ impl IdrDecoder {
             }
         }
 
+    }
+
+    fn decode_movs_r_rm(&mut self, inst: &Instruction, double: bool) {
+        let reg0 = inst.op0_register();
+        let ty = if double { Type::DOUBLE } else { Type::FLOAT };
+        match inst.op1_register() {
+            Register::None => {
+                // mov <reg0>, []
+                let mem_var = self.decode_mem_addr(inst, ty);
+                let reg0_var = self.write_reg_var(reg0);
+                self.push_assign(reg0_var, ty, Expression::Load(mem_var));
+            }
+            reg1 => {
+                // mov <reg0>, <reg1>
+                let reg1_var = self.read_reg_var(reg1, ty);
+                self.set_reg_var(reg0, reg1_var);
+            }
+        }
+    }
+
+    fn decode_movs_rm_r(&mut self, inst: &Instruction, double: bool) {
+        let reg1 = inst.op1_register();
+        let ty = if double { Type::DOUBLE } else { Type::FLOAT };
+        match inst.op0_register() {
+            Register::None => {
+                // mov [], <reg1>
+                let mem_var = self.decode_mem_addr(inst, ty);
+                let reg1_var = self.read_reg_var(reg1, ty);
+                self.push_store(mem_var, reg1_var);
+            }
+            reg0 => {
+                let reg1_var = self.read_reg_var(reg1, ty);
+                self.set_reg_var(reg0, reg1_var);
+            }
+        }
     }
 
     fn decode_call_rel(&mut self, inst: &Instruction) {
@@ -550,98 +712,114 @@ impl IdrDecoder {
         };
 
         self.cmp = Some(Cmp {
-            left: Value::Var(left_var),
-            right: Value::Var(right_var),
+            left: left_var,
+            right: right_var,
             ty: reg_ty,
             kind: CmpKind::Test,
         });
 
     }
 
-    // fn decode_jcc(&mut self, inst: &Instruction) {
+    fn decode_jcc(&mut self, inst: &Instruction) {
+        
+        let Some(cmp) = self.cmp.take() else { return; };
+        let pointer = inst.near_branch64();
 
-    //     // Note that we take the comparison, so it is replaced 
-    //     // with none. Even if jump instructions doesn't clear
-    //     // the comparison flags, because of the switch of
-    //     // basic blocks, we should clear it (at least for now). 
-    //     if let Some(cmp) = self.cmp.take() {
+        let cmp_var = self.var_factory.create();
 
-    //         let pointer = inst.near_branch64();
+        match cmp.kind {
+            CmpKind::Cmp => {
+                return; // TODO:
+            }
+            CmpKind::Test => {
 
-    //         match cmp.kind {
-    //             AnalyzerCmpKind::Cmp => {
+                if cmp.left == cmp.right {
 
-    //                 let idr_cond = match inst.condition_code() {
-    //                     ConditionCode::None => unreachable!(),
-    //                     ConditionCode::o => todo!(),
-    //                     ConditionCode::no => todo!(),
-    //                     ConditionCode::b => IdrCondition::UnsignedLower,
-    //                     ConditionCode::ae => IdrCondition::UnsignedGreaterOrEqual,
-    //                     ConditionCode::e => IdrCondition::Equal,
-    //                     ConditionCode::ne => IdrCondition::NotEqual,
-    //                     ConditionCode::be => IdrCondition::UnsignedLowerOrEqual,
-    //                     ConditionCode::a => IdrCondition::UnsignedGreater,
-    //                     ConditionCode::s => todo!(),
-    //                     ConditionCode::ns => todo!(),
-    //                     ConditionCode::p => todo!(),
-    //                     ConditionCode::np => todo!(),
-    //                     ConditionCode::l => IdrCondition::SignedLower,
-    //                     ConditionCode::ge => IdrCondition::SignedGeaterOrEqual,
-    //                     ConditionCode::le => IdrCondition::SignedLowerOrEqual,
-    //                     ConditionCode::g => IdrCondition::SignedGreater,
-    //                 };
+                    let comp = match inst.condition_code() {
+                        ConditionCode::e => Comparison::Equal,
+                        ConditionCode::ne => Comparison::NotEqual,
+                        _ => todo!()
+                    };
+
+                    self.push_assign(cmp_var, Type::BOOL, Expression::Cmp(comp, cmp.left, Value::Val(0)));
+
+                } else {
+                    return; // TODO:
+                }
+
+            }
+        }
+
+        // A conditionnal statement creates two basic blocks.
+        let then_index = self.function.ensure_basic_block(pointer);
+        let else_index = self.function.ensure_basic_block(inst.next_ip());
+
+        let (bb, _) = self.function.basic_block_mut();
+
+        bb.branch = Branch::Conditionnal { 
+            var: cmp_var,
+            then_index, 
+            then_args: Vec::new(), 
+            else_index, 
+            else_args: Vec::new(),
+        };
+
+    }
+
+    fn decode_jmp(&mut self, inst: &Instruction) {
+        
+        let pointer = inst.near_branch64();
+        let goto_index = self.function.ensure_basic_block(pointer);
+
+        for param in &self.function.basic_block_trackers[goto_index].parameters {
+            
+        }
+        
+        let (bb, _) = self.function.basic_block_mut();
+        bb.branch = Branch::Unconditionnal { index: goto_index, args: Vec::new() };
+
+        self.function.basic_block_end();
+
+    }
     
-    //                 self.push_branch(pointer, cmp.left_var, cmp.right_var, idr_cond);
+    fn decode_ret(&mut self, _inst: &Instruction) {
 
-    //             }
-    //             AnalyzerCmpKind::Test => {
+        let (bb, _) = self.function.basic_block_mut();
+        bb.branch = Branch::Ret;
 
-    //                 let test_var;
+        self.function.basic_block_end();
 
-    //                 // A common usage for test is to test if a variable 
-    //                 // is equal to 0 or not, in this case the pattern is
-    //                 // > test r0, r0
-    //                 // > JE  => if r0 == 0
-    //                 // > JNE => if r0 != 0
-    //                 if cmp.left_var == cmp.right_var {
-    //                     test_var = cmp.left_var;
-    //                 } else {
-    //                     test_var = self.var_factory.create();
-    //                     self.push_assign(test_var, cmp.ty.clone(), IdrExpression::And(cmp.left_var, cmp.right_var));
-    //                 }
-
-    //                 let idr_cond = match inst.condition_code() {
-    //                     ConditionCode::e => IdrCondition::Equal,
-    //                     ConditionCode::ne => IdrCondition::NotEqual,
-    //                     _ => todo!("unsupported condition code with 'test'"),
-    //                 };
-
-    //                 let zero_var = self.var_factory.create();
-    //                 self.push_assign(zero_var, cmp.ty, IdrExpression::Constant(0));
-
-    //                 self.push_branch(pointer, test_var, zero_var, idr_cond);
-
-    //             }
-    //         }
-
-    //     } else {
-    //         // No preceding comparison, error.
-    //         self.function.statements.push(IdrStatement::Error);
-    //     }
-
-    // }   
+    }
 
 }
 
 
+#[derive(Default)]
+struct FunctionTracker {
+    /// The IDR function being decoded, which is architecture
+    /// independent. For the decoding, we need to keep track
+    /// of some architecture-specific informations, these
+    /// are kept in this structure.
+    function: IdrFunction,
+    /// Individual trackers for each basic blocks of the current
+    /// function.
+    basic_block_trackers: Vec<BasicBlockTracker>,
+    /// Index of the current basic block being decoded.
+    /// When `None`, a basic block need to be created on the
+    /// next instruction.
+    basic_block_index: Option<usize>,
+    /// Mapping of Instruction Pointers to (basic block index, 
+    /// statement index).
+    ip_mapping: HashMap<u64, (usize, usize)>,
+}
+
+#[derive(Default)]
 struct BasicBlockTracker {
-    /// Index of this basic block within the function's lines.
-    index: usize,
     /// Each parameter is mapped to a specific memory slot.
-    params: Vec<FunctionParam>,
+    parameters: Vec<FunctionParam>,
     /// Mapping of which variable is contained in specific
     /// memory slots.
-    vars: HashMap<FunctionParam, IdrVar>,
+    variables: HashMap<FunctionParam, IdrVar>,
 }
 
 /// Describe how a parameter is passed to a basic block when
@@ -655,14 +833,122 @@ enum FunctionParam {
     Stack(i32),
 }
 
-impl BasicBlockTracker {
+impl FunctionTracker {
 
-    pub fn new(index: usize) -> Self {
-        Self {
-            index,
-            params: Vec::new(),
-            vars: HashMap::new(),
+    fn init(&mut self) {
+        self.function.basic_blocks.clear();
+        self.basic_block_trackers.clear();
+        self.basic_block_index = None;
+        self.ip_mapping.clear();
+    }
+
+    /// Internal function to get the IDR basic block together with its 
+    /// arch-specific tracker.
+    #[inline]
+    fn basic_block(&self) -> (&IdrBasicBlock, &BasicBlockTracker) {
+        let index = self.basic_block_index.unwrap();
+        (&self.function.basic_blocks[index], &self.basic_block_trackers[index])
+    }
+
+    /// Internal function to get the IDR basic block together with its 
+    /// arch-specific tracker.
+    #[inline]
+    fn basic_block_mut(&mut self) -> (&mut IdrBasicBlock, &mut BasicBlockTracker) {
+        let index = self.basic_block_index.unwrap();
+        (&mut self.function.basic_blocks[index], &mut self.basic_block_trackers[index])
+    }
+
+    /// End the current basic block.
+    #[inline]
+    fn basic_block_end(&mut self) {
+        self.basic_block_index = None;
+    }
+
+    /// Internal function to forward to a given IP, the IP should go instruction
+    /// by instruction.
+    fn forward(&mut self, ip: u64) {
+
+        let bb_index = match self.basic_block_index {
+            Some(index) => index,
+            None => {
+                let index = self.function.basic_blocks.len();
+                self.function.basic_blocks.push(IdrBasicBlock::default());
+                self.basic_block_trackers.push(BasicBlockTracker::default());
+                self.basic_block_index = Some(index);
+                index
+            }
+        };
+
+        let bb = &mut self.function.basic_blocks[bb_index];
+
+        match self.ip_mapping.entry(ip) {
+            Entry::Occupied(o) => {
+                // If the IP is already mapped, use its index.
+                let &(new_bb_index, _) = o.get();
+                if let Branch::Unknown = bb.branch {
+                    bb.branch = Branch::Unconditionnal { 
+                        index: new_bb_index, 
+                        args: Vec::new()
+                    };
+                }
+                self.basic_block_index = Some(new_bb_index);
+            }
+            Entry::Vacant(v) => {
+                // If the IP is not mapped, map it to the current statement.
+                v.insert((bb_index, bb.statements.len()));
+            }
         }
+
+    }
+
+    /// Internal function to ensure that a basic block exists at the given 
+    /// intruction pointer. The index of the basic block is returned.
+    /// 
+    /// This function handles the case where a basic block is inserted 
+    /// within an existing one and its parameters are fixed regarding that.
+    fn ensure_basic_block(&mut self, ip: u64) -> usize {
+
+        // If this is "some", this means that we are defining a basic block
+        // in middle of an already existing one. Because of this we'll need
+        // to recompute the basic block parameters because some of them will
+        // no longer be useful in the first block of the split.
+        match self.ip_mapping.get(&ip) {
+            Some(&(index, 0)) => {
+                // We constrain the statement index to 0, because it's the
+                // only index that is the start of a basic block.
+                index
+            }
+            Some(&(index, statement_index)) => {
+
+                // We are splitting an existing basic block in half.
+
+                let mut new_bb = IdrBasicBlock::default();
+                let mut new_bb_tracker = BasicBlockTracker::default();
+
+                let override_bb = &mut self.function.basic_blocks[index];
+
+                // Move all statements in their new basic block.
+                new_bb.statements.extend(override_bb.statements.drain(statement_index..));
+
+                // FIXME:
+
+                let index = self.function.basic_blocks.len();
+                self.function.basic_blocks.push(new_bb);
+                self.basic_block_trackers.push(new_bb_tracker);
+                self.ip_mapping.insert(ip, (index, 0));
+                index
+
+            }
+            None => {
+                // Add an empty basic block, that will be decoded later.
+                let index = self.function.basic_blocks.len();
+                self.function.basic_blocks.push(IdrBasicBlock::default());
+                self.basic_block_trackers.push(BasicBlockTracker::default());
+                self.ip_mapping.insert(ip, (index, 0));
+                index
+            }
+        }
+
     }
 
 }
@@ -720,17 +1006,18 @@ impl ConstantTracker {
 
 /// Internally used in a common function for all integer operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IntOp {
+enum NumOp {
     Add,
     Sub,
+    Xor,
 }
 
 
 /// Internal structure used to track possible comparisons.
 #[derive(Debug, Clone)]
 struct Cmp {
-    left: Value,
-    right: Value,
+    left: IdrVar,
+    right: IdrVar,
     ty: Type,
     kind: CmpKind,
 }

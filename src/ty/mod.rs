@@ -360,6 +360,15 @@ impl Type {
         }
     }
 
+    #[track_caller]
+    pub fn from_float_size(size: u16) -> Self {
+        match size {
+            4 => Self::FLOAT,
+            8 => Self::DOUBLE,
+            _ => panic!("unsupported float size: {size}")
+        }
+    }
+
 }
 
 impl From<DataType> for Type {

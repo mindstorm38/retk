@@ -16,7 +16,6 @@ use object::pe::ImageNtHeaders64;
 use object::LittleEndian as LE;
 
 use crate::func::{Function, ImportSymbol};
-use crate::idr::new::Statement;
 
 pub mod analyzer;
 pub mod block;
@@ -97,7 +96,7 @@ pub fn analyse(data: &[u8]) {
     analyzer.run(common::FunctionGraphAnalysis::default());
     println!("done: {} functions", analyzer.database.functions.len());
 
-    let func = &analyzer.database.functions[&0x141007320];
+    let func = &analyzer.database.functions[&0x1409AB740];
     let begin_ip = func.body.as_ref().unwrap().begin_ip;
     let end_ip = func.body.as_ref().unwrap().end_ip;
     println!("{begin_ip:08X} -> {end_ip:08X}");
@@ -109,35 +108,7 @@ pub fn analyse(data: &[u8]) {
     }
     
     let func = idr_analyzer.function();
-    for (i, line) in func.lines().iter().enumerate() {
-
-        if let Some(bb) = &line.basic_block {
-            print!("bb{i}(");
-            for (i, (var, ty)) in bb.parameters().iter().enumerate() {
-                if i != 0 {
-                    print!(", ");
-                }
-                print!("{var}: {ty:?}");
-            }
-            println!(")");
-        }
-
-        if let Some(stmt) = &line.statement {
-            match stmt {
-                Statement::Store(store) => {
-                    println!(" *{}           = {}", store.ptr, store.var);
-                }
-                Statement::Assign(assign) => {
-                    println!("  {}: {:8} = {:?}", assign.var, format!("{:?}", assign.ty), assign.val);
-                }
-                Statement::Asm(asm) => {
-                    println!("                {asm}");
-                }
-            }
-        }
-
-    }
-
+    crate::idr::print::print_function(func);
 
     // let section_name = section.name().unwrap();
     // let section_data = section.data().unwrap();
@@ -190,25 +161,3 @@ pub fn analyse(data: &[u8]) {
 
 
 }
-
-
-// fn walk_bb_tree(bbs: &HashMap<u64, BasicBlock>, ip: u64, padding: &mut String, prefix: &str) {
-//     let bb = &bbs[&ip];
-//     print!("{padding}{prefix}0x{:08X} -> 0x{:08X} ", bb.begin_ip, bb.end_ip);
-//     padding.push_str("  ");
-//     match bb.exit {
-//         BasicBlockExit::Unconditionnal { goto_ip } => {
-//             println!("jmp");
-//             walk_bb_tree(bbs, goto_ip, padding, "goto ");
-//         }
-//         BasicBlockExit::Conditionnal { goto_ip: then_ip, continue_ip: else_ip } => {
-//             println!("jcc");
-//             walk_bb_tree(bbs, then_ip, padding, "then ");
-//             walk_bb_tree(bbs, else_ip, padding, "else ");
-//         }
-//         BasicBlockExit::Unknown => {
-//             println!("ret|unk");
-//         }
-//     }
-//     padding.truncate(padding.len() - 2);
-// }
