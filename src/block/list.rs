@@ -79,15 +79,15 @@ impl ListResolver {
     ///   ***You should not** call this function if the goto IP is out of the code's
     ///   range.*
     /// - A next IP, this is the IP of the next instruction after the branch instruction,
-    ///   this should be always a valid IP even if the branch unconditionnaly go not to
+    ///   this should be always a valid IP even if the branch unconditionally go not to
     ///   this pointer.
-    /// - A condition flag, indicating if the branch is conditionnal.
+    /// - A condition flag, indicating if the branch is conditional.
     /// - A call flag, indicating if the branch is a function call, in such case no
     ///   basic block is created but a basic block is created on the goto IP, and it
     ///   is marked as "called", which is later used to find functions.
     pub fn push_branch(&mut self, goto_ip: u64, next_ip: u64, cond: bool, call: bool) {
 
-        // Update the targetted basic block with entries addresses.
+        // Update the targeted basic block with entries addresses.
         // Target IP=0 if the destination is not statically known.
         if goto_ip != 0 {
             let target_bb = self.ensure_basic_block(goto_ip);
@@ -101,7 +101,7 @@ impl ListResolver {
             return;
         }
         
-        // Because we took a jump (conditionnal or not), start a new
+        // Because we took a jump (conditional or not), start a new
         // basic block just after it.
         let next_bb = self.ensure_basic_block(next_ip);
         
@@ -109,12 +109,12 @@ impl ListResolver {
             // If the destination is unknown, use adequate exit.
             next_bb.prev_exit = BasicBlockExit::Unknown;
         } else if cond {
-            next_bb.prev_exit = BasicBlockExit::Conditionnal { 
+            next_bb.prev_exit = BasicBlockExit::Conditional { 
                 goto_ip, 
                 continue_ip: next_ip,
             };
         } else {
-            next_bb.prev_exit = BasicBlockExit::Unconditionnal { 
+            next_bb.prev_exit = BasicBlockExit::Unconditional { 
                 goto_ip, 
             };
         }
@@ -132,9 +132,9 @@ impl ListResolver {
                 self.blocks.push(IncompleteBlock {
                     begin_ip,
                     function: false,
-                    // New blocs set the previous exit to unconditionnaly jump to 
-                    // themself, this will be override if a jump precede this block.
-                    prev_exit: BasicBlockExit::Unconditionnal { goto_ip: begin_ip }
+                    // New blocs set the previous exit to unconditionally jump to 
+                    // themselves, this will be override if a jump precede this block.
+                    prev_exit: BasicBlockExit::Unconditional { goto_ip: begin_ip }
                 });
                 *v.insert(idx)
             },
@@ -171,14 +171,14 @@ impl ListResolver {
 
         let mut cross_refs = Vec::with_capacity(blocks_len);
 
-        // Propate end IP for basic blocks.
+        // Propagate end IP for basic blocks.
         while let Some(block) = blocks_it.next_back() {
 
             match next_exit {
-                BasicBlockExit::Unconditionnal { goto_ip } => {
+                BasicBlockExit::Unconditional { goto_ip } => {
                     cross_refs.push((block.begin_ip, goto_ip, 0));
                 },
-                BasicBlockExit::Conditionnal { goto_ip, continue_ip } => {
+                BasicBlockExit::Conditional { goto_ip, continue_ip } => {
                     cross_refs.push((block.begin_ip, goto_ip, continue_ip));
                 },
                 BasicBlockExit::Unknown => {},

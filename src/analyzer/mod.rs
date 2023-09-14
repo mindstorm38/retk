@@ -9,7 +9,9 @@ use crate::ty::TypeSystem;
 
 /// A generic analyzer implementation.
 pub struct Analyzer<R> {
-    pub runtime: R,
+    /// The arch-specific backend of the analyzer.
+    pub backend: R,
+    /// The arch-independent database.
     pub database: Database
 }
 
@@ -47,7 +49,7 @@ impl<R> Analyzer<R> {
     #[inline]
     pub fn new(runtime: R, pointer_size: u32) -> Self {
         Self { 
-            runtime, 
+            backend: runtime, 
             database: Database {
                 basic_blocks: HashMap::new(),
                 functions: HashMap::new(),

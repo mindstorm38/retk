@@ -4,8 +4,9 @@ use iced_x86::{Code, Register};
 
 use crate::analyzer::{Analysis, Analyzer};
 
-use crate::arch::x86::{self, Section};
 use crate::func::Abi;
+
+use super::{Backend, Section};
 
 
 /// ## ABI analysis
@@ -21,11 +22,11 @@ pub struct AbiAnalysis {
 
 }
 
-impl<'data> Analysis<x86::Runtime<'data>> for AbiAnalysis {
+impl<'data> Analysis<Backend<'data>> for AbiAnalysis {
 
-    fn analyze(&mut self, analyzer: &mut Analyzer<x86::Runtime<'data>>) {
+    fn analyze(&mut self, analyzer: &mut Analyzer<Backend<'data>>) {
         
-        let decoder = &mut analyzer.runtime.decoder;
+        let decoder = &mut analyzer.backend.decoder;
 
         let mut section = Section { pos: 0, begin_addr: 0, end_addr: 0 };
 
@@ -33,7 +34,7 @@ impl<'data> Analysis<x86::Runtime<'data>> for AbiAnalysis {
             if let Some(body) = &func.body {
 
                 if body.begin_ip < section.begin_addr || body.end_ip >= section.end_addr {
-                    section = match analyzer.runtime.sections.get_code_section_at(body.begin_ip) {
+                    section = match analyzer.backend.sections.get_code_section_at(body.begin_ip) {
                         Some(section) => section.clone(),
                         None => continue,
                     };

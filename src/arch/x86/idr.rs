@@ -21,24 +21,20 @@ use crate::ty::Type;
 
 
 /// ## IDR Decoder
-/// A x86 Intermediate Decompilation Representation decoder. 
-/// It needs to be fed with raw x86 instructions and will
-/// internally produce an [`IdrFunction`]. This function
-/// can later be optimized and retyped before actually
+/// A x86 Intermediate Decompilation Representation decoder for a single function. 
+/// It needs to be fed with raw x86 instructions and will internally produce an 
+/// [`IdrFunction`]. This function can later be optimized and retyped before actually 
 /// producing a more human-readable pseudo-code.
 /// 
-/// The three major steps are described in the following
-/// sections.
+/// The three major steps are described in the following sections.
 /// 
 /// ### Naive basic block decoding
-/// This first step consists of analysing each basic block
-/// individually and analysing their parameters. For each
-/// basic block, parameters are the registers read in the 
-/// block. Because each block will branch to another one
-/// (except for ret/unknown branches), this decoding should
-/// take branching arguments into account when possible.
-/// For example when branching to an already analyzed block,
-/// we already know which registers are expected.
+/// This first step consists of analyzing each basic block individually and analyzing 
+/// their parameters. For each basic block, parameters are the registers read in the 
+/// block. Because each block will branch to another one (except for ret/unknown 
+/// branches), this decoding should take branching arguments into account when possible.
+/// For example when branching to an already analyzed block, we already know which 
+/// registers are expected.
 /// 
 /// **This first pass doesn't take function calls.**
 /// 
@@ -50,14 +46,12 @@ pub struct IdrDecoder {
     function: FunctionTracker,
     /// Tracker for constant value stored in variables.
     constants: ConstantTracker,
-
     /// Internal factory to create unique variables.
     var_factory: IdrVarFactory,
-    /// Current stack pointer. It is common through all of the
-    /// function.
+    /// Current stack pointer. It is common through all of the function.
     stack_pointer: i32,
     /// Track the last comparison that might be used in a lated
-    /// conditionnal jump.
+    /// conditional jump.
     cmp: Option<Cmp>,
 }
 
@@ -756,7 +750,7 @@ impl IdrDecoder {
 
         let (bb, _) = self.function.basic_block_mut();
 
-        bb.branch = Branch::Conditionnal { 
+        bb.branch = Branch::Conditional { 
             var: cmp_var,
             then_index, 
             then_args: Vec::new(), 
@@ -776,7 +770,7 @@ impl IdrDecoder {
         }
         
         let (bb, _) = self.function.basic_block_mut();
-        bb.branch = Branch::Unconditionnal { index: goto_index, args: Vec::new() };
+        bb.branch = Branch::Unconditional { index: goto_index, args: Vec::new() };
 
         self.function.basic_block_end();
 
@@ -886,7 +880,7 @@ impl FunctionTracker {
                 // If the IP is already mapped, use its index.
                 let &(new_bb_index, _) = o.get();
                 if let Branch::Unknown = bb.branch {
-                    bb.branch = Branch::Unconditionnal { 
+                    bb.branch = Branch::Unconditional { 
                         index: new_bb_index, 
                         args: Vec::new()
                     };
@@ -956,7 +950,7 @@ impl FunctionTracker {
 
 /// A tracker for variables that have constant values known
 /// at analysis. This is just a hint for most variables but
-/// it's useful when used analysing optimisations around RSP.
+/// it's useful when used analyzing optimisations around RSP.
 #[derive(Debug, Default)]
 struct ConstantTracker {
     constants: HashMap<IdrVar, i64>,

@@ -147,9 +147,8 @@ pub struct StructBuilder<'a> {
 
 impl<'a> StructBuilder<'a> {
 
-    /// Make the next fields packed after the current ones,
-    /// no padding will be added and fields might be
-    /// misaligned.
+    /// Make the next fields packed after the current ones, no padding will be added and 
+    /// fields might be misaligned.
     #[inline]
     #[must_use]
     pub fn packed(&mut self) -> &mut Self {
@@ -157,9 +156,8 @@ impl<'a> StructBuilder<'a> {
         self
     }
 
-    /// Make the next fields padded in order to be aligned
-    /// to their type's alignment. **This is the default
-    /// behaviour.**
+    /// Make the next fields padded in order to be aligned to their type's alignment. 
+    /// **This is the default behavior.**
     #[inline]
     #[must_use]
     pub fn padded(&mut self) -> &mut Self {
@@ -169,9 +167,8 @@ impl<'a> StructBuilder<'a> {
 
     /// Force the alignment to a given bytes size.
     /// 
-    /// **You should call this after all fields are defining,
-    /// because the alignment is always redefined by a field
-    /// if its type has a greater alignment that the current
+    /// **You should call this after all fields are defining, because the alignment is 
+    /// always redefined by a field if its type has a greater alignment that the current
     /// one.**
     #[inline]
     #[must_use]
@@ -180,8 +177,7 @@ impl<'a> StructBuilder<'a> {
         self
     }
 
-    /// Add a field to this struct, using the current alignment
-    /// configuration for 
+    /// Add a field to this struct, using the current alignment configuration.
     #[inline]
     #[must_use]
     pub fn field<S: Into<String>>(&mut self, name: S, ty: Type) -> &mut Self {
@@ -299,19 +295,16 @@ impl DataType {
 }
 
 
-/// A type that optionnaly wraps a primitive type behind a given
-/// level of indirection.
+/// A type that optionally wraps a primitive type behind a given level of indirection.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Type {
-    /// The type pointed by if there are indirection,
-    /// or the type itself it not.
+    /// The type pointed by if there are indirection, or the type itself it not.
     pub data_type: DataType,
-    /// If greater than 0, this indicates that the type
-    /// is a pointer of a specific level to the data type.
-    /// Level 1 means `type*`, 2 means `type**` and so on.
+    /// If greater than 0, this indicates that the type is a pointer of a specific level 
+    /// to the data type. Level 1 means `type*`, 2 means `type**` and so on.
     pub pointer_level: u8,
     /// The length of the array. Used to define an array
-    /// type, note that multidimensionnal arrays is not
+    /// type, note that multidimensional arrays is not
     /// currently possible, and that an array length of
     /// 1 is not considered as an array, and 0 as invalid.
     pub array_len: u16,
@@ -419,8 +412,7 @@ pub struct StructDef {
     name: String,
     /// Fields of this structure type.
     fields: Vec<FieldDef>,
-    /// This structure is opaque. Can only be used behind a
-    /// pointer.
+    /// This structure is opaque. Can only be used behind a pointer.
     opaque: bool,
     /// Size of this structure, in bytes.
     size: u32,

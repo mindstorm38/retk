@@ -77,10 +77,10 @@ impl<'db> ContiguousGraphResolver<'db> {
     pub fn resolve(&mut self, bb: &'db BasicBlock, first_ip: u64) {
         if self.unique_bbs.insert(bb.begin_ip, bb).is_none() {
             match bb.exit {
-                BasicBlockExit::Unconditionnal { goto_ip } => {
+                BasicBlockExit::Unconditional { goto_ip } => {
                     let goto_bb = &self.bbs[&goto_ip];
                     if goto_ip < first_ip {
-                        // We know that unconditionnaly jumping before the function's ip
+                        // We know that unconditionally jumping before the function's ip
                         // is very likely to be a tail/thunk-call.
                         // If the basic block is already a function, do nothing.
                         if !goto_bb.function {
@@ -92,7 +92,7 @@ impl<'db> ContiguousGraphResolver<'db> {
                         }
                     }
                 }
-                BasicBlockExit::Conditionnal { goto_ip, continue_ip } => {
+                BasicBlockExit::Conditional { goto_ip, continue_ip } => {
                     let goto_bb = &self.bbs[&goto_ip];
                     if goto_ip < first_ip {
                         // Read the comment above.

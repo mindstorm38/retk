@@ -34,29 +34,39 @@ impl<R> Analysis<R> for FunctionGraphAnalysis {
 
         let db = &mut analyzer.database;
 
-        // This loop should exit because we define more and more function
-        // on each loop, and we can at most define the number of basic 
-        // blocks.
+        // This loop should exit because we define more and more function on each loop, 
+        // and we can at most define the number of basic blocks.
         while !new_functions.is_empty() || first_it {
 
             let mut func_resolver = ContiguousGraphResolver::new(&db.basic_blocks);
 
             if first_it {
+
+                // For our first iteration, we try to resolve functions from basic blocks
+                // that we know to be functions, "for sure", because they are called in
+                // code.
                 for bb in db.basic_blocks.values() {
                     if bb.function {
                         let (begin_ip, end_ip) = func_resolver.resolve_graph(bb);
                         db.functions.insert(begin_ip, Function::with_body_range(begin_ip, end_ip));
                     }
                 }
+
                 first_it = false;
+
             } else {
+
+                // For subsequent iterations, we just get new functions an resolve them.
                 for bb_ip in new_functions.drain(..) {
                     let bb = &db.basic_blocks[&bb_ip];
                     let (begin_ip, end_ip) = func_resolver.resolve_graph(bb);
                     db.functions.insert(begin_ip, Function::with_body_range(begin_ip, end_ip));
                 }
+
             }
 
+            // After each iteration, we get all potential new functions and iterate to
+            // define them as functions.
             new_functions.extend(func_resolver.iter_called_bbs());
             for bb_ip in &new_functions {
                 db.basic_blocks.get_mut(bb_ip).unwrap().function = true;

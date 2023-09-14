@@ -12,7 +12,7 @@ pub use list::ListResolver;
 
 /// A "basic block" of code. In the analyzer code, a basic block is 
 /// a block of code that has a single entry point and a single output 
-/// that can be one of: unconditionnal jump, conditionnal jump or 
+/// that can be one of: unconditional jump, conditional jump or 
 /// return.
 /// 
 /// ***Procedure calls are not considered as basic block outputs,
@@ -23,7 +23,7 @@ pub use list::ListResolver;
 /// jumps' destination can't be known.*
 #[derive(Clone)]
 pub struct BasicBlock {
-    /// Beging instruction pointer for the basic block.
+    /// Begin instruction pointer for the basic block.
     pub begin_ip: u64,
     /// End instruction pointer (exclusive) for the basic block.
     /// 
@@ -42,13 +42,13 @@ pub struct BasicBlock {
 /// Type of exit statement for a basic block.
 #[derive(Clone)]
 pub enum BasicBlockExit {
-    /// Unconditionnaly jumps to the absolute address.
-    Unconditionnal { 
+    /// Unconditionally jumps to the absolute address.
+    Unconditional { 
         /// Instruction pointer of the next basic block.
         goto_ip: u64 
     },
-    /// Conditionnal jump to the absolute address.
-    Conditionnal { 
+    /// Conditional jump to the absolute address.
+    Conditional { 
         /// The instruction pointer of the basic block to goto if 
         /// the condition is true.
         goto_ip: u64,
@@ -56,7 +56,7 @@ pub enum BasicBlockExit {
         /// to goto if the condition is false.
         /// 
         /// *Note that **the next block should be directly following the 
-        /// current block**, because conditionnal jump instructions only
+        /// current block**, because conditional jump instructions only
         /// provides a single "goto address", if the condition is not met,
         /// the flow continue after the instruction.*
         continue_ip: u64,
@@ -81,10 +81,10 @@ impl fmt::Debug for BasicBlock {
 impl fmt::Debug for BasicBlockExit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unconditionnal { goto_ip } => f.debug_struct("Unconditionnal")
+            Self::Unconditional { goto_ip } => f.debug_struct("Unconditional")
                 .field("goto_ip", &format_args!("0x{:08X}", goto_ip))
                 .finish(),
-            Self::Conditionnal { goto_ip: then_ip, continue_ip: else_ip } => f.debug_struct("Conditionnal")
+            Self::Conditional { goto_ip: then_ip, continue_ip: else_ip } => f.debug_struct("Conditional")
                 .field("then_ip", &format_args!("0x{:08X}", then_ip))
                 .field("else_ip", &format_args!("0x{:08X}", else_ip))
                 .finish(),

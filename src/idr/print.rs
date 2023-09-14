@@ -105,10 +105,10 @@ pub fn print_function(func: &IdrFunction) {
             Branch::Unknown => {
                 println!("                  br ???");
             }
-            Branch::Unconditionnal { index, ref args } => {
+            Branch::Unconditional { index, ref args } => {
                 println!("                  br bb{index}");
             }
-            Branch::Conditionnal { 
+            Branch::Conditional { 
                 var, 
                 then_index, ref then_args, 
                 else_index, ref else_args 

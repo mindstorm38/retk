@@ -5,7 +5,7 @@ use iced_x86::Code;
 use crate::analyzer::{Analysis, Analyzer};
 use crate::block::ListResolver;
 
-use crate::arch::x86;
+use super::Backend;
 
 
 /// Basic block analysis for x86.
@@ -14,13 +14,13 @@ pub struct BasicBlockAnalysis {
     resolver: ListResolver,
 }
 
-impl<'data> Analysis<x86::Runtime<'data>> for BasicBlockAnalysis {
+impl<'data> Analysis<Backend<'data>> for BasicBlockAnalysis {
 
-    fn analyze(&mut self, analyzer: &mut Analyzer<x86::Runtime<'data>>) {
+    fn analyze(&mut self, analyzer: &mut Analyzer<Backend<'data>>) {
         
-        let decoder = &mut analyzer.runtime.decoder;
+        let decoder = &mut analyzer.backend.decoder;
 
-        for section in &analyzer.runtime.sections.code {
+        for section in &analyzer.backend.sections.code {
 
             decoder.goto_range_at(section.pos, section.begin_addr, section.end_addr);
 
@@ -69,7 +69,7 @@ impl<'data> Analysis<x86::Runtime<'data>> for BasicBlockAnalysis {
                     _ => continue
                 };
     
-                if goto_ip == 0 || analyzer.runtime.sections.in_code_range(goto_ip) {
+                if goto_ip == 0 || analyzer.backend.sections.in_code_range(goto_ip) {
                     self.resolver.push_branch(goto_ip, inst.next_ip(), cond, call);
                 }
 

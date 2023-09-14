@@ -12,25 +12,25 @@ mod idr;
 pub use idr::IdrDecoder;
 
 
-/// The x86 runtime for analyzer.
-pub struct Runtime<'data> {
+/// The x86 backend for analyzer.
+pub struct Backend<'data> {
     /// The underlying bytes of data.
     pub data: &'data [u8],
-    /// Bitness of the instruction's decoder (16, 32, 64).
-    pub bitness: u32,
+    /// Pointer width of the instruction's decoder (16, 32, 64).
+    pub pointer_size: u32,
     /// The x86 instruction decoder.
     pub decoder: RangeDecoder<'data>,
     /// Sections and their metadata.
     pub sections: Sections,
 }
 
-impl<'data> Runtime<'data> {
+impl<'data> Backend<'data> {
 
-    pub fn new(data: &'data [u8], bitness: u32) -> Self {
+    pub fn new(data: &'data [u8], pointer_size: u32) -> Self {
         Self {
             data,
-            bitness,
-            decoder: RangeDecoder::new(data, bitness),
+            pointer_size,
+            decoder: RangeDecoder::new(data, pointer_size),
             sections: Sections::default(),
         }
     }
@@ -110,9 +110,9 @@ pub struct RangeDecoder<'data> {
 
 impl<'data> RangeDecoder<'data> {
 
-    pub fn new(data: &'data [u8], bitness: u32) -> Self {
+    pub fn new(data: &'data [u8], pointer_size: u32) -> Self {
         Self {
-            decoder: Decoder::new(bitness, data, DecoderOptions::NO_PAUSE),
+            decoder: Decoder::new(pointer_size, data, DecoderOptions::NO_PAUSE),
             end_ip: u64::MAX,
             inst: Instruction::new(),
         }

@@ -1,26 +1,23 @@
 //! Intermediate Decompilation Representation
 //! 
-//! This representation aims to abstract itself from the 
-//! machine-level instruction-set. This reprensentation
-//! only present places and assignments, no more registers
-//! nor actual memory addressing.
+//! This representation aims to abstract itself from the machine-level instruction-set. 
+//! This representation only present places and assignments, no more registers nor actual 
+//! memory addressing.
 //! 
-//! This representation uses Static Single-Assignment,
-//! which is notably used in LLVM IR. Here we use a simpler
-//! Intermediate Representation where some details can be
-//! ommited, because we can't know some of these in the 
-//! first place.
+//! This representation uses Static Single-Assignment, which is notably used in LLVM IR. 
+//! Here we use a simpler Intermediate Representation where some details can be omitted,
+//! because we can't know some of these in the first place.
 //! 
-//! This representation is mainly used to find and guess
-//! data types and structures. Code folding and branch/loops
-//! representation should be done after all these passes for
-//! the final pseudo-code representation.
+//! This representation is mainly used to find and guess data types and structures. Code 
+//! folding and branch/loops representation should be done after all these passes for the
+//! final pseudo-code representation.
 
 use std::num::NonZeroU32;
 
 use crate::ty::Type;
 
 pub mod print;
+mod types;
 
 
 /// An IDR function.
@@ -36,8 +33,8 @@ pub struct IdrFunction {
 pub struct IdrBasicBlock {
     /// Variables defined as parameters for the rest of the basic block.
     pub parameters: Vec<(IdrVar, Type)>,
-    /// The statement of this line. If none this line is empty and
-    /// should be replaced by the next added statement.
+    /// The statement of this line. If none this line is empty and should be replaced by 
+    /// the next added statement.
     pub statements: Vec<Statement>,
     /// The branch to exit this basic block.
     pub branch: Branch,
@@ -60,8 +57,7 @@ pub struct IdrVar(NonZeroU32);
 
 
 /// A factory to use to create a unique [`IdrVar`].
-/// This is the only way to create variable because this
-/// type is opaque.
+/// This is the only way to create variable because this type is opaque.
 pub struct IdrVarFactory {
     index: NonZeroU32,
 }
@@ -179,15 +175,15 @@ impl Statement {
 pub enum Branch {
     /// Unknown branching, usually impossible after a full analysis.
     Unknown,
-    /// Unconditionnal branch to the given basic block.
-    Unconditionnal {
+    /// Unconditional branch to the given basic block.
+    Unconditional {
         /// Index of the basic block to goto.
         index: usize,
         /// Arguments of the basic block.
         args: Vec<IdrVar>,
     },
-    /// Conditinnal branch depending on a boolean variable.
-    Conditionnal {
+    /// Conditional branch depending on a boolean variable.
+    Conditional {
         var: IdrVar,
         /// Index of the basic block to goto if the condition is met.
         then_index: usize,

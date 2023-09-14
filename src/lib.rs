@@ -30,7 +30,7 @@ pub fn analyse(data: &[u8]) {
     use analyzer::Analyzer;
     use arch::{common, x86};
 
-    let mut analyzer = Analyzer::new(x86::Runtime::new(data, 64), 8);
+    let mut analyzer = Analyzer::new(x86::Backend::new(data, 64), 8);
 
     // LOADING PE //
 
@@ -81,7 +81,7 @@ pub fn analyse(data: &[u8]) {
         if section.kind() == SectionKind::Text {
             if let Some((pos, size)) = section.file_range() {
                 let addr = section.address();
-                analyzer.runtime.sections.add_code_section(pos as usize, addr, addr + size);
+                analyzer.backend.sections.add_code_section(pos as usize, addr, addr + size);
             }
         }
     }
@@ -101,9 +101,9 @@ pub fn analyse(data: &[u8]) {
     let end_ip = func.body.as_ref().unwrap().end_ip;
     println!("{begin_ip:08X} -> {end_ip:08X}");
     let mut idr_analyzer = x86::IdrDecoder::new();
-    analyzer.runtime.goto(begin_ip, end_ip);
+    analyzer.backend.goto(begin_ip, end_ip);
     idr_analyzer.init();
-    while let Some(inst) = analyzer.runtime.decoder.decode() {
+    while let Some(inst) = analyzer.backend.decoder.decode() {
         idr_analyzer.feed(&inst);
     }
     
