@@ -1,11 +1,11 @@
-use crate::idr::Branch;
-
-use super::{IdrFunction, Statement, Expression, Value, IdrVar, Comparison};
 use std::fmt::{self, Write};
 
+use super::{Function, Statement, Expression, Value, Name, Comparison};
+use crate::idr::Branch;
 
-struct VarDisplay(IdrVar);
-impl fmt::Display for VarDisplay {
+
+struct NameDisplay(Name);
+impl fmt::Display for NameDisplay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         const BASE: u32 = 26;
         let mut rem = self.0.0.get() - 1;
@@ -25,33 +25,33 @@ impl fmt::Display for VarDisplay {
 }
 
 
-struct ValDisplay(Value);
-impl fmt::Display for ValDisplay {
+struct ValueDisplay(Value);
+impl fmt::Display for ValueDisplay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
-            Value::Var(var) => write!(f, "{}", VarDisplay(var)),
-            Value::Val(val) => write!(f, "{val}"),
+            Value::Register(var) => write!(f, "{}", NameDisplay(var)),
+            Value::Literal(val) => write!(f, "{val}"),
         }
     }
 }
 
 
-struct ExprDisplay<'a>(&'a Expression);
-impl<'a> fmt::Display for ExprDisplay<'a> {
+struct ExpressionDisplay<'a>(&'a Expression);
+impl<'a> fmt::Display for ExpressionDisplay<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
-            Expression::Constant(val) => write!(f, "{val}"),
-            Expression::Load(var) => write!(f, "load {}", VarDisplay(*var)),
-            Expression::Alloca(size) => write!(f, "alloca {size}"),
+            Expression::Literal(val) => write!(f, "{val}"),
+            Expression::Load(var) => write!(f, "load {}", NameDisplay(*var)),
+            Expression::Stack(size) => write!(f, "stack {size}"),
             Expression::Call { pointer, arguments } => {
-                write!(f, "call {}", ValDisplay(*pointer))?;
+                write!(f, "call {}", ValueDisplay(*pointer))?;
                 for arg in arguments {
-                    write!(f, ", {}", ValDisplay(*arg))?;
+                    write!(f, ", {}", ValueDisplay(*arg))?;
                 }
                 Ok(())
             }
             Expression::GetElementPointer { pointer, index, stride } => {
-                write!(f, "gep {}, {} * {stride}", VarDisplay(*pointer), VarDisplay(*index))
+                write!(f, "gep {}, {} * {stride}", NameDisplay(*pointer), NameDisplay(*index))
             }
             Expression::Cmp(cmp, var, val) => {
                 write!(f, "cmp ")?;
@@ -59,67 +59,67 @@ impl<'a> fmt::Display for ExprDisplay<'a> {
                     Comparison::Equal => write!(f, "eq")?,
                     Comparison::NotEqual => write!(f, "neq")?,
                 }
-                write!(f, ", {}, {}", VarDisplay(*var), ValDisplay(*val))
+                write!(f, ", {}, {}", ValueDisplay(*var), ValueDisplay(*val))
             }
-            Expression::Add(var, val) => write!(f, "add {}, {}", VarDisplay(*var), ValDisplay(*val)),
-            Expression::Sub(var, val) => write!(f, "sub {}, {}", VarDisplay(*var), ValDisplay(*val)),
-            Expression::Mul(var, val) => write!(f, "mul {}, {}", VarDisplay(*var), ValDisplay(*val)),
-            Expression::Div(var, val) => write!(f, "div {}, {}", VarDisplay(*var), ValDisplay(*val)),
-            Expression::Xor(var, val) => write!(f, "xor {}, {}", VarDisplay(*var), ValDisplay(*val)),
+            Expression::Add(var, val) => write!(f, "add {}, {}", ValueDisplay(*var), ValueDisplay(*val)),
+            Expression::Sub(var, val) => write!(f, "sub {}, {}", ValueDisplay(*var), ValueDisplay(*val)),
+            Expression::Mul(var, val) => write!(f, "mul {}, {}", ValueDisplay(*var), ValueDisplay(*val)),
+            Expression::Div(var, val) => write!(f, "div {}, {}", ValueDisplay(*var), ValueDisplay(*val)),
+            Expression::Xor(var, val) => write!(f, "xor {}, {}", ValueDisplay(*var), ValueDisplay(*val)),
         }
     }
 }
 
 
-pub fn print_function(func: &IdrFunction) {
+pub fn print_function(func: &Function) {
 
-    for (bb_index, bb) in func.basic_blocks.iter().enumerate() {
+    // for (bb_index, bb) in func.basic_blocks.iter().enumerate() {
 
-        print!("bb{bb_index}(");
-        for (i, (var, ty)) in bb.parameters.iter().enumerate() {
-            if i != 0 {
-                print!(", ");
-            }
-            print!("{}: {ty:?}", VarDisplay(*var));
-        }
-        println!(")");
+    //     print!("bb{bb_index}(");
+    //     for (i, (var, ty)) in bb.parameters.iter().enumerate() {
+    //         if i != 0 {
+    //             print!(", ");
+    //         }
+    //         print!("{}: {ty:?}", NameDisplay(*var));
+    //     }
+    //     println!(")");
 
-        for stmt in &bb.statements {
-            match stmt {
-                Statement::Store(store) => {
-                    let ptr = VarDisplay(store.ptr).to_string();
-                    println!(" *{ptr:>3}           = {}", VarDisplay(store.var));
-                }
-                Statement::Assign(assign) => {
-                    let var = VarDisplay(assign.var).to_string();
-                    let ty = format!("{:?}", assign.ty);
-                    println!("  {var:>3}: {ty:8} = {}", ExprDisplay(&assign.val));
-                }
-                Statement::Asm(asm) => {
-                    println!("                  asm '{asm}'");
-                }
-            }
-        }
+    //     for stmt in &bb.statements {
+    //         match stmt {
+    //             Statement::Store(store) => {
+    //                 let ptr = NameDisplay(store.pointer_register).to_string();
+    //                 println!(" *{ptr:>3}           = {}", NameDisplay(store.register));
+    //             }
+    //             Statement::Create(assign) => {
+    //                 let var = NameDisplay(assign.register).to_string();
+    //                 let ty = format!("{:?}", assign.ty);
+    //                 println!("  {var:>3}: {ty:8} = {}", ExpressionDisplay(&assign.value));
+    //             }
+    //             Statement::Asm(asm) => {
+    //                 println!("                  asm '{asm}'");
+    //             }
+    //         }
+    //     }
         
-        match bb.branch {
-            Branch::Unknown => {
-                println!("                  br ???");
-            }
-            Branch::Unconditional { index, ref args } => {
-                println!("                  br bb{index}");
-            }
-            Branch::Conditional { 
-                var, 
-                then_index, ref then_args, 
-                else_index, ref else_args 
-            } => {
-                println!("                  br {}, then bb{then_index}, else bb{else_index}", VarDisplay(var));
-            }
-            Branch::Ret => {
-                println!("                  ret");
-            }
-        }
+    //     match bb.branch {
+    //         Branch::Unknown => {
+    //             println!("                  br ???");
+    //         }
+    //         Branch::Unconditional { index, ref args } => {
+    //             println!("                  br bb{index}");
+    //         }
+    //         Branch::Conditional { 
+    //             var, 
+    //             then_index, ref then_args, 
+    //             else_index, ref else_args 
+    //         } => {
+    //             println!("                  br {}, then bb{then_index}, else bb{else_index}", NameDisplay(var));
+    //         }
+    //         Branch::Ret => {
+    //             println!("                  ret");
+    //         }
+    //     }
 
-    }
+    // }
 
 }

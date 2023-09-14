@@ -1,11 +1,5 @@
 //! Generic analyzer structure.
 
-use std::collections::HashMap;
-
-use crate::block::BasicBlock;
-use crate::func::Function;
-use crate::ty::TypeSystem;
-
 
 /// A generic analyzer implementation.
 pub struct Analyzer<R> {
@@ -19,12 +13,7 @@ pub struct Analyzer<R> {
 /// as possible, objects contained in the database doesn't contains
 /// architecture-specific objects.
 pub struct Database {
-    /// All basic blocks associated to their instruction pointer. 
-    pub basic_blocks: HashMap<u64, BasicBlock>,
-    /// All functions associated to their instruction pointer.
-    pub functions: HashMap<u64, Function>,
-    /// Type system.
-    pub types: TypeSystem,
+    
 }
 
 /// A specific analysis implementation.
@@ -51,9 +40,6 @@ impl<R> Analyzer<R> {
         Self { 
             backend: runtime, 
             database: Database {
-                basic_blocks: HashMap::new(),
-                functions: HashMap::new(),
-                types: TypeSystem::new(pointer_size),
             }
         }
     }

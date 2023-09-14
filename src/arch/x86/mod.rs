@@ -2,15 +2,6 @@
 
 use iced_x86::{Decoder, DecoderOptions, Instruction};
 
-mod block;
-pub use block::BasicBlockAnalysis;
-
-mod abi;
-pub use abi::AbiAnalysis;
-
-mod idr;
-pub use idr::IdrDecoder;
-
 
 /// The x86 backend for analyzer.
 pub struct Backend<'data> {

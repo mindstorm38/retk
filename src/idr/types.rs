@@ -1,4 +1,4 @@
-//! Type system crate, providing a way of defining complex data types.
+//! Type system module for IDR, providing a way of defining complex data types.
 
 use std::cell::OnceCell;
 
