@@ -21,16 +21,40 @@ use types::Type;
 
 
 /// An function's Intermediate Decompilation Representation.
-#[derive(Debug)]
+#[derive(Debug, Default, Clone)]
 pub struct Function {
+    /// The calling convention of this function, used to know how to decode calls to it.
+    pub calling_convention: CallingConvention,
     /// All lines/statements of the function.
     pub basic_blocks: Vec<BasicBlock>,
-    /// Next unique name for a register.
-    pub name_factory: NameFactory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallingConvention {
+    /// Unknown calling convention.
+    Unknown,
+    /// Unix C x86.
+    Cdecl,
+    /// WINAPI.
+    Stdcall,
+    /// Windows x86.
+    Fastcall,
+    /// Windows x64.
+    Win64,
+    /// System V AMD 64.
+    Amd64,
+    /// For leaf function calling convention, no argument or framing.
+    Leaf,
+}
+
+impl Default for CallingConvention {
+    fn default() -> Self {
+        Self::Unknown
+    }
 }
 
 /// A basic block in a function's IDR.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct BasicBlock {
     /// The statement of this line. If none this line is empty and should be replaced by 
     /// the next added statement.
@@ -49,11 +73,11 @@ pub enum Value {
     /// The value is come from a register.
     Register(Name),
     /// A constant value.
-    Literal(i64)
+    LiteralInt(i64),
 }
 
 /// A statement.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Statement {
     /// Store an expression's value to a pointed value.
     Store(Store),
@@ -64,7 +88,7 @@ pub enum Statement {
     Asm(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Store {
     /// The register that stores the pointer where the source register's value should by
     /// copied to.
@@ -73,7 +97,7 @@ pub struct Store {
     pub value: Expression,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Create {
     /// The new register that is being created.
     pub register: Name,
@@ -84,7 +108,7 @@ pub struct Create {
 }
 
 /// An exit branch for a basic block.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Branch {
     /// Unknown branching, usually impossible after a full analysis.
     Unknown,
@@ -121,10 +145,10 @@ impl Default for Branch {
 
 
 /// Represent an rvalue in an assignment.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Expression {
     /// A literal value.
-    Literal(i64),
+    LiteralInt(i64),
     /// Load a value by dereferencing the given register.
     Load(Name),
     /// Stack allocation of a given size. *Value type is a pointer.*
@@ -162,14 +186,14 @@ pub enum Expression {
 }
 
 /// Kind of comparison.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Comparison {
     Equal,
     NotEqual,
 }
 
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NameFactory {
     index: NonZeroU32,
 }
@@ -181,11 +205,6 @@ impl Default for NameFactory {
 }
 
 impl NameFactory {
-
-    #[inline]
-    pub fn new() -> Self {
-        Self::default()
-    }
 
     /// Create a new IDR variable unique to this factory.
     pub fn next(&mut self) -> Name {

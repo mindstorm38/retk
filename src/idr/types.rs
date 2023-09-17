@@ -1,6 +1,7 @@
 //! Type system module for IDR, providing a way of defining complex data types.
 
-use std::cell::OnceCell;
+use std::collections::HashMap;
+use std::fmt::Write;
 
 
 /// The type system.
@@ -9,16 +10,10 @@ pub struct TypeSystem {
     pointer_size: u64,
     /// Size of bytes on this system, in bits.
     byte_size: u64,
-    /// All registered types in the type system.
-    type_defs: Vec<TypeDefCache>,
-}
-
-struct TypeDefCache {
-    /// The actual type def.
-    inner: Box<dyn TypeDef>,
-    /// The cached name of this type, to avoid reallocating again and again when name is
-    /// requested.
-    name: OnceCell<String>,
+    /// Cache for type names.
+    name_cache: HashMap<Type, String>,
+    /// The list of struct definitions.
+    struct_defs: Vec<(String, Option<StructDef>)>,
 }
 
 impl TypeSystem {
@@ -27,7 +22,8 @@ impl TypeSystem {
         Self { 
             pointer_size,
             byte_size,
-            type_defs: Vec::new(),
+            name_cache: HashMap::new(),
+            struct_defs: Vec::new(),
         }
     }
 
@@ -42,10 +38,21 @@ impl TypeSystem {
     }
 
     /// Return the name of the given type.
-    pub fn name(&self, ty: Type) -> &str {
-        self.type_defs[ty.0].name.get_or_init(|| {
-            self.type_defs[ty.0].inner.name(self)
-        })
+    pub fn name(&mut self, ty: Type) -> &str {
+        self.name_cache.entry(ty).or_insert_with_key(|&k| {
+            let mut name = String::new();
+            match k.primitive {
+                PrimitiveType::Int(n) => write!(name, "i{n}").unwrap(),
+                PrimitiveType::Float => name.write_str("f32").unwrap(),
+                PrimitiveType::Double => name.write_str("f64").unwrap(),
+                PrimitiveType::Struct(s) => {
+                    let struct_name = self.struct_defs[s.0 as usize].0;
+                    write!(name, "struct {struct_name}").unwrap();
+                }
+            }
+            name.extend(std::iter::repeat('*').take(k.indirection as _));
+            name
+        }).as_str()
     }
 
     /// Round the given number of bits up to get the number of bytes needed to store.
@@ -61,50 +68,58 @@ impl TypeSystem {
     /// Return the layout of the given type
     pub fn layout(&self, ty: Type) -> Option<Layout> {
 
-        let type_def = &self.type_defs[ty.0];
-        if type_def.inner.opaque() {
-            return None
+        if ty.indirection != 0 {
+            let bytes = self.bits_to_bytes(self.pointer_size);
+            return Some(Layout { size: bytes, align: bytes });
         }
 
-        let bits = type_def.inner.bits(self);
-        let align = type_def.inner.align(self);
-
-        // Get minimum byte size and them make it a multiple of the given alignment.
-        let raw_size = self.bits_to_bytes(bits);
-        let size = (raw_size + align - 1) / align * align;
-
-        Some(Layout {
-            size,
-            align,
-        })
+        match ty.primitive {
+            PrimitiveType::Int(n) => {
+                let bytes = self.bits_to_bytes(n as u64);
+                Some(Layout { size: bytes, align: bytes })
+            }
+            PrimitiveType::Float => Some(Layout { size: 4, align: 4 }),
+            PrimitiveType::Double => Some(Layout { size: 8, align: 8 }),
+            PrimitiveType::Struct(s) => {
+                let def = &self.struct_defs[s.0 as usize].1?;
+                Some(Layout { size: def.size, align: def.align })
+            }
+        }
 
     }
 
-    /// Define the given type and get a unique handle to it.
-    pub fn define(&mut self, ty: impl TypeDef + 'static) -> Type {
-        let ret = Type(self.type_defs.len());
-        self.type_defs.push(TypeDefCache { 
-            inner: Box::new(ty), 
-            name: OnceCell::new(),
-        });
-        ret
+    /// Declare an opaque structure type, it can be defined layer as needed.
+    pub fn declare_opaque_struct(&mut self, name: impl Into<String>) -> StructType {
+        let idx: u32 = self.struct_defs.len().try_into().unwrap();
+        self.struct_defs.push((name.into(), None));
+        StructType(idx)
     }
 
-    /// Get a build for building a structure, and then define it to this 
-    pub fn define_structure(&mut self) -> StructBuilder<'_> {
+    /// Define an already declared opaque struct.
+    pub fn define_opaque_struct(&mut self, ty: StructType) -> StructBuilder<'_> {
+        assert!(self.struct_defs[ty.0 as usize].1.is_none(), "struct is already defined");
         StructBuilder { 
             system: self, 
-            packed: false, 
-            size: 0, 
-            align: 0, 
-            fields: Vec::new(),
+            def: StructDef {
+                fields: Vec::new(),
+                size: 0,
+                align: 0,
+            }, 
+            def_index: ty.0 as usize, 
+            packed: false
         }
+    }
+
+    pub fn define_struct(&mut self, name: impl Into<String>) -> StructBuilder<'_> {
+        let s = self.declare_opaque_struct(name);
+        self.define_opaque_struct(s)
     }
 
 }
 
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Represent the byte layout of a type, computed by the type system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Layout {
     /// The size of the type **in bytes**.
     pub size: u64,
@@ -112,186 +127,95 @@ pub struct Layout {
     pub align: u64,
 }
 
+/// Opaque structure type handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StructType(u32);
 
-/// Opaque handle to a type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Type(usize);
-
-
-/// Abstract type trait, used for registering a type.
-pub trait TypeDef {
-
-    /// Return the name of **this type**.
-    fn name(&self, system: &TypeSystem) -> String;
-
-    /// Size of this type **in bits**.
-    fn bits(&self, system: &TypeSystem) -> u64;
-
-    /// Alignment of this type, **in bytes**, you should guarantee that this is a power
-    /// of two, if not the case this could break the type system.
-    fn align(&self, system: &TypeSystem) -> u64;
-
-    /// Return true if the type is opaque and can only be used for pointers. It doesn't
-    /// have known layout at this time.
-    fn opaque(&self) -> bool { false }
-
+/// Primitive data type definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PrimitiveType {
+    /// An integer of the given bits size.
+    Int(u32),
+    /// Single-precision IEEE-754 floating point number.
+    Float,
+    /// Double-precision IEEE-754 floating point number.
+    Double,
+    /// A structure type, referenced by its handle.
+    Struct(StructType),
 }
 
-
-
-/// Pointer to a given type.
-pub struct Ptr(pub Type);
-
-impl TypeDef for Ptr {
-
-    fn name(&self, system: &TypeSystem) -> String {
-        format!("{}*", system.name(self.0))
-    }
-
-    fn bits(&self, system: &TypeSystem) -> u64 {
-        system.pointer_size() as _
-    }
-
-    fn align(&self, system: &TypeSystem) -> u64 {
-        system.pointer_size() / system.byte_size()
-    }
-
+/// A full type definition with the indirection level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Type {
+    /// The primitive type pointed by this type.
+    pub primitive: PrimitiveType,
+    /// Indirection level of this type.
+    pub indirection: u8,
 }
 
+impl From<PrimitiveType> for Type {
+    fn from(value: PrimitiveType) -> Self {
+        Self { primitive: value, indirection: 0 }
+    }
+}
 
-/// An repetition of the given type for a given count.
-pub struct Array(pub Type, pub u32);
+impl PrimitiveType {
 
-impl TypeDef for Array {
-
-    fn name(&self, system: &TypeSystem) -> String {
-        format!("[{}; {}]", system.name(self.0), self.1)
+    pub const fn plain(self) -> Type {
+        Type { primitive: self, indirection: 0 }
     }
 
-    fn bits(&self, system: &TypeSystem) -> u64 {
-        system.layout(self.0).unwrap().size as u64 * system.byte_size() as u64
-    }
-
-    fn align(&self, system: &TypeSystem) -> u64 {
-        system.layout(self.0).unwrap().align
+    pub const fn pointer(self, indirection: u8) -> Type {
+        Type { primitive: self, indirection }
     }
 
 }
 
+impl Type {
 
-/// An integer type of the given bits count.
-pub struct Int(pub u64);
-
-impl TypeDef for Int {
-
-    fn name(&self, _system: &TypeSystem) -> String {
-        format!("i{}", self.0)
-    }
-    
-    fn bits(&self, _system: &TypeSystem) -> u64 {
-        self.0
-    }
-
-    fn align(&self, system: &TypeSystem) -> u64 {
-        // Get minimum number of bytes required, and them compute next power of two.
-        system.bits_to_bytes(self.0).next_power_of_two()
+    /// Get a pointer to the current type with the given number of indirection. If the
+    /// current type is already a pointer, this indirection is added to the existing one.
+    pub const fn pointer(self, indirection: u8) -> Type {
+        Type { primitive: self.primitive, indirection: self.indirection + indirection }
     }
 
 }
-
-
-/// Single-precision IEEE-754 floating point number.
-pub struct Float;
-/// Double-precision IEEE-754 floating point number.
-pub struct Double;
-
-
-impl TypeDef for Float {
-
-    fn name(&self, _system: &TypeSystem) -> String {
-        "f32".into()
-    }
-    
-    fn bits(&self, _system: &TypeSystem) -> u64 {
-        32
-    }
-
-    fn align(&self, _system: &TypeSystem) -> u64 {
-        4
-    }
-
-}
-
-impl TypeDef for Double {
-
-    fn name(&self, _system: &TypeSystem) -> String {
-        "f64".into()
-    }
-    
-    fn bits(&self, _system: &TypeSystem) -> u64 {
-        64
-    }
-
-    fn align(&self, _system: &TypeSystem) -> u64 {
-        8
-    }
-
-}
-
 
 /// Represent the complex definition of a structure.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Struct {
-    /// Type name.
-    name: String,
+pub struct StructDef {
     /// Fields of this structure type.
-    fields: Vec<Field>,
+    pub fields: Vec<FieldDef>,
     /// Size of this structure **in bytes**.
-    size: u64,
-    /// Alignment of this structure **in bytes**.
-    align: u64,
+    pub size: u64,
+    /// Alignment of this structure **in bytes**. An alignment of zero is invalid an
+    /// serves as a marker for an *opaque structure*, that has no definition yet and
+    /// can only be used through indirection.
+    pub align: u64,
 }
 
 /// Represent the complex definition of a structure field.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Field {
+pub struct FieldDef {
     /// Offset of the field **in bytes**.
-    offset: u64,
+    pub offset: u64,
     /// Name of the field.
-    name: String,
+    pub name: String,
     /// Type of the field.
-    ty: Type,
-}
-
-impl TypeDef for Struct {
-
-    fn name(&self, _system: &TypeSystem) -> String {
-        self.name.clone()
-    }
-
-    fn bits(&self, system: &TypeSystem) -> u64 {
-        system.bytes_to_bits(self.size)
-    }
-
-    fn align(&self, _system: &TypeSystem) -> u64 {
-        self.align
-    }
-
+    pub ty: Type,
 }
 
 
 /// A builder that should be used to define 
 pub struct StructBuilder<'a> {
-    /// The type system back reference, used when defining fields.
+    /// The type system, internally using to get layout of the fields.
     system: &'a mut TypeSystem,
-    /// Current packing status for 
+    /// Definition of the structure.
+    def: StructDef,
+    /// Index of the struct def in the type system.
+    def_index: usize,
+    /// Indicate if the builder is currently packing fields or not.
     packed: bool,
-    /// Current size of the structure.
-    size: u64,
-    /// Current alignment of the structure.
-    align: u64,
-    /// All field definitions.
-    fields: Vec<Field>,
 }
 
 impl<'a> StructBuilder<'a> {
@@ -316,13 +240,13 @@ impl<'a> StructBuilder<'a> {
 
     /// Force the alignment to a given bytes size.
     /// 
-    /// **You should call this after all fields are defining, because the alignment is 
+    /// **You should call this after all fields are defined, because the alignment is 
     /// always redefined by a field if its type has a greater alignment that the current
     /// one.**
     #[inline]
     #[must_use]
     pub fn align(&mut self, align: u64) -> &mut Self {
-        self.align = align;
+        self.def.align = align;
         self
     }
 
@@ -336,24 +260,24 @@ impl<'a> StructBuilder<'a> {
         let layout = self.system.layout(ty).unwrap();
 
         if !self.packed {
-            let field_misalignment = self.size % layout.align;
+            let field_misalignment = self.def.size % layout.align;
             if field_misalignment != 0 {
                 let field_misalignment = layout.align - field_misalignment; 
-                self.size += field_misalignment;
+                self.def.size += field_misalignment;
             }
         }
 
-        if layout.align > self.align {
-            self.align = layout.align;
+        if layout.align > self.def.align {
+            self.def.align = layout.align;
         }
 
-        self.fields.push(Field { 
-            offset: self.size, 
+        self.def.fields.push(FieldDef { 
+            offset: self.def.size, 
             name, 
             ty,
         });
 
-        self.size += layout.size;
+        self.def.size += layout.size;
 
         self
 
@@ -361,21 +285,20 @@ impl<'a> StructBuilder<'a> {
 
     /// Finally build the structure, applying all changes
     /// to the real structure definition.
-    pub fn define(mut self, name: impl Into<String>) -> Type {
+    pub fn define(mut self) -> StructType {
 
         // Same as for fields, we pad the size of this structure.
-        let struct_misalignment = self.size % self.align;
+        let struct_misalignment = self.def.size % self.def.align;
         if struct_misalignment != 0 {
-            let struct_misalignment = self.align - struct_misalignment;
-            self.size += struct_misalignment;
+            let struct_misalignment = self.def.align - struct_misalignment;
+            self.def.size += struct_misalignment;
         }
 
-        self.system.define(Struct {
-            name: name.into(),
-            fields: self.fields,
-            size: self.size,
-            align: self.align,
-        })
+        self.system.struct_defs[self.def_index].1 = Some(self.def);
+        
+        // We can can this to u32 directly because we know that it's a valid index 
+        // because it's already declared.
+        StructType(self.def_index as u32)
 
     }
 

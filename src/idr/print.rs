@@ -30,7 +30,7 @@ impl fmt::Display for ValueDisplay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
             Value::Register(var) => write!(f, "{}", NameDisplay(var)),
-            Value::Literal(val) => write!(f, "{val}"),
+            Value::LiteralInt(val) => write!(f, "{val}"),
         }
     }
 }
@@ -40,7 +40,7 @@ struct ExpressionDisplay<'a>(&'a Expression);
 impl<'a> fmt::Display for ExpressionDisplay<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
-            Expression::Literal(val) => write!(f, "{val}"),
+            Expression::LiteralInt(val) => write!(f, "{val}"),
             Expression::Load(var) => write!(f, "load {}", NameDisplay(*var)),
             Expression::Stack(size) => write!(f, "stack {size}"),
             Expression::Call { pointer, arguments } => {

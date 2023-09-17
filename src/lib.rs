@@ -7,7 +7,6 @@
 //! by anyone with the same binary and the same procedure.
 //! It should also work with newer versions of the binary.
 
-use std::io::Write;
 use std::sync::Arc;
 
 use object::{Object, ObjectSection, Architecture, SectionKind};
@@ -15,20 +14,15 @@ use object::read::pe::{PeFile64, Import};
 use object::pe::ImageNtHeaders64;
 use object::LittleEndian as LE;
 
-use crate::func::{Function, ImportSymbol};
-
 pub mod analyzer;
-pub mod block;
-pub mod func;
 pub mod idr;
 pub mod arch;
-pub mod ty;
 
 
 pub fn analyse(data: &[u8]) {
 
     use analyzer::Analyzer;
-    use arch::{common, x86};
+    use arch::x86;
 
     let mut analyzer = Analyzer::new(x86::Backend::new(data, 64), 8);
 
@@ -42,39 +36,34 @@ pub fn analyse(data: &[u8]) {
     }
 
     // let libs = LibraryDatabase::new();
-    let rva_base = file.relative_address_base();
-    let import_table = file.import_table().unwrap().unwrap();
-    let mut import_desc_it = import_table.descriptors().unwrap();
-    while let Some(desc) = import_desc_it.next().unwrap() {
+    // let rva_base = file.relative_address_base();
+    // let import_table = file.import_table().unwrap().unwrap();
+    // let mut import_desc_it = import_table.descriptors().unwrap();
+    // while let Some(desc) = import_desc_it.next().unwrap() {
 
-        let mut name: Arc<[u8]> = import_table.name(desc.name.get(LE)).unwrap().into();
+    //     let mut name: Arc<[u8]> = import_table.name(desc.name.get(LE)).unwrap().into();
 
-        // Make the library name lowercase, in place.
-        Arc::get_mut(&mut name).unwrap().make_ascii_lowercase();
+    //     // Make the library name lowercase, in place.
+    //     Arc::get_mut(&mut name).unwrap().make_ascii_lowercase();
 
-        let mut current_thunk_rva = desc.first_thunk.get(LE);
-        let mut thunks = import_table.thunks(current_thunk_rva).unwrap();
+    //     let mut current_thunk_rva = desc.first_thunk.get(LE);
+    //     let mut thunks = import_table.thunks(current_thunk_rva).unwrap();
 
-        while let Some(thunk) = thunks.next::<ImageNtHeaders64>().unwrap() {
+    //     while let Some(thunk) = thunks.next::<ImageNtHeaders64>().unwrap() {
             
-            let import = import_table.import::<ImageNtHeaders64>(thunk).unwrap();
-            let import_kind = match import {
-                Import::Ordinal(ord) => ImportSymbol::Ordinal(ord),
-                Import::Name(_, name) => ImportSymbol::Name(Box::from(name)),
-            };
+    //         let import = import_table.import::<ImageNtHeaders64>(thunk).unwrap();
+    //         let import_kind = match import {
+    //             Import::Ordinal(ord) => ImportSymbol::Ordinal(ord),
+    //             Import::Name(_, name) => ImportSymbol::Name(Box::from(name)),
+    //         };
 
-            let function = Function::with_imported(Arc::clone(&name), import_kind);
-            analyzer.database.functions.insert(rva_base + current_thunk_rva as u64, function);
+    //         let function = Function::with_imported(Arc::clone(&name), import_kind);
+    //         analyzer.database.functions.insert(rva_base + current_thunk_rva as u64, function);
 
-            current_thunk_rva += 8; // Sizeof thunk in PE64 (actually PE32+)
+    //         current_thunk_rva += 8; // Sizeof thunk in PE64 (actually PE32+)
 
-        }
+    //     }
 
-    }
-
-    // println!("== Function count: {}", analyzer.database.functions.len());
-    // for (&addr, func) in &analyzer.database.functions {
-    //     println!(" = {addr:08X} {:?}", func.imported);
     // }
 
     for section in file.sections() {
@@ -86,29 +75,31 @@ pub fn analyse(data: &[u8]) {
         }
     }
 
-    print!(" = Basic Block pass... ");
-    std::io::stdout().flush().unwrap();
-    analyzer.run(x86::BasicBlockAnalysis::default());
-    println!("done: {} basic blocks", analyzer.database.basic_blocks.len());
+    // print!(" = Basic Block pass... ");
+    // std::io::stdout().flush().unwrap();
+    // analyzer.run(x86::BasicBlockAnalysis::default());
+    // println!("done: {} basic blocks", analyzer.database.basic_blocks.len());
 
-    print!(" = Function find pass... ");
-    std::io::stdout().flush().unwrap();
-    analyzer.run(common::FunctionGraphAnalysis::default());
-    println!("done: {} functions", analyzer.database.functions.len());
+    // print!(" = Function find pass... ");
+    // std::io::stdout().flush().unwrap();
+    // analyzer.run(common::FunctionGraphAnalysis::default());
+    // println!("done: {} functions", analyzer.database.functions.len());
 
-    let func = &analyzer.database.functions[&0x1409AB740];
-    let begin_ip = func.body.as_ref().unwrap().begin_ip;
-    let end_ip = func.body.as_ref().unwrap().end_ip;
-    println!("{begin_ip:08X} -> {end_ip:08X}");
-    let mut idr_analyzer = x86::IdrDecoder::new();
-    analyzer.backend.goto(begin_ip, end_ip);
-    idr_analyzer.init();
-    while let Some(inst) = analyzer.backend.decoder.decode() {
-        idr_analyzer.feed(&inst);
-    }
+    analyzer.run(x86::IdrAnalysis::default());
+
+    // let func = &analyzer.database.functions[&0x1409AB740];
+    // let begin_ip = func.body.as_ref().unwrap().begin_ip;
+    // let end_ip = func.body.as_ref().unwrap().end_ip;
+    // println!("{begin_ip:08X} -> {end_ip:08X}");
+    // let mut idr_analyzer = x86::IdrDecoder::new();
+    // analyzer.backend.goto(begin_ip, end_ip);
+    // idr_analyzer.init();
+    // while let Some(inst) = analyzer.backend.decoder.decode() {
+    //     idr_analyzer.feed(&inst);
+    // }
     
-    let func = idr_analyzer.function();
-    crate::idr::print::print_function(func);
+    // let func = idr_analyzer.function();
+    // crate::idr::print::print_function(func);
 
     // let section_name = section.name().unwrap();
     // let section_data = section.data().unwrap();

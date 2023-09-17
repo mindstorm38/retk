@@ -3,6 +3,10 @@
 use iced_x86::{Decoder, DecoderOptions, Instruction};
 
 
+mod idr;
+pub use idr::IdrAnalysis;
+
+
 /// The x86 backend for analyzer.
 pub struct Backend<'data> {
     /// The underlying bytes of data.
