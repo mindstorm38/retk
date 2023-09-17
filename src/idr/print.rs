@@ -1,10 +1,10 @@
 use std::fmt::{self, Write};
 
-use super::{Function, Statement, Expression, Value, Name, Comparison};
+use super::{Function, Statement, Expression, Value, Binding, Comparison};
 use crate::idr::Branch;
 
 
-struct NameDisplay(Name);
+struct NameDisplay(Binding);
 impl fmt::Display for NameDisplay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         const BASE: u32 = 26;
@@ -29,7 +29,7 @@ struct ValueDisplay(Value);
 impl fmt::Display for ValueDisplay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
-            Value::Register(var) => write!(f, "{}", NameDisplay(var)),
+            Value::Binding(var) => write!(f, "{}", NameDisplay(var)),
             Value::LiteralInt(val) => write!(f, "{val}"),
         }
     }

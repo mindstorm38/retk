@@ -7,7 +7,7 @@ use iced_x86::{Instruction, Code, Register};
 
 use crate::analyzer::{Analysis, Analyzer};
 
-use crate::idr::{Statement, Name, NameFactory, Expression, Create, Store};
+use crate::idr::{Statement, Binding, BindingFactory, Expression, Bind, Store, Value};
 use crate::idr::types::{TypeSystem, Type, PrimitiveType};
 
 use super::Backend;
@@ -44,37 +44,24 @@ const TY_DWORD: Type = PrimitiveType::Int(32).plain();
 const TY_QWORD: Type = PrimitiveType::Int(64).plain();
 
 
-struct Decoder {
-    /// Internal basic blocks resolver.
-    blocks: BasicBlockResolver,
+/// This internal decoder is used as the first pass in IDR analysis, it simply find and
+/// decode each basic block to a simple IDR. This decoder keeps a lot of intermediate 
+/// details about each function's call but doesn't determine which basic blocks are
+/// function entries.
+struct BasicBlockDecoder {
     /// Internal type system.
     type_system: TypeSystem,
-    /// The name factory for the current basic block.
-    name_factory: NameFactory,
-
-    inputs: HashMap<>,
-    /// Mapping of registers to the variable they hold.
-    variables: HashMap<Register, Name>,
-    /// Tracker for constant value stored in variables.
-    constants: Constants,
-    /// Current stack pointer. It is common through all of the function.
-    stack_pointer: i32,
-    /// Track the last comparison that might be used in a lated
-    /// conditional jump.
-    cmp: Option<Cmp>,
+    /// This structure holds all attribute used to decompile the current basic block to 
+    /// the intermediate representation.
+    block: BasicBlockTracker,
 }
 
-impl Decoder {
+impl BasicBlockDecoder {
 
     pub fn new() -> Self {
         Self {
-            blocks: BasicBlockResolver::default(),
             type_system: TypeSystem::new(64, 8),
-            name_factory: NameFactory::default(),
-            variables: HashMap::new(),
-            constants: Constants::default(),
-            stack_pointer: 0,
-            cmp: None,
+            block: BasicBlockTracker::default(),
         }
     }
 
@@ -215,148 +202,44 @@ impl Decoder {
             Code::Retfd_imm16 |
             Code::Retfw_imm16 => self.decode_ret(inst),
             _ => {
-                self.push_stmt(Statement::Asm(inst.to_string()));
+                self.block.push_stmt(Statement::Asm(inst.to_string()));
             }
         }
-    } 
-
-    fn sub_sp(&mut self, delta: i32) -> i32 {
-        self.stack_pointer -= delta;
-        self.stack_pointer
-    }
-
-    fn add_sp(&mut self, delta: i32) -> i32 {
-        self.stack_pointer += delta;
-        self.stack_pointer
-    }
-
-    /// Create a dummy register, not linked to anything at this point.
-    fn create_register(&mut self) -> Name {
-        self.name_factory.next()
-    }
-
-    /// Read a stack pointer variable, ensuring that it already exists.
-    fn read_stack_var(&mut self, addr: i32) -> IdrVar {
-        let (bb, bb_tracker) = self.function.basic_block_mut();
-        let param = FunctionParam::Stack(addr);
-        match bb_tracker.variables.entry(param) {
-            Entry::Occupied(o) => *o.into_mut(),
-            Entry::Vacant(v) => {
-                let var = self.var_factory.create();
-                bb.parameters.push((var, Type::VOIDP));
-                bb_tracker.parameters.push(param);
-                *v.insert(var)
-            }
-        }
-    }
-
-    /// This function ensures that a given register is mapped to a register name. If no
-    /// register is currently mapped, a new register name is created and marked as 
-    /// parameter for the current basic block.
-    fn read_reg_var(&mut self, reg: Register, ty: Type) -> Name {
-        let bb = self.blocks.basic_block_mut();
-
-        let (bb, bb_tracker) = self.function.basic_block_mut();
-        let param = FunctionParam::Reg(reg);
-        match bb_tracker.variables.entry(param) {
-            Entry::Occupied(o) => *o.into_mut(),
-            Entry::Vacant(v) => {
-                let var = self.var_factory.create();
-                bb.parameters.push((var, ty));
-                bb_tracker.parameters.push(param);
-                *v.insert(var)
-            }
-        }
-    }
-
-    /// The function creates a new register name for later writing to the given register.
-    fn write_reg_var(&mut self, reg: Register) -> Name {
-        let (_, bb_tracker) = self.function.basic_block_mut();
-        let param = FunctionParam::Reg(reg);
-        let var = self.name_factory.next();
-        bb_tracker.variables.insert(param, var);
-        var
-    }
-
-    fn get_reg_var(&self, reg: Register) -> Option<Name> {
-        let (_, bb_tracker) = self.function.basic_block();
-        bb_tracker.variables.get(&FunctionParam::Reg(reg)).copied()
-    }
-
-    fn set_reg_var(&mut self, reg: Register, var: IdrVar) {
-        let (_, bb_tracker) = self.function.basic_block_mut();
-        let param = FunctionParam::Reg(reg);
-        bb_tracker.variables.insert(param, var);
-    }
-
-    /// Utility method for fast query of constant value stored in
-    /// a register.
-    fn get_reg_const(&self, reg: Register) -> Option<i64> {
-        let var = self.get_reg_var(reg)?;
-        self.constants.get(var)
-    }
-
-    /// Internal method to push the given statement on the current basic block.
-    fn push_stmt(&mut self, stmt: Statement) {
-        let bb = self.blocks.basic_block_mut();
-        bb.statements.push(stmt);
-    }
-
-    /// Internal function to enqueue a statement
-    fn push_assign(&mut self, register: Name, ty: Type, value: Expression) {
-
-        // Propagate constant values.
-        match value {
-            Expression::LiteralInt(val) => self.constants.set(register, val),
-            // Expression::Add(from, Value::Val(val)) => 
-            //     self.constants.try_add(from, var, val),
-            // Expression::Sub(from, Value::Val(val)) =>
-            //     self.constants.try_sub(from, var, val),
-            _ => {}
-        }
-
-        self.push_stmt(Statement::Create(Create { register, ty, value }));
-
-    }
-
-    /// Push a store statement in the current basic block.
-    fn push_store(&mut self, pointer_register: Name, value: Expression) {
-        self.push_stmt(Statement::Store(Store { pointer_register, value }));
     }
 
     /// Decode an instruction's memory addressing operand and return the variable where 
     /// the final address is stored. This variable is a pointer type to a given type 
     /// (ty) and can later be used for load or store.
-    fn decode_mem_addr(&mut self, inst: &Instruction, ty: Type) -> Name {
+    fn decode_mem_addr(&mut self, inst: &Instruction, ty: Type) -> Binding {
 
         let mem_displ = inst.memory_displacement64() as i64;
         
-        let mut var;
+        let mut binding;
         match inst.memory_base() {
             Register::EIP |
             Register::RIP => {
                 // Special handling for RIP addressing, because displacement contains the
-                // absolute value.
-                var = self.create_register();
-                self.push_assign(var, ty.pointer(1), Expression::LiteralInt(mem_displ));
+                // absolute value. We create 
+                binding = self.block.create_binding();
+                self.block.push_bind(binding, ty.pointer(1), Expression::LiteralInt(mem_displ));
             }
             Register::SP |
             Register::ESP |
             Register::RSP => {
                 // If we refer to RSP, we calculate the real address relative to the 
-                // function's base. And then we check if that slot already.
-                let addr = self.stack_pointer + mem_displ as i32;
-                var = self.read_stack_var(addr);
-                self.constants.set(var, addr as i64);
+                // function's base.
+                let addr = self.block.stack_pointer + mem_displ as i32;
+                binding = self.block.read_location(Location::Stack(addr));
+                // self.constants.set(binding, addr as i64);
             }
             base_reg => {
                 // Access relative to other registers.
-                var = self.read_reg_var(base_reg, TY_VOID.pointer(1));
+                binding = self.block.read_location(Location::Register(base_reg));
                 if mem_displ != 0 {
-                    let new_var = self.create_register();
-                    let expr = Expression::Add(var, Value::Val(mem_displ));
-                    self.push_assign(new_var, ty.pointer(1), expr);
-                    var = new_var;
+                    let new_binding = self.block.create_binding();
+                    let expr = Expression::Add(Value::Binding(binding), Value::LiteralInt(mem_displ));
+                    self.block.push_bind(new_binding, ty.pointer(1), expr);
+                    binding = new_binding;
                 }
             }
         }
@@ -365,18 +248,18 @@ impl Decoder {
             Register::None => {}
             index_reg => {
                 // Indexed memory access converts to a GetElementPointer expression.
-                var = self.create_register();
-                let reg_var = self.read_reg_var(index_reg, TY_DWORD);
+                binding = self.block.create_binding();
+                let reg_binding = self.block.read_location(Location::Register(index_reg));
                 let expr = Expression::GetElementPointer { 
-                    pointer: var, 
-                    index: reg_var, 
+                    pointer: binding, 
+                    index: reg_binding, 
                     stride: inst.memory_index_scale() as u8
                 };
-                self.push_assign(var, ty.pointer(1), expr);
+                self.block.push_bind(binding, ty.pointer(1), expr);
             }
         }
 
-        var
+        binding
 
     }
 
@@ -385,36 +268,32 @@ impl Decoder {
         let reg = inst.op0_register();
         let reg_size = reg.size() as u32;
         let reg_ty = PrimitiveType::Int(reg_size * 8).plain();
-        let reg_var = self.read_reg_var(reg, reg_ty);
 
-        let sp = self.sub_sp(reg_size as i32);
-        let stack_var = self.read_stack_var(sp);
-
-        self.push_store(stack_var, reg_var);
+        let binding = self.block.read_location(Location::Register(reg));
+        let sp = self.block.sub_sp(reg_size as i32);
+        self.block.set_location(Location::Stack(sp), binding);
 
     }
 
     fn decode_pop_r(&mut self, inst: &Instruction) {
 
         let reg = inst.op0_register();
-        let reg_size = reg.size() as u16;
-        let reg_ty = Type::from_integer_size(reg_size);
-        let reg_var = self.write_reg_var(reg);
+        let reg_size = reg.size() as u32;
+        let reg_ty = PrimitiveType::Int(reg_size * 8).plain();
 
-        let sp = self.stack_pointer;
-        let stack_var = self.read_stack_var(sp);
-        self.add_sp(reg_size as i32);
-        
-        self.push_assign(reg_var, reg_ty, Expression::Load(stack_var));
+        let sp = self.block.stack_pointer;
+        self.block.add_sp(reg_size as i32);
+        let binding = self.block.read_location(Location::Stack(sp));
+        self.block.set_location(Location::Register(reg), binding);
 
     }
 
     fn decode_lea_r_m(&mut self, inst: &Instruction) {
 
         // mem_size with LEA would be null, so we use the size of the register
-        let mem_var = self.decode_mem_addr(inst, Type::VOID);
+        let binding = self.decode_mem_addr(inst, TY_VOID);
         let reg = inst.op0_register();
-        self.set_reg_var(reg, mem_var);
+        self.block.set_location(Location::Register(reg), binding);
 
     }
 
@@ -788,69 +667,180 @@ impl Decoder {
 
 }
 
-
-/// This structure keeps track of all basic blocks in the program and helps resolving all
-/// of them.
-#[derive(Debug, Default)]
-struct BasicBlockResolver {
-    /// List of all basic blocks already known to the resolver.
-    blocks: Vec<BasicBlockTracker>,
-    /// Mapping of instruction pointers to basic blocks.
-    blocks_map: HashMap<u64, usize>,
-    /// Index of the current basic block being decoded.
-    block_index: Option<usize>,
-}
-
-/// Tracker structure for a single basic block.
+/// Substructure of the IDR decoder that tracks the decoding of the current basic block.
 #[derive(Debug, Default)]
 struct BasicBlockTracker {
+    /// The name factory for the current basic block.
+    binding_factory: BindingFactory,
+    /// Location mapping for input bindings.
+    inputs: HashMap<Location, Binding>,
+    /// Location mapping for output bindings, this also stores bindings used for the
+    /// basic block's body decoding.
+    bindings: HashMap<Location, Binding>,
+    /// Tracker for constant value stored in variables.
+    constants: Constants,
+    /// Current stack pointer. It is common through all of the function.
+    stack_pointer: i32,
+    /// Track the last comparison that might be used in a later conditional jump.
+    cmp: Option<Cmp>,
     /// IDR statements of this basic block.
     statements: Vec<Statement>,
-    /// Start instruction pointer of this basic block.
-    start_ip: u64,
-    /// End instruction pointer (excluded) of this basic block, none if not done.
-    end_ip: Option<u64>,
-    /// Registers that are read by this basic block's instructions.
-    input: Vec<Register>,
-    /// Registers that are written to by this basic block's instructions.
-    output: Vec<Register>,
 }
 
-impl BasicBlockResolver {
+/// A predictable hardware location for an IDR binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Location {
+    /// The operand is passed in the given hardware register.
+    Register(Register),
+    /// The operand is placed in stack at the given offset from Stack Pointer at the
+    /// beginning of the basic block.
+    Stack(i32),
+}
 
-    #[inline]
-    fn basic_block(&self) -> &BasicBlockTracker {
-        &self.blocks[self.block_index.unwrap()]
+impl BasicBlockTracker {
+
+    /// Subtract a delta from the current stack pointer.
+    fn sub_sp(&mut self, delta: i32) -> i32 {
+        self.stack_pointer -= delta;
+        self.stack_pointer
     }
 
-    #[inline]
-    fn basic_block_mut(&mut self) -> &mut BasicBlockTracker {
-        &mut self.blocks[self.block_index.unwrap()]
+    /// Add a delta to the current stack pointer.
+    fn add_sp(&mut self, delta: i32) -> i32 {
+        self.stack_pointer += delta;
+        self.stack_pointer
     }
 
-    fn forward(&mut self, ip: u64) {
+    fn create_binding(&mut self) -> Binding {
+        self.binding_factory.next()
+    }
 
-        let bb_index = match self.block_index {
-            Some(index) => index,
-            None => {
-                let index = self.blocks.len();
-                self.blocks.push(BasicBlockTracker::default());
-                self.block_index = Some(index);
-                index
-            }
-        };
+    /// Internal function to get the binding of the given symbolic location.
+    fn read_location(&mut self, mut location: Location) -> Binding {
 
-        let bb = &mut self.blocks[bb_index];
+        // For general purpose and vector register, we bind to the 
+        // full register (AX -> EAX).
+        // TODO: Track last register size used.
+        if let Location::Register(ref mut reg) = location {
+            *reg = reg.full_register();
+        }
 
-        // // If a basic block is already defined at the new IP, we switch to it.
-        // if let Some(existing_block) = self.blocks_map.get_mut(&ip) {
-        //     // TODO: unconditional jump from bb to this one.
-        //     self.block_index = Some()
-        // }
+        *self.bindings.get(&location).unwrap_or_else(|| {
+            self.inputs.entry(location).or_insert_with(|| self.binding_factory.next())
+        })
+
+    }
+
+    /// Internal function to create a new binding for on the given location and return it.
+    fn write_location(&mut self, location: Location) -> Binding {
+        let binding = self.binding_factory.next();
+        self.bindings.insert(location, binding);
+        binding
+    }
+
+    /// Get the current binding of the given location, if there is no binding this 
+    /// fallback to searching in input bindings.
+    fn get_location(&self, location: Location) -> Option<Binding> {
+        self.bindings.get(&location).or_else(|| self.inputs.get(&location)).copied()
+    }
+
+    /// Force set a binding for the given location.
+    fn set_location(&mut self, location: Location, binding: Binding) {
+        self.bindings.insert(location, binding);
+    }
+
+    /// Internal method to push the given statement on the current basic block.
+    fn push_stmt(&mut self, stmt: Statement) {
+        self.statements.push(stmt);
+    }
+
+    /// Internal function to enqueue a statement
+    fn push_bind(&mut self, binding: Binding, ty: Type, value: Expression) {
+
+        // Propagate constant values.
+        match value {
+            Expression::LiteralInt(val) => self.constants.set(binding, val),
+            // Expression::Add(from, Value::Val(val)) => 
+            //     self.constants.try_add(from, var, val),
+            // Expression::Sub(from, Value::Val(val)) =>
+            //     self.constants.try_sub(from, var, val),
+            _ => {}
+        }
+
+        self.push_stmt(Statement::Bind(Bind { register: binding, ty, value }));
+
+    }
+
+    /// Push a store statement in the current basic block.
+    fn push_store(&mut self, pointer_register: Binding, value: Expression) {
+        self.push_stmt(Statement::Store(Store { pointer_register, value }));
+    }
+
+}
+
+
+// /// This structure keeps track of all basic blocks in the program and helps resolving all
+// /// of them.
+// #[derive(Debug, Default)]
+// struct BasicBlockList {
+//     /// List of all basic blocks already known to the resolver.
+//     blocks: Vec<BasicBlockInfo>,
+//     /// Mapping of instruction pointers to basic blocks.
+//     blocks_map: HashMap<u64, usize>,
+//     /// Index of the current basic block being decoded.
+//     block_index: Option<usize>,
+// }
+
+// /// A partial basic block as stored in the basic block list.
+// #[derive(Debug, Default)]
+// struct BasicBlockInfo {
+//     /// IDR statements of this basic block.
+//     statements: Vec<Statement>,
+//     /// Start instruction pointer of this basic block.
+//     start_ip: u64,
+//     /// End instruction pointer (excluded) of this basic block, none if not done.
+//     end_ip: Option<u64>,
+//     /// Registers that are read by this basic block's instructions.
+//     input: Vec<Register>,
+//     /// Registers that are written to by this basic block's instructions.
+//     output: Vec<Register>,
+// }
+
+// impl BasicBlockList {
+
+//     #[inline]
+//     fn basic_block(&self) -> &BasicBlockInfo {
+//         &self.blocks[self.block_index.unwrap()]
+//     }
+
+//     #[inline]
+//     fn basic_block_mut(&mut self) -> &mut BasicBlockInfo {
+//         &mut self.blocks[self.block_index.unwrap()]
+//     }
+
+//     fn forward(&mut self, ip: u64) {
+
+//         let bb_index = match self.block_index {
+//             Some(index) => index,
+//             None => {
+//                 let index = self.blocks.len();
+//                 self.blocks.push(BasicBlockInfo::default());
+//                 self.block_index = Some(index);
+//                 index
+//             }
+//         };
+
+//         let bb = &mut self.blocks[bb_index];
+
+//         // // If a basic block is already defined at the new IP, we switch to it.
+//         // if let Some(existing_block) = self.blocks_map.get_mut(&ip) {
+//         //     // TODO: unconditional jump from bb to this one.
+//         //     self.block_index = Some()
+//         // }
         
-    }
+//     }
 
-}
+// }
 
 
 /// A tracker for variables that have constant values known
@@ -858,23 +848,23 @@ impl BasicBlockResolver {
 /// it's useful when used analyzing optimisations around RSP.
 #[derive(Debug, Default)]
 struct Constants {
-    inner: HashMap<Name, i64>,
+    inner: HashMap<Binding, i64>,
 }
 
 impl Constants {
 
-    fn set(&mut self, var: Name, val: i64) {
+    fn set(&mut self, var: Binding, val: i64) {
         self.inner.insert(var, val);
     }
 
-    fn get(&self, var: Name) -> Option<i64> {
+    fn get(&self, var: Binding) -> Option<i64> {
         self.inner.get(&var).copied()
     }
 
     /// If the variable `from` has a constant value, map its 
     /// value using the given function to the `to` variable.
     #[inline]
-    fn try_map<F>(&mut self, from: Name, to: Name, func: F)
+    fn try_map<F>(&mut self, from: Binding, to: Binding, func: F)
     where
         F: FnOnce(i64) -> i64
     {
@@ -886,17 +876,17 @@ impl Constants {
     /// If the variable `from` has a constant value, copy
     /// it to the `to` variable.
     #[inline]
-    fn try_copy(&mut self, from: Name, to: Name) {
+    fn try_copy(&mut self, from: Binding, to: Binding) {
         self.try_map(from, to, |v| v)
     }
 
     #[inline]
-    fn try_add(&mut self, from: Name, to: Name, val: i64) {
+    fn try_add(&mut self, from: Binding, to: Binding, val: i64) {
         self.try_map(from, to, move |v| v + val)
     }
 
     #[inline]
-    fn try_sub(&mut self, from: Name, to: Name, val: i64) {
+    fn try_sub(&mut self, from: Binding, to: Binding, val: i64) {
         self.try_map(from, to, move |v| v - val)
     }
 
@@ -915,8 +905,8 @@ enum NumOp {
 /// Internal structure used to track possible comparisons.
 #[derive(Debug, Clone)]
 struct Cmp {
-    left: Name,
-    right: Name,
+    left: Binding,
+    right: Binding,
     ty: Type,
     kind: CmpKind,
 }

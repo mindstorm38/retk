@@ -161,10 +161,12 @@ impl From<PrimitiveType> for Type {
 
 impl PrimitiveType {
 
+    /// Create a plain type (not a pointer) from this primitive type.
     pub const fn plain(self) -> Type {
         Type { primitive: self, indirection: 0 }
     }
 
+    /// Create a point type with specific level of indirection from this primitive type.
     pub const fn pointer(self, indirection: u8) -> Type {
         Type { primitive: self, indirection }
     }

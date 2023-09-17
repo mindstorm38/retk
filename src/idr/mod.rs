@@ -63,15 +63,15 @@ pub struct BasicBlock {
     pub branch: Branch,
 }
 
-/// Represent a variable's unique name in a function's IDR.
+/// Represent a unique binding in a basic block's IDR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Name(NonZeroU32);
+pub struct Binding(NonZeroU32);
 
 /// Describe the effective value for an expression, can be either a variable or a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Value {
-    /// The value is come from a register.
-    Register(Name),
+    /// The value is come from a previous binding.
+    Binding(Binding),
     /// A constant value.
     LiteralInt(i64),
 }
@@ -81,9 +81,9 @@ pub enum Value {
 pub enum Statement {
     /// Store an expression's value to a pointed value.
     Store(Store),
-    /// Create a new register of a given name, type and definitive value. Its name should
-    /// be unique through the whole function.
-    Create(Create),
+    /// Bind a new register with a type and its final value. You should ensure that its
+    /// name is unique throughout the basic block.
+    Bind(Bind),
     /// A raw assembly instruction, **currently** just string.
     Asm(String),
 }
@@ -92,15 +92,15 @@ pub enum Statement {
 pub struct Store {
     /// The register that stores the pointer where the source register's value should by
     /// copied to.
-    pub pointer_register: Name,
+    pub pointer_register: Binding,
     /// The source expression from which the value is copied in the pointed location.
     pub value: Expression,
 }
 
 #[derive(Debug, Clone)]
-pub struct Create {
+pub struct Bind {
     /// The new register that is being created.
-    pub register: Name,
+    pub register: Binding,
     /// Type of the variable.
     pub ty: Type,
     /// The expression used that calculate the value to assign.
@@ -117,23 +117,23 @@ pub enum Branch {
         /// Index of the basic block to goto.
         index: usize,
         /// Arguments of the basic block.
-        args: Vec<Name>,
+        args: Vec<Binding>,
     },
     /// Conditional branch depending on a boolean variable.
     Conditional {
-        var: Name,
+        var: Binding,
         /// Index of the basic block to goto if the condition is met.
         then_index: usize,
         /// Arguments of the basic block to goto if the condition is met.
-        then_args: Vec<Name>,
+        then_args: Vec<Binding>,
         /// Index of the basic block to goto if the condition is not met.
         else_index: usize,
         /// Arguments of the basic block to goto if the condition is not met.
-        else_args: Vec<Name>,
+        else_args: Vec<Binding>,
     },
     /// Returning from the function.
     Ret {
-        var: Name,
+        var: Binding,
     },
 }
 
@@ -150,7 +150,7 @@ pub enum Expression {
     /// A literal value.
     LiteralInt(i64),
     /// Load a value by dereferencing the given register.
-    Load(Name),
+    Load(Binding),
     /// Stack allocation of a given size. *Value type is a pointer.*
     Stack(u64),
     /// A call to another function.
@@ -162,26 +162,29 @@ pub enum Expression {
     },
     /// Offset a given pointer by a given index and stride.
     GetElementPointer {
-        pointer: Name, 
-        index: Name, 
+        /// The pointer we want to offset.
+        pointer: Binding,
+        /// The variable containing the offset.
+        index: Binding,
+        /// The bytes stride when index increments by one.
         stride: u8
     },
     /// Compare two values and place return a boolean.
     Cmp(Comparison, Value, Value),
-    /// Add a value to a variable. Both values should have the same 
-    /// type, *and this is the returned type*.
+    /// Add a value to a variable. Both values should have the same type, *and this is 
+    /// the returned type*.
     Add(Value, Value),
-    /// Sub a value from a variable. Both values should have the same 
-    /// type, *and this is the returned type*.
+    /// Sub a value from a variable. Both values should have the same type, *and this is 
+    /// the returned type*.
     Sub(Value, Value),
-    /// Mul a value to a variable. Both values should have the same 
-    /// type, *and this is the returned type*.
+    /// Mul a value to a variable. Both values should have the same type, *and this is 
+    /// the returned type*.
     Mul(Value, Value),
-    /// Div a value to a variable. Both values should have the same 
-    /// type, *and this is the returned type*.
+    /// Div a value to a variable. Both values should have the same type, *and this is
+    /// the returned type*.
     Div(Value, Value),
-    /// XOR a value to a variable. Both values should have the same 
-    /// type, *and this is the returned type*.
+    /// XOR a value to a variable. Both values should have the same type, *and this is
+    /// the returned type*.
     Xor(Value, Value),
 }
 
@@ -194,24 +197,24 @@ pub enum Comparison {
 
 
 #[derive(Debug, Clone)]
-pub struct NameFactory {
+pub struct BindingFactory {
     index: NonZeroU32,
 }
 
-impl Default for NameFactory {
+impl Default for BindingFactory {
     fn default() -> Self {
         Self { index: NonZeroU32::new(1).unwrap() }
     }
 }
 
-impl NameFactory {
+impl BindingFactory {
 
     /// Create a new IDR variable unique to this factory.
-    pub fn next(&mut self) -> Name {
+    pub fn next(&mut self) -> Binding {
         let index = self.index;
         self.index = self.index.checked_add(1)
             .expect("reached maximum number of idr variables");
-        Name(index)
+        Binding(index)
     }
 
 }
