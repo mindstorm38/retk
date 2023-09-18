@@ -1,26 +1,28 @@
-use std::fmt::{self, Write};
+use std::fmt;
 
-use super::{Function, Statement, Expression, Value, Binding, Comparison};
-use crate::idr::Branch;
+use super::{Statement, Expression, Value, Place, Comparison};
+use super::types::TypeSystem;
 
 
-struct NameDisplay(Binding);
-impl fmt::Display for NameDisplay {
+struct PlaceDisplay(Place);
+impl fmt::Display for PlaceDisplay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        const BASE: u32 = 26;
-        let mut rem = self.0.0.get() - 1;
-        f.write_char('%')?;
-        loop {
-            let idx = rem % BASE;
-            f.write_char(char::from_u32('a' as u32 + idx).unwrap())?;
-            rem = rem / BASE;
-            if rem == 0 {
-                break;
-            } else {
-                rem -= 1;
-            }
-        }
-        Ok(())
+        write!(f, "%{}", self.0.0)
+
+        // const BASE: u32 = 26;
+        // let mut rem = self.0.0.get() - 1;
+        // f.write_char('%')?;
+        // loop {
+        //     let idx = rem % BASE;
+        //     f.write_char(char::from_u32('a' as u32 + idx).unwrap())?;
+        //     rem = rem / BASE;
+        //     if rem == 0 {
+        //         break;
+        //     } else {
+        //         rem -= 1;
+        //     }
+        // }
+        // Ok(())
     }
 }
 
@@ -29,97 +31,69 @@ struct ValueDisplay(Value);
 impl fmt::Display for ValueDisplay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
-            Value::Binding(var) => write!(f, "{}", NameDisplay(var)),
-            Value::LiteralInt(val) => write!(f, "{val}"),
+            Value::Place(var) => write!(f, "{}", PlaceDisplay(var)),
+            Value::LiteralInt(val) => write!(f, "0x{val:X}"),
         }
     }
 }
 
 
 struct ExpressionDisplay<'a>(&'a Expression);
-impl<'a> fmt::Display for ExpressionDisplay<'a> {
+impl fmt::Display for ExpressionDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
-            Expression::LiteralInt(val) => write!(f, "{val}"),
-            Expression::Load(var) => write!(f, "load {}", NameDisplay(*var)),
+        match *self.0 {
+            Expression::Value(value) => write!(f, "{}", ValueDisplay(value)),
+            Expression::Load(var) => write!(f, "load {}", PlaceDisplay(var)),
             Expression::Stack(size) => write!(f, "stack {size}"),
-            Expression::Call { pointer, arguments } => {
-                write!(f, "call {}", ValueDisplay(*pointer))?;
-                for arg in arguments {
-                    write!(f, ", {}", ValueDisplay(*arg))?;
+            Expression::Call { pointer, ref arguments } => {
+                write!(f, "call {}", ValueDisplay(pointer))?;
+                for &arg in arguments {
+                    write!(f, ", {}", ValueDisplay(arg))?;
                 }
                 Ok(())
             }
             Expression::GetElementPointer { pointer, index, stride } => {
-                write!(f, "gep {}, {} * {stride}", NameDisplay(*pointer), NameDisplay(*index))
+                write!(f, "gep {}, {} * {stride}", PlaceDisplay(pointer), PlaceDisplay(index))
             }
-            Expression::Cmp(cmp, var, val) => {
-                write!(f, "cmp ")?;
-                match cmp {
-                    Comparison::Equal => write!(f, "eq")?,
-                    Comparison::NotEqual => write!(f, "neq")?,
-                }
-                write!(f, ", {}, {}", ValueDisplay(*var), ValueDisplay(*val))
+            Expression::Cmp(cmp, left, right) => {
+                write!(f, "cmp {}, {}, {}", match cmp {
+                    Comparison::Equal => "eq",
+                    Comparison::NotEqual => "neq",
+                }, ValueDisplay(left), ValueDisplay(right))
             }
-            Expression::Add(var, val) => write!(f, "add {}, {}", ValueDisplay(*var), ValueDisplay(*val)),
-            Expression::Sub(var, val) => write!(f, "sub {}, {}", ValueDisplay(*var), ValueDisplay(*val)),
-            Expression::Mul(var, val) => write!(f, "mul {}, {}", ValueDisplay(*var), ValueDisplay(*val)),
-            Expression::Div(var, val) => write!(f, "div {}, {}", ValueDisplay(*var), ValueDisplay(*val)),
-            Expression::Xor(var, val) => write!(f, "xor {}, {}", ValueDisplay(*var), ValueDisplay(*val)),
+            Expression::Add(left, right) => write!(f, "add {}, {}", ValueDisplay(left), ValueDisplay(right)),
+            Expression::Sub(left, right) => write!(f, "sub {}, {}", ValueDisplay(left), ValueDisplay(right)),
+            Expression::Mul(left, right) => write!(f, "mul {}, {}", ValueDisplay(left), ValueDisplay(right)),
+            Expression::Div(left, right) => write!(f, "div {}, {}", ValueDisplay(left), ValueDisplay(right)),
+            Expression::Xor(left, right) => write!(f, "xor {}, {}", ValueDisplay(left), ValueDisplay(right)),
         }
     }
 }
 
 
-pub fn print_function(func: &Function) {
+pub struct StatementsDisplay<'a, 'b> {
+    pub statements: &'a [Statement],
+    pub type_system: &'b TypeSystem,
+}
 
-    // for (bb_index, bb) in func.basic_blocks.iter().enumerate() {
-
-    //     print!("bb{bb_index}(");
-    //     for (i, (var, ty)) in bb.parameters.iter().enumerate() {
-    //         if i != 0 {
-    //             print!(", ");
-    //         }
-    //         print!("{}: {ty:?}", NameDisplay(*var));
-    //     }
-    //     println!(")");
-
-    //     for stmt in &bb.statements {
-    //         match stmt {
-    //             Statement::Store(store) => {
-    //                 let ptr = NameDisplay(store.pointer_register).to_string();
-    //                 println!(" *{ptr:>3}           = {}", NameDisplay(store.register));
-    //             }
-    //             Statement::Create(assign) => {
-    //                 let var = NameDisplay(assign.register).to_string();
-    //                 let ty = format!("{:?}", assign.ty);
-    //                 println!("  {var:>3}: {ty:8} = {}", ExpressionDisplay(&assign.value));
-    //             }
-    //             Statement::Asm(asm) => {
-    //                 println!("                  asm '{asm}'");
-    //             }
-    //         }
-    //     }
-        
-    //     match bb.branch {
-    //         Branch::Unknown => {
-    //             println!("                  br ???");
-    //         }
-    //         Branch::Unconditional { index, ref args } => {
-    //             println!("                  br bb{index}");
-    //         }
-    //         Branch::Conditional { 
-    //             var, 
-    //             then_index, ref then_args, 
-    //             else_index, ref else_args 
-    //         } => {
-    //             println!("                  br {}, then bb{then_index}, else bb{else_index}", NameDisplay(var));
-    //         }
-    //         Branch::Ret => {
-    //             println!("                  ret");
-    //         }
-    //     }
-
-    // }
-
+impl fmt::Display for StatementsDisplay<'_, '_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for stmt in self.statements {
+            match stmt {
+                Statement::Store(store) => {
+                    let ptr = PlaceDisplay(store.pointer).to_string();
+                    writeln!(f, " *{ptr:>3}           = {}", ExpressionDisplay(&store.value))?;
+                }
+                Statement::Bind(bind) => {
+                    let var = PlaceDisplay(bind.place).to_string();
+                    let ty = self.type_system.name(bind.ty);
+                    writeln!(f, "  {var:>3}: {ty:8} = {}", ExpressionDisplay(&bind.value))?;
+                }
+                Statement::Asm(asm) => {
+                    writeln!(f, "                  asm '{asm}'")?;
+                }
+            }
+        }
+        Ok(())
+    }
 }

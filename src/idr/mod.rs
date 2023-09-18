@@ -63,15 +63,15 @@ pub struct BasicBlock {
     pub branch: Branch,
 }
 
-/// Represent a unique binding in a basic block's IDR.
+/// Represent a unique place for storing a value in a basic block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Binding(NonZeroU32);
+pub struct Place(NonZeroU32);
 
 /// Describe the effective value for an expression, can be either a variable or a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Value {
-    /// The value is come from a previous binding.
-    Binding(Binding),
+    /// The value is come from a place's value.
+    Place(Place),
     /// A constant value.
     LiteralInt(i64),
 }
@@ -81,8 +81,7 @@ pub enum Value {
 pub enum Statement {
     /// Store an expression's value to a pointed value.
     Store(Store),
-    /// Bind a new register with a type and its final value. You should ensure that its
-    /// name is unique throughout the basic block.
+    /// Create a new place associated to a given expression.
     Bind(Bind),
     /// A raw assembly instruction, **currently** just string.
     Asm(String),
@@ -90,17 +89,17 @@ pub enum Statement {
 
 #[derive(Debug, Clone)]
 pub struct Store {
-    /// The register that stores the pointer where the source register's value should by
+    /// The place that stores the pointer where the source place's value should by
     /// copied to.
-    pub pointer_register: Binding,
+    pub pointer: Place,
     /// The source expression from which the value is copied in the pointed location.
     pub value: Expression,
 }
 
 #[derive(Debug, Clone)]
 pub struct Bind {
-    /// The new register that is being created.
-    pub register: Binding,
+    /// The new place that is being created.
+    pub place: Place,
     /// Type of the variable.
     pub ty: Type,
     /// The expression used that calculate the value to assign.
@@ -117,23 +116,23 @@ pub enum Branch {
         /// Index of the basic block to goto.
         index: usize,
         /// Arguments of the basic block.
-        args: Vec<Binding>,
+        args: Vec<Place>,
     },
     /// Conditional branch depending on a boolean variable.
     Conditional {
-        var: Binding,
+        place: Place,
         /// Index of the basic block to goto if the condition is met.
         then_index: usize,
         /// Arguments of the basic block to goto if the condition is met.
-        then_args: Vec<Binding>,
+        then_args: Vec<Place>,
         /// Index of the basic block to goto if the condition is not met.
         else_index: usize,
         /// Arguments of the basic block to goto if the condition is not met.
-        else_args: Vec<Binding>,
+        else_args: Vec<Place>,
     },
     /// Returning from the function.
     Ret {
-        var: Binding,
+        place: Place,
     },
 }
 
@@ -147,10 +146,10 @@ impl Default for Branch {
 /// Represent an rvalue in an assignment.
 #[derive(Debug, Clone)]
 pub enum Expression {
-    /// A literal value.
-    LiteralInt(i64),
+    /// A direct value.
+    Value(Value),
     /// Load a value by dereferencing the given register.
-    Load(Binding),
+    Load(Place),
     /// Stack allocation of a given size. *Value type is a pointer.*
     Stack(u64),
     /// A call to another function.
@@ -163,9 +162,9 @@ pub enum Expression {
     /// Offset a given pointer by a given index and stride.
     GetElementPointer {
         /// The pointer we want to offset.
-        pointer: Binding,
+        pointer: Place,
         /// The variable containing the offset.
-        index: Binding,
+        index: Place,
         /// The bytes stride when index increments by one.
         stride: u8
     },
@@ -197,24 +196,24 @@ pub enum Comparison {
 
 
 #[derive(Debug, Clone)]
-pub struct BindingFactory {
+pub struct PlaceFactory {
     index: NonZeroU32,
 }
 
-impl Default for BindingFactory {
+impl Default for PlaceFactory {
     fn default() -> Self {
         Self { index: NonZeroU32::new(1).unwrap() }
     }
 }
 
-impl BindingFactory {
+impl PlaceFactory {
 
-    /// Create a new IDR variable unique to this factory.
-    pub fn next(&mut self) -> Binding {
+    /// Create a new place unique to this factory.
+    pub fn next(&mut self) -> Place {
         let index = self.index;
         self.index = self.index.checked_add(1)
-            .expect("reached maximum number of idr variables");
-        Binding(index)
+            .expect("reached maximum number of idr places");
+        Place(index)
     }
 
 }

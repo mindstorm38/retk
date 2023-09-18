@@ -10,7 +10,7 @@ pub struct TypeSystem {
     pointer_size: u64,
     /// Size of bytes on this system, in bits.
     byte_size: u64,
-    /// Cache for type names.
+    /// Cache for type names (TODO: rework it to avoid needing mutation).
     name_cache: HashMap<Type, String>,
     /// The list of struct definitions.
     struct_defs: Vec<(String, Option<StructDef>)>,
@@ -38,21 +38,33 @@ impl TypeSystem {
     }
 
     /// Return the name of the given type.
-    pub fn name(&mut self, ty: Type) -> &str {
-        self.name_cache.entry(ty).or_insert_with_key(|&k| {
-            let mut name = String::new();
-            match k.primitive {
-                PrimitiveType::Int(n) => write!(name, "i{n}").unwrap(),
-                PrimitiveType::Float => name.write_str("f32").unwrap(),
-                PrimitiveType::Double => name.write_str("f64").unwrap(),
-                PrimitiveType::Struct(s) => {
-                    let struct_name = self.struct_defs[s.0 as usize].0;
-                    write!(name, "struct {struct_name}").unwrap();
-                }
+    pub fn name(&self, ty: Type) -> String {
+        // self.name_cache.entry(ty).or_insert_with_key(|&k| {
+        //     let mut name = String::new();
+        //     match k.primitive {
+        //         PrimitiveType::Int(n) => write!(name, "i{n}").unwrap(),
+        //         PrimitiveType::Float => name.write_str("f32").unwrap(),
+        //         PrimitiveType::Double => name.write_str("f64").unwrap(),
+        //         PrimitiveType::Struct(s) => {
+        //             let struct_name = &self.struct_defs[s.0 as usize].0;
+        //             write!(name, "struct {struct_name}").unwrap();
+        //         }
+        //     }
+        //     name.extend(std::iter::repeat('*').take(k.indirection as _));
+        //     name
+        // }).as_str()
+        let mut name = String::new();
+        match ty.primitive {
+            PrimitiveType::Int(n) => write!(name, "i{n}").unwrap(),
+            PrimitiveType::Float => name.write_str("f32").unwrap(),
+            PrimitiveType::Double => name.write_str("f64").unwrap(),
+            PrimitiveType::Struct(s) => {
+                let struct_name = &self.struct_defs[s.0 as usize].0;
+                write!(name, "struct {struct_name}").unwrap();
             }
-            name.extend(std::iter::repeat('*').take(k.indirection as _));
-            name
-        }).as_str()
+        }
+        name.extend(std::iter::repeat('*').take(ty.indirection as _));
+        name
     }
 
     /// Round the given number of bits up to get the number of bytes needed to store.
@@ -81,7 +93,7 @@ impl TypeSystem {
             PrimitiveType::Float => Some(Layout { size: 4, align: 4 }),
             PrimitiveType::Double => Some(Layout { size: 8, align: 8 }),
             PrimitiveType::Struct(s) => {
-                let def = &self.struct_defs[s.0 as usize].1?;
+                let def = self.struct_defs[s.0 as usize].1.as_ref()?;
                 Some(Layout { size: def.size, align: def.align })
             }
         }
