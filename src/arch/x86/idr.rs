@@ -81,6 +81,8 @@ struct BasicBlockDecoder {
     block: Option<BasicBlockTracker>,
     /// Mapping of basic block's entry point adresses to there decoding information.
     blocks: HashMap<u64, BasicBlockInfo>,
+    /// Queue for next basic blocks to decode.
+    blocks_queue: Vec<u64>,
     /// Type system (for now used for debugging type names).
     type_system: TypeSystem,
 }
@@ -91,6 +93,7 @@ impl BasicBlockDecoder {
         Self {
             block: None,
             blocks: HashMap::new(),
+            blocks_queue: Vec::new(),
             type_system: TypeSystem::new(64, 8),
         }
     }
@@ -103,7 +106,7 @@ impl BasicBlockDecoder {
         let ip = inst.ip();
         let block = self.block.get_or_insert_with(|| BasicBlockTracker::new(ip));
         
-        println!("[{:08X}] {inst}", block.start_ip);
+        println!("[{ip:08X} (+{:02})] {inst}", ip - block.start_ip);
         
         match inst.code() {
             // NOP
@@ -203,6 +206,11 @@ impl BasicBlockDecoder {
             Code::Movss_xmmm32_xmm => block.decode_movs_rm_r(inst, false),
             Code::Movsd_xmm_xmmm64 => block.decode_movs_r_rm(inst, true),
             Code::Movsd_xmmm64_xmm => block.decode_movs_rm_r(inst, true),
+            // TEST
+            Code::Test_rm64_r64 |
+            Code::Test_rm32_r32 |
+            Code::Test_rm16_r16 |
+            Code::Test_rm8_r8 => block.decode_test_rm_r(inst),
             // CALL
             Code::Call_rel16 |
             Code::Call_rel32_32 |
@@ -216,11 +224,6 @@ impl BasicBlockDecoder {
             // Code::Cmp_rm64_imm32 |
             // Code::Cmp_rm32_imm32 |
             // Code::Cmp_rm16_imm16 => self.decode_cmp_rm_imm(inst),
-            // TEST
-            Code::Test_rm64_r64 |
-            Code::Test_rm32_r32 |
-            Code::Test_rm16_r16 |
-            Code::Test_rm8_r8 => block.decode_test_rm_r(inst),
             // Jcc
             code if code.is_jcc_short_or_near() => return self.decode_jcc(inst),
             // JMP
@@ -228,7 +231,7 @@ impl BasicBlockDecoder {
             Code::Jmp_rel8_32 |
             Code::Jmp_rel8_16 |
             Code::Jmp_rel32_64 |
-            Code::Jmp_rel32_32 => self.decode_jmp(inst),
+            Code::Jmp_rel32_32 => return self.decode_jmp(inst),
             // RET
             Code::Retnq |
             Code::Retnd |
@@ -241,7 +244,7 @@ impl BasicBlockDecoder {
             Code::Retfw |
             Code::Retfq_imm16 |
             Code::Retfd_imm16 |
-            Code::Retfw_imm16 => self.decode_ret(inst),
+            Code::Retfw_imm16 => return self.decode_ret(inst),
             _ => {
                 println!("  (unknown)");
                 block.push_stmt(Statement::Asm(inst.to_string()));
@@ -252,7 +255,7 @@ impl BasicBlockDecoder {
 
     }
 
-    fn decode_call_rel(&mut self, inst: &Instruction) -> Option<u64> { // TODO:
+    fn decode_call_rel(&mut self, inst: &Instruction) -> Option<u64> {
 
         // The instruction pointer of the basic block to call, we decode it first so we
         // can later resume the decoding of the current basic block with better knowledge
@@ -273,8 +276,11 @@ impl BasicBlockDecoder {
         self.blocks.insert(block.start_ip, BasicBlockInfo { 
             statements: block.statements, 
             start_ip: block.start_ip,
-            end_ip: None,
+            end_ip: None, // Our basic block is not finished, call will return in it.
         });
+
+        // We need to re-decode this block later...
+        self.blocks_queue.push(block.start_ip);
 
         Some(pointer)
 
@@ -293,33 +299,64 @@ impl BasicBlockDecoder {
         // });
     }
 
-    // fn decode_cmp_rm_imm(&mut self, inst: &Instruction) {
+    /*fn decode_cmp_rm_imm(&mut self, inst: &Instruction) {
 
-    //     let (left_var, var_ty) = match inst.op0_register() {
-    //         Register::None => {
-    //             let (mem_var, mem_size) = self.decode_mem_addr(inst);
-    //             let var = self.var_factory.create();
-    //             let var_ty = Type::from_integer_size(mem_size);
-    //             self.push_assign(var, var_ty.clone(), IdrExpression::Deref { base: mem_var, offset: 0 });
-    //             (var, var_ty)
-    //         }
-    //         reg => {
-    //             (self.decode_read_register(reg), Type::from_integer_size(reg.size() as u16))
-    //         },
-    //     };
+        let (left_var, var_ty) = match inst.op0_register() {
+            Register::None => {
+                let (mem_var, mem_size) = self.decode_mem_addr(inst);
+                let var = self.var_factory.create();
+                let var_ty = Type::from_integer_size(mem_size);
+                self.push_assign(var, var_ty.clone(), IdrExpression::Deref { base: mem_var, offset: 0 });
+                (var, var_ty)
+            }
+            reg => {
+                (self.decode_read_register(reg), Type::from_integer_size(reg.size() as u16))
+            },
+        };
 
-    //     let right_var = self.var_factory.create();
+        let right_var = self.var_factory.create();
 
-    //     self.push_assign(right_var, var_ty.clone(), IdrExpression::Constant(inst.immediate64() as i64));
+        self.push_assign(right_var, var_ty.clone(), IdrExpression::Constant(inst.immediate64() as i64));
 
-    //     self.cmp = Some(AnalyzerCmp { 
-    //         left_var, 
-    //         right_var, 
-    //         ty: var_ty,
-    //         kind: AnalyzerCmpKind::Cmp,
-    //     });
+        self.cmp = Some(AnalyzerCmp { 
+            left_var, 
+            right_var, 
+            ty: var_ty,
+            kind: AnalyzerCmpKind::Cmp,
+        });
 
-    // }
+    }*/
+
+    fn decode_jmp(&mut self, inst: &Instruction) -> Option<u64> {
+        
+        let pointer = inst.near_branch64();
+
+        // Check if the pointed block is already decoded or not, if so we ignore it.
+        if let Some(pointed_block) = self.blocks.get(&pointer) {
+            if pointed_block.end_ip.is_some() {
+                return None;
+            }
+        }
+
+        // We are on a branching instruction, take the current tracker and prepare next
+        // one that will track the called basic block.
+        let block = self.block.take().unwrap();
+
+        println!("decode_jmp:\n{}", StatementsDisplay {
+            statements: &block.statements,
+            type_system: &self.type_system,
+        });
+
+        // Before switching to the next block, save the current block's information.
+        self.blocks.insert(block.start_ip, BasicBlockInfo { 
+            statements: block.statements, 
+            start_ip: block.start_ip,
+            end_ip: Some(inst.next_ip()), // Our basic block is finished.
+        });
+
+        Some(pointer)
+
+    }
 
     fn decode_jcc(&mut self, inst: &Instruction) -> Option<u64> {
 
@@ -359,6 +396,9 @@ impl BasicBlockDecoder {
         self.blocks.insert(pointer, BasicBlockInfo::new(pointer));
         self.blocks.insert(inst.next_ip(), BasicBlockInfo::new(inst.next_ip()));
 
+        // We need to decode the next block (second jcc branch) later...
+        self.blocks_queue.push(inst.next_ip());
+
         println!("decode_jcc:\n{}", StatementsDisplay { 
             statements: &block.statements,
             type_system: &self.type_system,
@@ -367,33 +407,46 @@ impl BasicBlockDecoder {
         None
 
     }
+    
+    fn decode_ret(&mut self, inst: &Instruction) -> Option<u64> {
 
-    fn decode_jmp(&mut self, inst: &Instruction) {
+        // Return is an unconditional jump to a statically unknown instruction pointer,
+        // so we just stop decoding the current basic block and work again and resume
+        // the last unfinished basic block.
+
+        // Complete the current basic block and push it in blocks map.
+        let block = self.block.take().unwrap();
+
+        println!("decode_ret:\n{}", StatementsDisplay { 
+            statements: &block.statements,
+            type_system: &self.type_system,
+        });
         
-        unimplemented!("decode_jmp")
+        self.blocks.insert(block.start_ip, BasicBlockInfo { 
+            statements: block.statements, 
+            start_ip: block.start_ip,
+            end_ip: Some(inst.next_ip()), // Our basic block is finished.
+        });
 
-        // let pointer = inst.near_branch64();
-        // let goto_index = self.function.ensure_basic_block(pointer);
-
-        // for param in &self.function.basic_block_trackers[goto_index].parameters {
-            
-        // }
-        
-        // let (bb, _) = self.function.basic_block_mut();
-        // bb.branch = Branch::Unconditional { index: goto_index, args: Vec::new() };
-
-        // self.function.basic_block_end();
+        self.find_next_block()
 
     }
-    
-    fn decode_ret(&mut self, _inst: &Instruction) {
 
-        unimplemented!("decode_ret")
+    fn find_next_block(&mut self) -> Option<u64> {
 
-        // let (bb, _) = self.function.basic_block_mut();
-        // bb.branch = Branch::Ret;
+        while let Some(next_ip) = self.blocks_queue.pop() {
+            // If the block already exists, do not decode it again if it is already done.
+            // If it doesn't exists, just go to it.
+            if let Some(next_block) = self.blocks.get(&next_ip) {
+                if next_block.end_ip.is_none() {
+                    return Some(next_ip);
+                }
+            } else {
+                return Some(next_ip);
+            }
+        }
 
-        // self.function.basic_block_end();
+        None
 
     }
 
@@ -408,8 +461,8 @@ struct BasicBlockTracker {
     place_factory: PlaceFactory,
     /// Location mapping for input places.
     inputs: HashMap<Location, Place>,
-    /// Location mapping for output places, this also stores places used for the
-    /// basic block's body decoding.
+    /// Location mapping for output places, this also stores places used for the basic 
+    /// block's body decoding.
     place: HashMap<Location, Place>,
     /// Tracker for constant value stored in variables.
     constants: Constants,
@@ -421,13 +474,17 @@ struct BasicBlockTracker {
     statements: Vec<Statement>,
 }
 
-/// A predictable hardware location for an IDR place.
+/// Each place is bound to a hardware location known at (de)compile-time (statically-known
+/// locations), such locations are hardware registers and stack variables. Each place may
+/// be stored in multiple locations at once, it's possible because of the *SSA form* used,
+/// so each place have only one value in its lifetime and this value can be stored in 
+/// multiple places if needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Location {
-    /// The operand is passed in the given hardware register.
+    /// The place is located in a x86 hardware register.
     Register(Register),
-    /// The operand is placed in stack at the given offset from Stack Pointer at the
-    /// beginning of the basic block.
+    /// The place is located in the stack, starting at the given stack offset *(relative
+    /// to the basic-block stack frame pointer).
     Stack(i32),
 }
 
@@ -452,11 +509,15 @@ impl BasicBlockTracker {
         self.stack_pointer
     }
 
+    /// Manually create a new IDR place, this can be used to represent memory locations
+    /// that are unknown at static analysis. If the location is known, for example with
+    /// registers or stack, please refer to [`read_location`] or [`write_location`].
     fn create_place(&mut self) -> Place {
         self.place_factory.next()
     }
 
     /// Internal function to get the binding of the given symbolic location.
+    /// The returned place should already be bound, so you should only read from it.
     fn read_location(&mut self, mut location: Location) -> Place {
 
         // For general purpose and vector register, we bind to the 
@@ -473,6 +534,7 @@ impl BasicBlockTracker {
     }
 
     /// Internal function to create a new place for on the given location and return it.
+    /// You must bind it to an expression.
     fn write_location(&mut self, mut location: Location) -> Place {
 
         // NOTE: Read comments in 'read_location'.
@@ -524,60 +586,83 @@ impl BasicBlockTracker {
         self.push_stmt(Statement::Store(Store { pointer: pointer_register, value }));
     }
 
-    /// Decode an instruction's memory addressing operand and return the variable where 
-    /// the final address is stored. This variable is a pointer type to a given type 
-    /// (ty) and can later be used for load or store.
-    fn decode_mem_addr(&mut self, inst: &Instruction, ty: Type) -> Place {
+    /// Decode an instruction's memory addressing operand and return the decoded operand,
+    /// this operand may be an expression that produces a pointer value, or a stack offset
+    /// if the memory operand is referring to a stack slot.
+    fn decode_mem_operand(&mut self, inst: &Instruction) -> MemOperand {
 
         let mem_displ = inst.memory_displacement64() as i64;
-        
-        let mut place;
+
+        let mut operand;
         match inst.memory_base() {
             Register::EIP |
             Register::RIP => {
                 // Special handling for RIP addressing, because displacement contains the
-                // absolute value. We create 
-                place = self.create_place();
-                self.push_bind(place, ty.pointer(1), Expression::Value(Value::LiteralInt(mem_displ)));
+                // absolute value.
+                operand = MemOperand::Pointer(Expression::Value(Value::LiteralInt(mem_displ)));
             }
             Register::SP |
             Register::ESP |
             Register::RSP => {
-                // If we refer to RSP, we calculate the real address relative to the 
-                // function's base.
-                let addr = self.stack_pointer + mem_displ as i32;
-                place = self.read_location(Location::Stack(addr));
-                // TODO: self.constants.set(binding, addr as i64);
+                // Compute real stack offset from currently known stack pointer.
+                operand = MemOperand::Stack(self.stack_pointer + mem_displ as i32);
             }
             base_reg => {
                 // Access relative to other registers.
-                place = self.read_location(Location::Register(base_reg));
-                if mem_displ != 0 {
-                    let new_place = self.create_place();
-                    let expr = Expression::Add(Value::Place(place), Value::LiteralInt(mem_displ));
-                    self.push_bind(new_place, ty.pointer(1), expr);
-                    place = new_place;
-                }
+                let place = self.read_location(Location::Register(base_reg));
+                let expr = if mem_displ == 0 {
+                    Expression::Value(Value::Place(place))
+                } else {
+                    Expression::Add(Value::Place(place), Value::LiteralInt(mem_displ))
+                };
+                operand = MemOperand::Pointer(expr);
             }
         }
 
         match inst.memory_index() {
             Register::None => {}
             index_reg => {
-                // Indexed memory access converts to a GetElementPointer expression.
-                place = self.create_place();
-                let reg_place = self.read_location(Location::Register(index_reg));
-                let expr = Expression::GetElementPointer { 
-                    pointer: place, 
-                    index: reg_place, 
-                    stride: inst.memory_index_scale() as u8
-                };
-                self.push_bind(place, ty.pointer(1), expr);
+                // // Indexed memory access converts to a GetElementPointer expression.
+                // let place = self.create_place();
+                // self.push_bind(place, TY_VOID.pointer(1), expr);
+                // let reg_place = self.read_location(Location::Register(index_reg));
+                // expr = Expression::GetElementPointer { 
+                //     pointer: place, 
+                //     index: reg_place, 
+                //     stride: inst.memory_index_scale() as u8
+                // };
+                unimplemented!("decode_mem_operand: memory index")
             }
         }
 
-        place
+        operand
 
+    }
+
+    fn decode_mem_operand_load(&mut self, inst: &Instruction) -> Place {
+        match self.decode_mem_operand(inst) {
+            MemOperand::Pointer(value) => {
+                let place = self.create_place();
+                self.push_bind(place, TY_VOID.pointer(1), value);
+                place
+            }
+            MemOperand::Stack(offset) => {
+                self.read_location(Location::Stack(offset))
+            }
+        }
+    }
+
+    fn decode_mem_operand_store(&mut self, inst: &Instruction) -> Place {
+        match self.decode_mem_operand(inst) {
+            MemOperand::Pointer(value) => {
+                let place = self.create_place();
+                self.push_bind(place, TY_VOID.pointer(1), value);
+                place
+            }
+            MemOperand::Stack(offset) => {
+                self.write_location(Location::Stack(offset))
+            }
+        }
     }
 
     /// Decode an instruction of the form 'push <reg>'.
@@ -611,8 +696,9 @@ impl BasicBlockTracker {
     fn decode_lea_r_m(&mut self, inst: &Instruction) {
 
         // mem_size with LEA would be null, so we use the size of the register
-        let place = self.decode_mem_addr(inst, TY_VOID);
+        let place = self.decode_mem_operand_store(inst);
         let reg = inst.op0_register();
+
         self.set_location(Location::Register(reg), place);
 
     }
@@ -625,12 +711,20 @@ impl BasicBlockTracker {
             Register::None => {
                 // <op> <rm>,<imm>
                 let ty = ty_from_int_bytes(inst.memory_size().size());
-                let mem_place = self.decode_mem_addr(inst, ty);
-                // Temp variable to store loaded value.
-                let val_place = self.create_place();
-                self.push_bind(val_place, ty, Expression::Load(mem_place));
-                // Store the final value back on mem pointer.
-                self.push_store(mem_place, op.to_expression(Value::Place(val_place), Value::LiteralInt(imm)));
+                match self.decode_mem_operand(inst) {
+                    MemOperand::Pointer(value) => {
+                        let ptr_place = self.create_place();
+                        self.push_bind(ptr_place, ty.pointer(1), value);
+                        let dst_place = self.create_place();
+                        self.push_bind(dst_place, ty, Expression::Load(ptr_place));
+                        self.push_store(ptr_place, op.to_expression(Value::Place(dst_place), Value::LiteralInt(imm)));
+                    }
+                    MemOperand::Stack(offset) => {
+                        let src_place = self.read_location(Location::Stack(offset));
+                        let dst_place = self.write_location(Location::Stack(offset));
+                        self.push_bind(dst_place, ty, op.to_expression(Value::Place(src_place), Value::LiteralInt(imm)));
+                    }
+                }
             }
             Register::SP |
             Register::ESP |
@@ -645,9 +739,9 @@ impl BasicBlockTracker {
             reg => {
                 // <op> <reg>,<imm>
                 let reg_ty = ty_from_int_bytes(reg.size());
-                let read_placeg = self.read_location(Location::Register(reg));
+                let read_place = self.read_location(Location::Register(reg));
                 let write_place = self.write_location(Location::Register(reg));
-                self.push_store(write_place, op.to_expression(Value::Place(read_placeg), Value::LiteralInt(imm)));
+                self.push_store(write_place, op.to_expression(Value::Place(read_place), Value::LiteralInt(imm)));
             }
         }
     }
@@ -657,26 +751,42 @@ impl BasicBlockTracker {
     fn decode_int_op_rm_rm(&mut self, inst: &Instruction, op: IntOp) {
         match (inst.op0_register(), inst.op1_register()) {
             (Register::None, reg1) => {
-                // <op> <rm>,<reg1>
+                // <op> <m>,<reg1>
                 let ty = ty_from_int_bytes(reg1.size());
-                let mem_place = self.decode_mem_addr(inst, ty);
-                // Temp variable to store loaded value.
-                let val_place = self.create_place();
-                self.push_bind(val_place, ty, Expression::Load(mem_place));
-                // Store the final value back on mem pointer.
                 let reg1_place = self.read_location(Location::Register(reg1));
-                self.push_store(mem_place, op.to_expression(Value::Place(val_place), Value::Place(reg1_place)));
+                match self.decode_mem_operand(inst) {
+                    MemOperand::Pointer(value) => {
+                        let ptr_place = self.create_place();
+                        self.push_bind(ptr_place, ty.pointer(1), value);
+                        let dst_place = self.create_place();
+                        self.push_bind(dst_place, ty, Expression::Load(ptr_place));
+                        self.push_store(ptr_place, op.to_expression(Value::Place(dst_place), Value::Place(reg1_place)));
+                    }
+                    MemOperand::Stack(offset) => {
+                        let src_place = self.read_location(Location::Stack(offset));
+                        let dst_place = self.write_location(Location::Stack(offset));
+                        self.push_bind(dst_place, ty, op.to_expression(Value::Place(src_place), Value::Place(reg1_place)));
+                    }
+                }
             }
             (reg0, Register::None) => {
-                // <op> <reg0>,<rm>
+                // <op> <reg0>,<m>
                 let ty = ty_from_int_bytes(reg0.size());
-                let mem_place = self.decode_mem_addr(inst, ty);
-                // Temp variable to store loaded value.
-                let val_place = self.create_place();
-                self.push_bind(val_place, ty, Expression::Load(mem_place));
-                // Store the final value back on mem pointer.
-                let reg0_place = self.read_location(Location::Register(reg0));
-                self.push_store(mem_place, op.to_expression(Value::Place(val_place), Value::Place(reg0_place)));
+                let reg0_read_place = self.read_location(Location::Register(reg0));
+                let reg0_write_place = self.write_location(Location::Register(reg0));
+                match self.decode_mem_operand(inst) {
+                    MemOperand::Pointer(value) => {
+                        let ptr_place = self.create_place();
+                        self.push_bind(ptr_place, ty.pointer(1), value);
+                        let mem_read_place = self.create_place();
+                        self.push_bind(mem_read_place, ty, Expression::Load(ptr_place));
+                        self.push_bind(reg0_write_place, ty, op.to_expression(Value::Place(reg0_read_place), Value::Place(mem_read_place)));
+                    }
+                    MemOperand::Stack(offset) => {
+                        let stack_read_place = self.read_location(Location::Stack(offset));
+                        self.push_bind(reg0_write_place, ty, op.to_expression(Value::Place(reg0_read_place), Value::Place(stack_read_place)));
+                    }
+                }
             }
             (reg0, reg1) if op == IntOp::Xor && reg0 == reg1 => {
                 // xor <reg>,<reg>: zero the register.
@@ -687,22 +797,22 @@ impl BasicBlockTracker {
             (reg0, reg1) => {
                 // <op> <reg0>,<reg1>
                 let ty = ty_from_int_bytes(reg0.size());
-                let reg1_place = self.read_location(Location::Register(reg1));
+                let reg1_read_place = self.read_location(Location::Register(reg1));
                 let reg0_read_place = self.read_location(Location::Register(reg0));
                 let reg0_write_place = self.write_location(Location::Register(reg0));
-                self.push_bind(reg0_write_place, ty, op.to_expression(Value::Place(reg0_read_place), Value::Place(reg1_place)));
+                self.push_bind(reg0_write_place, ty, op.to_expression(Value::Place(reg0_read_place), Value::Place(reg1_read_place)));
             }
         }
     }
 
-    /// Decode an instruction of the form 'mov <rm>, <imm>'.
+    /// Decode an instruction of the form 'mov <rm>,<imm>'.
     fn decode_mov_rm_imm(&mut self, inst: &Instruction) {
         let imm = inst.immediate32to64();
         match inst.op0_register() {
             Register::None => {
                 // mov <m>,<imm>
                 let ty = ty_from_int_bytes(inst.memory_size().size());
-                let mem_place = self.decode_mem_addr(inst, ty);
+                let mem_place = self.decode_mem_operand_store(inst);
                 self.push_store(mem_place, Expression::Value(Value::LiteralInt(imm)));
             }
             Register::SP |
@@ -729,9 +839,18 @@ impl BasicBlockTracker {
         match inst.op1_register() {
             Register::None => {
                 // mov <reg0>,<m>
-                let mem_place = self.decode_mem_addr(inst, ty);
-                let reg0_place = self.write_location(Location::Register(reg0));
-                self.push_bind(reg0_place, ty, Expression::Load(mem_place));
+                match self.decode_mem_operand(inst) {
+                    MemOperand::Pointer(value) => {
+                        let ptr_place = self.create_place();
+                        self.push_bind(ptr_place, ty.pointer(1), value);
+                        let reg0_place = self.write_location(Location::Register(reg0));
+                        self.push_bind(reg0_place, ty, Expression::Load(ptr_place));
+                    }
+                    MemOperand::Stack(offset) => {
+                        let stack_write_place = self.read_location(Location::Stack(offset));
+                        self.set_location(Location::Register(reg0), stack_write_place);
+                    }
+                }
             }
             Register::RSP => {
                 // mov <reg0>,sp
@@ -763,9 +882,17 @@ impl BasicBlockTracker {
         match inst.op0_register() {
             Register::None => {
                 // mov <m>,<reg>
-                let mem_place = self.decode_mem_addr(inst, ty);
                 let reg1_place = self.read_location(Location::Register(reg1));
-                self.push_store(mem_place, Expression::Value(Value::Place(reg1_place)));
+                match self.decode_mem_operand(inst) {
+                    MemOperand::Pointer(value) => {
+                        let ptr_place = self.create_place();
+                        self.push_bind(ptr_place, ty.pointer(1), value);
+                        self.push_store(ptr_place, Expression::Value(Value::Place(reg1_place)));
+                    }
+                    MemOperand::Stack(offset) => {
+                        self.set_location(Location::Stack(offset), reg1_place);
+                    }
+                }
             }
             Register::SP |
             Register::ESP |
@@ -793,40 +920,40 @@ impl BasicBlockTracker {
 
     /// Decode an instruction of the form 'movs <reg>,<rm>' (with scalar register).
     fn decode_movs_r_rm(&mut self, inst: &Instruction, double: bool) {
-        let reg0 = inst.op0_register();
-        let ty = if double { TY_DOUBLE } else { TY_FLOAT };
-        match inst.op1_register() {
-            Register::None => {
-                // mov <reg0>,<m>
-                let mem_place = self.decode_mem_addr(inst, ty);
-                let reg0_place = self.write_location(Location::Register(reg0));
-                self.push_bind(reg0_place, ty, Expression::Load(mem_place));
-            }
-            reg1 => {
-                // mov <reg0>,<reg1>
-                let reg1_place = self.read_location(Location::Register(reg1));
-                self.set_location(Location::Register(reg0), reg1_place);
-            }
-        }
+        // let reg0 = inst.op0_register();
+        // let ty = if double { TY_DOUBLE } else { TY_FLOAT };
+        // match inst.op1_register() {
+        //     Register::None => {
+        //         // movs <reg0>,<m>
+        //         let mem_place = self.decode_mem_operand(inst, ty);
+        //         let reg0_place = self.write_location(Location::Register(reg0));
+        //         self.push_bind(reg0_place, ty, Expression::Load(mem_place));
+        //     }
+        //     reg1 => {
+        //         // movs <reg0>,<reg1>
+        //         let reg1_place = self.read_location(Location::Register(reg1));
+        //         self.set_location(Location::Register(reg0), reg1_place);
+        //     }
+        // }
     }
 
     /// Decode an instruction of the form 'movs <rm>,<reg>' (with scalar register).
     fn decode_movs_rm_r(&mut self, inst: &Instruction, double: bool) {
-        let reg1 = inst.op1_register();
-        let ty = if double { TY_DOUBLE } else { TY_FLOAT };
-        match inst.op0_register() {
-            Register::None => {
-                // mov <m>,<reg1>
-                let mem_place = self.decode_mem_addr(inst, ty);
-                let reg1_place = self.read_location(Location::Register(reg1));
-                self.push_store(mem_place, Expression::Value(Value::Place(reg1_place)));
-            }
-            reg0 => {
-                // mov <reg0>,<reg1>
-                let reg1_place = self.read_location(Location::Register(reg1));
-                self.set_location(Location::Register(reg0), reg1_place);
-            }
-        }
+        // let reg1 = inst.op1_register();
+        // let ty = if double { TY_DOUBLE } else { TY_FLOAT };
+        // match inst.op0_register() {
+        //     Register::None => {
+        //         // mov <m>,<reg1>
+        //         let mem_place = self.decode_mem_operand(inst, ty);
+        //         let reg1_place = self.read_location(Location::Register(reg1));
+        //         self.push_store(mem_place, Expression::Value(Value::Place(reg1_place)));
+        //     }
+        //     reg0 => {
+        //         // mov <reg0>,<reg1>
+        //         let reg1_place = self.read_location(Location::Register(reg1));
+        //         self.set_location(Location::Register(reg0), reg1_place);
+        //     }
+        // }
     }
 
     /// Decode an instruction of the form 'test <rm>,<reg>'.
@@ -835,15 +962,23 @@ impl BasicBlockTracker {
         // We actually don't do anything here because we don't really know how the test
         // will be used in later code.
         let right_reg = inst.op1_register();
-        let reg_ty = ty_from_int_bytes(right_reg.size());
+        let ty = ty_from_int_bytes(right_reg.size());
         let right_place = self.read_location(Location::Register(right_reg));
 
         let left_place = match inst.op0_register() {
             Register::None => {
-                let mem_place = self.decode_mem_addr(inst, reg_ty);
-                let place = self.create_place();
-                self.push_bind(place, reg_ty, Expression::Load(mem_place));
-                place
+                match self.decode_mem_operand(inst) {
+                    MemOperand::Pointer(value) => {
+                        let ptr_place = self.create_place();
+                        self.push_bind(ptr_place, ty.pointer(1), value);
+                        let place = self.create_place();
+                        self.push_bind(place, ty, Expression::Load(ptr_place));
+                        place
+                    }
+                    MemOperand::Stack(offset) => {
+                        self.read_location(Location::Stack(offset))
+                    }
+                }
             }
             reg => self.read_location(Location::Register(reg))
         };
@@ -851,7 +986,7 @@ impl BasicBlockTracker {
         self.cmp = Some(Cmp {
             right_place,
             left_place,
-            ty: reg_ty,
+            ty,
             kind: CmpKind::Test,
         });
 
@@ -972,4 +1107,14 @@ struct Cmp {
 enum CmpKind {
     Cmp,
     Test,
+}
+
+/// A result of decoding a memory operand.
+#[derive(Debug, Clone)]
+enum MemOperand {
+    /// The memory operand is available through the given expression, a pointer is
+    /// calculated from this expression and can be used to load/store value from/to.
+    Pointer(Expression),
+    /// The memory operand directly points to a stack place.
+    Stack(i32),
 }

@@ -150,8 +150,8 @@ pub enum Expression {
     Value(Value),
     /// Load a value by dereferencing the given register.
     Load(Place),
-    /// Stack allocation of a given size. *Value type is a pointer.*
-    Stack(u64),
+    // /// Stack allocation of a given size. *Value type is a pointer.*
+    // Stack(u64),
     /// A call to another function.
     Call {
         /// The value of the pointer.

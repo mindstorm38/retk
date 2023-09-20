@@ -44,7 +44,7 @@ impl fmt::Display for ExpressionDisplay<'_> {
         match *self.0 {
             Expression::Value(value) => write!(f, "{}", ValueDisplay(value)),
             Expression::Load(var) => write!(f, "load {}", PlaceDisplay(var)),
-            Expression::Stack(size) => write!(f, "stack {size}"),
+            // Expression::Stack(size) => write!(f, "stack {size}"),
             Expression::Call { pointer, ref arguments } => {
                 write!(f, "call {}", ValueDisplay(pointer))?;
                 for &arg in arguments {
