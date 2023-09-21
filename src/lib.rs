@@ -14,8 +14,10 @@ use object::read::pe::{PeFile64, Import};
 use object::pe::ImageNtHeaders64;
 use object::LittleEndian as LE;
 
-pub mod analyzer;
 pub mod idr;
+pub mod pseudo;
+
+pub mod analyzer;
 pub mod arch;
 
 
@@ -85,7 +87,8 @@ pub fn analyse(data: &[u8]) {
     // analyzer.run(common::FunctionGraphAnalysis::default());
     // println!("done: {} functions", analyzer.database.functions.len());
 
-    analyzer.run(x86::IdrAnalysis::default());
+    // analyzer.run(x86::IdrAnalysis::default());
+    analyzer.run(x86::PseudoAnalysis::default());
 
     // let func = &analyzer.database.functions[&0x1409AB740];
     // let begin_ip = func.body.as_ref().unwrap().begin_ip;

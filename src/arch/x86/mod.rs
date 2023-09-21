@@ -3,8 +3,12 @@
 use iced_x86::{Decoder, DecoderOptions, Instruction};
 
 
-mod idr;
-pub use idr::IdrAnalysis;
+// mod idr;
+// pub use idr::IdrAnalysis;
+
+
+mod pseudo;
+pub use pseudo::PseudoAnalysis;
 
 
 /// The x86 backend for analyzer.

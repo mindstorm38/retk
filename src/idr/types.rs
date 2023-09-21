@@ -11,7 +11,7 @@ pub struct TypeSystem {
     /// Size of bytes on this system, in bits.
     byte_size: u64,
     /// Cache for type names (TODO: rework it to avoid needing mutation).
-    name_cache: HashMap<Type, String>,
+    _name_cache: HashMap<Type, String>,
     /// The list of struct definitions.
     struct_defs: Vec<(String, Option<StructDef>)>,
 }
@@ -22,7 +22,7 @@ impl TypeSystem {
         Self { 
             pointer_size,
             byte_size,
-            name_cache: HashMap::new(),
+            _name_cache: HashMap::new(),
             struct_defs: Vec::new(),
         }
     }
@@ -55,7 +55,7 @@ impl TypeSystem {
         // }).as_str()
         let mut name = String::new();
         match ty.primitive {
-            PrimitiveType::Int(n) => write!(name, "i{n}").unwrap(),
+            PrimitiveType::Int(n) => write!(name, "u{n}").unwrap(),
             PrimitiveType::Float => name.write_str("f32").unwrap(),
             PrimitiveType::Double => name.write_str("f64").unwrap(),
             PrimitiveType::Struct(s) => {
@@ -68,13 +68,14 @@ impl TypeSystem {
     }
 
     /// Round the given number of bits up to get the number of bytes needed to store.
-    pub fn bits_to_bytes(&self, bits: u64) -> u64 {
-        (bits + self.byte_size - 1) / self.byte_size
+    pub fn bits_to_bytes(&self, bits: u64) -> u32 {
+        u32::try_from((bits + self.byte_size - 1) / self.byte_size)
+            .expect("to much bits")
     }
 
     /// Calculate the number of bits given a number of bytes.
-    pub fn bytes_to_bits(&self, bytes: u64) -> u64 {
-        bytes * self.byte_size
+    pub fn bytes_to_bits(&self, bytes: u32) -> u64 {
+        bytes as u64 * self.byte_size
     }
 
     /// Return the layout of the given type
@@ -131,12 +132,12 @@ impl TypeSystem {
 
 
 /// Represent the byte layout of a type, computed by the type system.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Layout {
     /// The size of the type **in bytes**.
-    pub size: u64,
+    pub size: u32,
     /// The alignment of the type **in bytes and power of two**
-    pub align: u64,
+    pub align: u32,
 }
 
 /// Opaque structure type handle.
@@ -201,18 +202,18 @@ pub struct StructDef {
     /// Fields of this structure type.
     pub fields: Vec<FieldDef>,
     /// Size of this structure **in bytes**.
-    pub size: u64,
+    pub size: u32,
     /// Alignment of this structure **in bytes**. An alignment of zero is invalid an
     /// serves as a marker for an *opaque structure*, that has no definition yet and
     /// can only be used through indirection.
-    pub align: u64,
+    pub align: u32,
 }
 
 /// Represent the complex definition of a structure field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldDef {
     /// Offset of the field **in bytes**.
-    pub offset: u64,
+    pub offset: u32,
     /// Name of the field.
     pub name: String,
     /// Type of the field.
@@ -259,7 +260,7 @@ impl<'a> StructBuilder<'a> {
     /// one.**
     #[inline]
     #[must_use]
-    pub fn align(&mut self, align: u64) -> &mut Self {
+    pub fn align(&mut self, align: u32) -> &mut Self {
         self.def.align = align;
         self
     }
