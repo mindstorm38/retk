@@ -35,7 +35,7 @@ impl<'data> Analysis<Backend<'data>> for PseudoAnalysis {
         while let Some(inst) = decoder.decode() {
             pseudo_decoder.feed(inst);
             i += 1;
-            if i > 100 {
+            if i > 200 {
                 break
             }
         }
@@ -389,43 +389,14 @@ impl PseudoDecoder {
         todo!("decode_pop_r");
     }
 
-    fn decode_int_op_rm_imm(&mut self, inst: &Instruction, op: IntOp) {
-        let imm = inst.immediate32to64();
-        match inst.op0_register() {
-            Register::None => {
-                // <op> <rm>,<imm>
-                todo!()
-            }
-            Register::SP |
-            Register::ESP |
-            Register::RSP => {
-                // <op> sp,<imm>
-                match op {
-                    IntOp::Add => self.add_sp(imm as i32),
-                    IntOp::Sub => self.sub_sp(imm as i32),
-                    _ => panic!("statically unknown: {op:?} sp,<imm>")
-                };
-            }
-            reg => {
-                // <op> <reg>,<imm>
-                todo!()
-            }
-        }
-    }
-
-    fn decode_int_op_rm_rm(&mut self, inst: &Instruction, op: IntOp) {
-
-    }
-
     fn decode_mov_rm_imm(&mut self, inst: &Instruction) {
         let imm = inst.immediate32to64();
         match inst.op0_register() {
             Register::None => {
                 // mov <m>,<imm>
-                let ty = ty_from_int_bytes(inst.memory_size().size());
-                let mem_place = self.decode_mem_operand_place(inst, ty);
-                self.push_assign(mem_place, 
-                    Expression::Copy(Operand::LiteralInt(imm as u64)));
+                let mem_ty = ty_from_int_bytes(inst.memory_size().size());
+                let mem_place = self.decode_mem_operand_place(inst, mem_ty);
+                self.push_assign(mem_place, Expression::Copy(Operand::LiteralInt(imm as u64)));
             }
             Register::SP |
             Register::ESP |
@@ -435,10 +406,9 @@ impl PseudoDecoder {
             }
             reg => {
                 // mov <reg>,<imm>
-                unimplemented!("decode_mov_rm_imm: mov <reg>,<imm>");
-                // let reg_place = self.write_location(Location::Register(reg));
-                // let ty = ty_from_int_bytes(reg.size());
-                // self.push_bind(reg_place, ty, Expression::Value(Value::LiteralInt(imm)));
+                let reg_ty = ty_from_int_bytes(reg.size());
+                let reg_local = self.write_register_local(reg, reg_ty);
+                self.push_assign(Place::new_direct(reg_local), Expression::Copy(Operand::LiteralInt(imm as u64)));
             }
         }
     }
@@ -527,6 +497,75 @@ impl PseudoDecoder {
         todo!("decode_movs_rm_r");
     }
 
+    fn decode_int_op_rm_imm(&mut self, inst: &Instruction, op: IntOp) {
+        let imm = inst.immediate32to64();
+        match inst.op0_register() {
+            Register::None => {
+                // <op> <rm>,<imm>
+                let mem_ty = ty_from_int_bytes(inst.memory_size().size());
+                let mem_place = self.decode_mem_operand_place(inst, mem_ty);
+                let mem_local = self.decode_mem_operand_read(inst, mem_ty);
+                self.push_assign(mem_place, 
+                    op.to_expr(Operand::Local(mem_local), Operand::LiteralInt(imm as u64)));
+            }
+            Register::SP |
+            Register::ESP |
+            Register::RSP => {
+                // <op> sp,<imm>
+                match op {
+                    IntOp::Add => self.add_sp(imm as i32),
+                    IntOp::Sub => self.sub_sp(imm as i32),
+                    _ => panic!("statically unknown: {op:?} sp,<imm>")
+                };
+            }
+            reg => {
+                // <op> <reg>,<imm>
+                let reg_ty = ty_from_int_bytes(reg.size());
+                let reg_read_local = self.read_register_local(reg);
+                let reg_write_local = self.write_register_local(reg, reg_ty);
+                self.push_assign(Place::new_direct(reg_write_local), 
+                    op.to_expr(Operand::Local(reg_read_local), Operand::LiteralInt(imm as u64)));
+            }
+        }
+    }
+
+    fn decode_int_op_rm_rm(&mut self, inst: &Instruction, op: IntOp) {
+
+        let mem_ty = ty_from_int_bytes(inst.memory_size().size());
+
+        let place;
+        let left;
+        let right;
+
+        match (inst.op0_register(), inst.op1_register()) {
+            (Register::None, Register::RSP) => panic!("statically unknown: {op:?} <m>,sp"),
+            (Register::RSP, Register::None) => panic!("statically unknown: {op:?} sp,<m>"),
+            (Register::None, reg1) => {
+                place = self.decode_mem_operand_place(inst, mem_ty);
+                left = Operand::Local(self.decode_mem_operand_read(inst, mem_ty));
+                right = Operand::Local(self.read_register_local(reg1));
+            }
+            (reg0, Register::None) => {
+                right = Operand::Local(self.decode_mem_operand_read(inst, mem_ty));
+                left = Operand::Local(self.read_register_local(reg0));
+                place = Place::new_direct(self.write_register_local(reg0, mem_ty));
+            }
+            (reg0, reg1) if op == IntOp::Xor && reg0 == reg1 => {
+                let place = Place::new_direct(self.write_register_local(reg0, mem_ty));
+                self.push_assign(place, Expression::Copy(Operand::LiteralInt(0)));
+                return;
+            }
+            (reg0, reg1) => {
+                right = Operand::Local(self.read_register_local(reg1));
+                left = Operand::Local(self.read_register_local(reg0));
+                place = Place::new_direct(self.write_register_local(reg0, mem_ty));
+            }
+        }
+
+        self.push_assign(place, op.to_expr(left, right));
+
+    }
+
     fn decode_test_rm_r(&mut self, inst: &Instruction) {
         todo!("decode_test_rm_r");
     }
@@ -545,16 +584,45 @@ impl PseudoDecoder {
 
     }
 
+    fn decode_cmp_rm_rm(&mut self, inst: &Instruction) {
+
+        let memory_ty = ty_from_int_bytes(inst.memory_size().size());
+        let mem_local = self.decode_mem_operand_read(inst, memory_ty);
+
+        let left = match inst.op0_register() {
+            Register::None => Operand::Local(mem_local),
+            Register::SP |
+            Register::ESP |
+            Register::RSP => panic!("statically unknown: cmp sp,<rm>"),
+            reg0 => Operand::Local(self.read_register_local(reg0)),
+        };
+
+        let right = match inst.op1_register() {
+            Register::None => Operand::Local(mem_local),
+            Register::SP |
+            Register::ESP |
+            Register::RSP => panic!("statically unknown: cmp <rm>,sp"),
+            reg1 => Operand::Local(self.read_register_local(reg1)),
+        };
+
+        self.last_cmp = Some(Cmp {
+            left,
+            right,
+            ty: memory_ty,
+            kind: CmpKind::Cmp,
+        });
+
+    }
+
     fn decode_call_rel(&mut self, inst: &Instruction) {
         
         let pointer = inst.memory_displacement64();
         let ret_local = self.write_register_local(Register::RAX, TY_QWORD);
 
-        self.push_assign(Place::new_direct(ret_local), 
-            Expression::Call { 
-                pointer: Operand::LiteralInt(pointer), 
-                arguments: Vec::new()
-            });
+        self.push_assign(Place::new_direct(ret_local), Expression::Call { 
+            pointer: Operand::LiteralInt(pointer), 
+            arguments: Vec::new()
+        });
 
     }
 
@@ -610,7 +678,8 @@ impl PseudoDecoder {
     }
 
     fn decode_jmp(&mut self, inst: &Instruction) {
-        todo!("decode_jmp")
+        let pointer = inst.near_branch64();
+        self.push_goto(pointer);
     }
 
     fn decode_ret(&mut self, inst: &Instruction) {
@@ -656,6 +725,45 @@ impl PseudoDecoder {
             Code::Lea_r64_m |
             Code::Lea_r32_m |
             Code::Lea_r16_m => self.decode_lea_r_m(inst),
+            // MOV
+            Code::Mov_r64_imm64 |
+            Code::Mov_r32_imm32 |
+            Code::Mov_r16_imm16 |
+            Code::Mov_r8_imm8 |
+            Code::Mov_rm64_imm32 |
+            Code::Mov_rm32_imm32 |
+            Code::Mov_rm16_imm16 |
+            Code::Mov_rm8_imm8 => self.decode_mov_rm_imm(inst),
+            Code::Mov_r64_rm64 |
+            Code::Mov_r32_rm32 |
+            Code::Mov_r16_rm16 |
+            Code::Mov_r8_rm8 => self.decode_mov_r_rm(inst),
+            Code::Mov_rm64_r64 |
+            Code::Mov_rm32_r32 |
+            Code::Mov_rm16_r16 |
+            Code::Mov_rm8_r8 => self.decode_mov_rm_r(inst),
+            // MOVZX (move zero-extended)
+            Code::Movzx_r64_rm16 |
+            Code::Movzx_r64_rm8 |
+            Code::Movzx_r32_rm16 |
+            Code::Movzx_r32_rm8 |
+            Code::Movzx_r16_rm16 |
+            Code::Movzx_r16_rm8 => self.decode_movzx_r_rm(inst),
+            // MOVSX (move sign-extended)
+            Code::Movsx_r64_rm16 |
+            Code::Movsx_r64_rm8 |
+            Code::Movsx_r32_rm16 |
+            Code::Movsx_r32_rm8 |
+            Code::Movsx_r16_rm16 |
+            Code::Movsx_r16_rm8 |
+            Code::Movsxd_r64_rm32 |
+            Code::Movsxd_r32_rm32 |
+            Code::Movsxd_r16_rm16 => self.decode_movsx_r_rm(inst),
+            // MOVSS/MOVSD
+            Code::Movss_xmm_xmmm32 => self.decode_movs_r_rm(inst, false),
+            Code::Movss_xmmm32_xmm => self.decode_movs_rm_r(inst, false),
+            Code::Movsd_xmm_xmmm64 => self.decode_movs_r_rm(inst, true),
+            Code::Movsd_xmmm64_xmm => self.decode_movs_rm_r(inst, true),
             // ADD
             Code::Add_rm64_imm8 |
             Code::Add_rm32_imm8 |
@@ -704,45 +812,6 @@ impl PseudoDecoder {
             Code::Xor_rm32_r32 |
             Code::Xor_rm16_r16 |
             Code::Xor_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Xor),
-            // MOV
-            Code::Mov_r64_imm64 |
-            Code::Mov_r32_imm32 |
-            Code::Mov_r16_imm16 |
-            Code::Mov_r8_imm8 |
-            Code::Mov_rm64_imm32 |
-            Code::Mov_rm32_imm32 |
-            Code::Mov_rm16_imm16 |
-            Code::Mov_rm8_imm8 => self.decode_mov_rm_imm(inst),
-            Code::Mov_r64_rm64 |
-            Code::Mov_r32_rm32 |
-            Code::Mov_r16_rm16 |
-            Code::Mov_r8_rm8 => self.decode_mov_r_rm(inst),
-            Code::Mov_rm64_r64 |
-            Code::Mov_rm32_r32 |
-            Code::Mov_rm16_r16 |
-            Code::Mov_rm8_r8 => self.decode_mov_rm_r(inst),
-            // MOVZX (move zero-extended)
-            Code::Movzx_r64_rm16 |
-            Code::Movzx_r64_rm8 |
-            Code::Movzx_r32_rm16 |
-            Code::Movzx_r32_rm8 |
-            Code::Movzx_r16_rm16 |
-            Code::Movzx_r16_rm8 => self.decode_movzx_r_rm(inst),
-            // MOVSX (move sign-extended)
-            Code::Movsx_r64_rm16 |
-            Code::Movsx_r64_rm8 |
-            Code::Movsx_r32_rm16 |
-            Code::Movsx_r32_rm8 |
-            Code::Movsx_r16_rm16 |
-            Code::Movsx_r16_rm8 |
-            Code::Movsxd_r64_rm32 |
-            Code::Movsxd_r32_rm32 |
-            Code::Movsxd_r16_rm16 => self.decode_movsx_r_rm(inst),
-            // MOVSS/MOVSD
-            Code::Movss_xmm_xmmm32 => self.decode_movs_r_rm(inst, false),
-            Code::Movss_xmmm32_xmm => self.decode_movs_rm_r(inst, false),
-            Code::Movsd_xmm_xmmm64 => self.decode_movs_r_rm(inst, true),
-            Code::Movsd_xmmm64_xmm => self.decode_movs_rm_r(inst, true),
             // TEST
             Code::Test_rm64_r64 |
             Code::Test_rm32_r32 |
@@ -755,6 +824,12 @@ impl PseudoDecoder {
             Code::Cmp_rm64_imm32 |
             Code::Cmp_rm32_imm32 |
             Code::Cmp_rm16_imm16 => self.decode_cmp_rm_imm(inst),
+            Code::Cmp_rm64_r64 |
+            Code::Cmp_rm32_r32 |
+            Code::Cmp_rm16_r16 |
+            Code::Cmp_r64_rm64 |
+            Code::Cmp_r32_rm32 |
+            Code::Cmp_r16_rm16 => self.decode_cmp_rm_rm(inst),
             // CALL
             Code::Call_rel16 |
             Code::Call_rel32_32 |
@@ -803,9 +878,11 @@ impl PseudoDecoder {
 
     /// Get the local variable usable to read the given register. 
     /// The given type is used if the local doesn't exists yet.
+    #[track_caller]
     fn read_register_local(&mut self, register: Register) -> LocalRef {
         // For example CL/CH/CX/ECX/RCX all overwrite and read same storage.
         let full_register = register.full_register();
+        assert_ne!(full_register, Register::RSP, "cannot read from sp register");
         *self.register_locals.entry(full_register).or_insert_with(|| {
             let ty = ty_from_int_bytes(register.size());
             let new_local = self.function.new_local(&self.type_system, ty);
@@ -816,9 +893,12 @@ impl PseudoDecoder {
 
     /// Get the local variable usable to write the given register.
     /// The given type is used to check if the current variable bound to this register
-    /// has the same type, if it's not of the same type
+    /// has the same type, if it's not of the same type.
+    #[track_caller]
     fn write_register_local(&mut self, register: Register, ty: Type) -> LocalRef {
-        match self.register_locals.entry(register.full_register()) {
+        let full_register = register.full_register();
+        assert_ne!(full_register, Register::RSP, "cannot read from sp register");
+        match self.register_locals.entry(full_register) {
             Entry::Occupied(mut o) => {
                 let current_local = *o.get();
                 if self.function.local_type(current_local) != ty {
@@ -901,6 +981,18 @@ enum IntOp {
     Add,
     Sub,
     Xor,
+}
+
+impl IntOp {
+
+    fn to_expr(self, left: Operand, right: Operand) -> Expression {
+        match self {
+            IntOp::Add => Expression::Add(BinaryExpression { left, right }),
+            IntOp::Sub => Expression::Sub(BinaryExpression { left, right }),
+            IntOp::Xor => Expression::Xor(BinaryExpression { left, right }),
+        }
+    }
+
 }
 
 /// Internal structure used to track possible comparisons.
