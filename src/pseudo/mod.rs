@@ -126,6 +126,10 @@ pub struct BinaryExpression {
 pub enum ComparisonOperator {
     Equal,
     NotEqual,
+    Greater,
+    GreaterOrEqual,
+    Less,
+    LessOrEqual,
 }
 
 impl Place {
@@ -225,6 +229,10 @@ impl fmt::Display for ComparisonOperator {
         f.write_str(match *self {
             ComparisonOperator::Equal => "==",
             ComparisonOperator::NotEqual => "!=",
+            ComparisonOperator::Greater => ">",
+            ComparisonOperator::GreaterOrEqual => ">=",
+            ComparisonOperator::Less => "<",
+            ComparisonOperator::LessOrEqual => "<=",
         })
     }
 }

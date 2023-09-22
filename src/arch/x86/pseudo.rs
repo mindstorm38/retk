@@ -35,7 +35,7 @@ impl<'data> Analysis<Backend<'data>> for PseudoAnalysis {
         while let Some(inst) = decoder.decode() {
             pseudo_decoder.feed(inst);
             i += 1;
-            if i > 200 {
+            if i > 20000 {
                 break
             }
         }
@@ -431,18 +431,19 @@ impl PseudoDecoder {
                 panic!("statically unknown: mov <reg>,sp");
             }
             reg1 => {
-                // if let Register::SP | Register::ESP | Register::RSP = reg0 {
-                //     // mov sp,<reg1>
-                //     // TODO:
-                //     // let reg1_val = self.get_reg_const(reg1)
-                //     //     .expect("move to sp requires constant value in right register");
-                //     // self.stack_pointer = reg1_val as i32;
-                // } else {
-                //     // mov <reg0>,<reg1>
-                //     let reg1_place = self.read_location(Location::Register(reg1));
-                //     self.set_location(Location::Register(reg0), reg1_place);
-                // }
-                todo!()
+                if let Register::SP | Register::ESP | Register::RSP = reg0 {
+                    // mov sp,<reg1>
+                    // TODO:
+                    // let reg1_val = self.get_reg_const(reg1)
+                    //     .expect("move to sp requires constant value in right register");
+                    // self.stack_pointer = reg1_val as i32;
+                    todo!()
+                } else {
+                    // mov <reg0>,<reg1>
+                    let reg1_local = self.read_register_local(reg1);
+                    let reg0_place = self.write_register_local(reg0, ty);
+                    self.push_assign(Place::new_direct(reg0_place), Expression::Copy(Operand::Local(reg1_local)));
+                }
             }
         }
 
@@ -489,12 +490,29 @@ impl PseudoDecoder {
         self.decode_mov_r_rm(inst); // FIXME: Add specific support for movsx
     }
 
-    fn decode_movs_r_rm(&mut self, inst: &Instruction, double: bool) {
-        todo!("decode_movs_r_rm");
-    }
+    fn decode_movs_rm_rm(&mut self, inst: &Instruction, double: bool) {
+        
+        let ty = if double { TY_DOUBLE } else { TY_FLOAT };
+        let place;
+        let operand;
 
-    fn decode_movs_rm_r(&mut self, inst: &Instruction, double: bool) {
-        todo!("decode_movs_rm_r");
+        match (inst.op0_register(), inst.op1_register()) {
+            (Register::None, reg1) => {
+                operand = Operand::Local(self.read_register_local(reg1));
+                place = self.decode_mem_operand_place(inst, ty);
+            }
+            (reg0, Register::None) => {
+                operand = Operand::Local(self.decode_mem_operand_read(inst, ty));
+                place = Place::new_direct(self.write_register_local(reg0, ty));
+            }
+            (reg0, reg1) => {
+                operand = Operand::Local(self.read_register_local(reg1));
+                place = Place::new_direct(self.write_register_local(reg0, ty));
+            }
+        }
+
+        self.push_assign(place, Expression::Copy(operand));
+
     }
 
     fn decode_int_op_rm_imm(&mut self, inst: &Instruction, op: IntOp) {
@@ -531,8 +549,6 @@ impl PseudoDecoder {
 
     fn decode_int_op_rm_rm(&mut self, inst: &Instruction, op: IntOp) {
 
-        let mem_ty = ty_from_int_bytes(inst.memory_size().size());
-
         let place;
         let left;
         let right;
@@ -541,24 +557,28 @@ impl PseudoDecoder {
             (Register::None, Register::RSP) => panic!("statically unknown: {op:?} <m>,sp"),
             (Register::RSP, Register::None) => panic!("statically unknown: {op:?} sp,<m>"),
             (Register::None, reg1) => {
-                place = self.decode_mem_operand_place(inst, mem_ty);
-                left = Operand::Local(self.decode_mem_operand_read(inst, mem_ty));
+                let ty = ty_from_int_bytes(reg1.size());
+                place = self.decode_mem_operand_place(inst, ty);
+                left = Operand::Local(self.decode_mem_operand_read(inst, ty));
                 right = Operand::Local(self.read_register_local(reg1));
             }
             (reg0, Register::None) => {
-                right = Operand::Local(self.decode_mem_operand_read(inst, mem_ty));
+                let ty = ty_from_int_bytes(reg0.size());
+                right = Operand::Local(self.decode_mem_operand_read(inst, ty));
                 left = Operand::Local(self.read_register_local(reg0));
-                place = Place::new_direct(self.write_register_local(reg0, mem_ty));
+                place = Place::new_direct(self.write_register_local(reg0, ty));
             }
             (reg0, reg1) if op == IntOp::Xor && reg0 == reg1 => {
-                let place = Place::new_direct(self.write_register_local(reg0, mem_ty));
+                let ty = ty_from_int_bytes(reg0.size());
+                let place = Place::new_direct(self.write_register_local(reg0, ty));
                 self.push_assign(place, Expression::Copy(Operand::LiteralInt(0)));
                 return;
             }
             (reg0, reg1) => {
+                let ty = ty_from_int_bytes(reg0.size());
                 right = Operand::Local(self.read_register_local(reg1));
                 left = Operand::Local(self.read_register_local(reg0));
-                place = Place::new_direct(self.write_register_local(reg0, mem_ty));
+                place = Place::new_direct(self.write_register_local(reg0, ty));
             }
         }
 
@@ -567,18 +587,45 @@ impl PseudoDecoder {
     }
 
     fn decode_test_rm_r(&mut self, inst: &Instruction) {
-        todo!("decode_test_rm_r");
+
+        let reg1 = inst.op1_register();
+        let ty = ty_from_int_bytes(reg1.size());
+        let right_local = self.read_register_local(reg1);
+
+        let left_local = match inst.op0_register() {
+            Register::None => self.decode_mem_operand_read(inst, ty),
+            reg0 => self.read_register_local(reg0)
+        };
+
+        self.last_cmp = Some(Cmp {
+            left: Operand::Local(left_local),
+            right: Operand::Local(right_local),
+            ty,
+            kind: CmpKind::Test,
+        });
+
     }
 
     fn decode_cmp_rm_imm(&mut self, inst: &Instruction) {
 
-        let memory_ty = ty_from_int_bytes(inst.memory_size().size());
-        let left_local = self.decode_mem_operand_read(inst, memory_ty);
+        let ty;
+        let left_local;
         
+        match inst.op0_register() {
+            Register::None => {
+                ty = ty_from_int_bytes(inst.memory_size().size());
+                left_local = self.decode_mem_operand_read(inst, ty);
+            }
+            reg => {
+                ty = ty_from_int_bytes(reg.size());
+                left_local = self.read_register_local(reg);
+            }
+        };
+
         self.last_cmp = Some(Cmp {
             left: Operand::Local(left_local),
             right: Operand::LiteralInt(inst.immediate32to64() as u64),
-            ty: memory_ty,
+            ty,
             kind: CmpKind::Cmp,
         });
 
@@ -627,7 +674,19 @@ impl PseudoDecoder {
     }
 
     fn decode_call_rm(&mut self, inst: &Instruction) {
-        todo!("decode_call_rm")
+
+        let pointer_local = match inst.op0_register() {
+            Register::None => self.decode_mem_operand_read(inst, TY_VOID.pointer(1)),
+            reg => self.read_register_local(reg),
+        };
+
+        let ret_local = self.write_register_local(Register::RAX, TY_QWORD);
+
+        self.push_assign(Place::new_direct(ret_local), Expression::Call {
+            pointer: Operand::Local(pointer_local),
+            arguments: Vec::new(),
+        });
+
     }
 
     fn decode_jcc(&mut self, inst: &Instruction) {
@@ -645,6 +704,16 @@ impl PseudoDecoder {
                 let operator = match inst.condition_code() {
                    ConditionCode::ne => ComparisonOperator::NotEqual,
                    ConditionCode::e => ComparisonOperator::Equal,
+                   // Unsigned...
+                   ConditionCode::a => ComparisonOperator::Greater,
+                   ConditionCode::ae => ComparisonOperator::GreaterOrEqual,
+                   ConditionCode::b => ComparisonOperator::Less,
+                   ConditionCode::be => ComparisonOperator::LessOrEqual,
+                   // Signed...
+                   ConditionCode::g => ComparisonOperator::Greater,
+                   ConditionCode::ge => ComparisonOperator::GreaterOrEqual,
+                   ConditionCode::l => ComparisonOperator::Less,
+                   ConditionCode::le => ComparisonOperator::LessOrEqual,
                    _ => unimplemented!("decode_jcc: cmp {:?}", inst.condition_code())
                 };
 
@@ -657,7 +726,27 @@ impl PseudoDecoder {
             }
             // Test performs a bitwise and.
             CmpKind::Test => {
-                todo!("decode_jcc: test")
+
+                // If both operands of the test is the same local, the "bitwise and" will
+                // result to "equal" if the register is zero, and "not equal" is not zero.
+                if cmp.left == cmp.right {
+
+                    let operator = match inst.condition_code() {
+                        ConditionCode::ne => ComparisonOperator::NotEqual,
+                        ConditionCode::e => ComparisonOperator::Equal,
+                        _ => unimplemented!("decode_jcc: cmp {:?}", inst.condition_code())
+                    };
+
+                    cond_expr = Expression::Comparison { 
+                        left: cmp.left, 
+                        operator,
+                        right: Operand::LiteralInt(0)
+                    };
+
+                } else {
+                    todo!()
+                }
+
             }
         }
 
@@ -687,7 +776,7 @@ impl PseudoDecoder {
         let ret_place = self.read_register_local(Register::RAX);
         self.push_statement(Statement::Return(ret_place));
 
-        self.debug_function();
+        // self.debug_function();
 
         // TODO: Later before resetting, register the final function.
         self.reset();
@@ -760,10 +849,10 @@ impl PseudoDecoder {
             Code::Movsxd_r32_rm32 |
             Code::Movsxd_r16_rm16 => self.decode_movsx_r_rm(inst),
             // MOVSS/MOVSD
-            Code::Movss_xmm_xmmm32 => self.decode_movs_r_rm(inst, false),
-            Code::Movss_xmmm32_xmm => self.decode_movs_rm_r(inst, false),
-            Code::Movsd_xmm_xmmm64 => self.decode_movs_r_rm(inst, true),
-            Code::Movsd_xmmm64_xmm => self.decode_movs_rm_r(inst, true),
+            Code::Movss_xmm_xmmm32 |
+            Code::Movss_xmmm32_xmm => self.decode_movs_rm_rm(inst, false),
+            Code::Movsd_xmm_xmmm64 |
+            Code::Movsd_xmmm64_xmm => self.decode_movs_rm_rm(inst, true),
             // ADD
             Code::Add_rm64_imm8 |
             Code::Add_rm32_imm8 |
@@ -827,9 +916,11 @@ impl PseudoDecoder {
             Code::Cmp_rm64_r64 |
             Code::Cmp_rm32_r32 |
             Code::Cmp_rm16_r16 |
+            Code::Cmp_rm8_r8 |
             Code::Cmp_r64_rm64 |
             Code::Cmp_r32_rm32 |
-            Code::Cmp_r16_rm16 => self.decode_cmp_rm_rm(inst),
+            Code::Cmp_r16_rm16 |
+            Code::Cmp_r8_rm8 => self.decode_cmp_rm_rm(inst),
             // CALL
             Code::Call_rel16 |
             Code::Call_rel32_32 |
