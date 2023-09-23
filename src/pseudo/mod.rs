@@ -3,7 +3,7 @@
 use std::fmt::{self, Write as _};
 use std::io;
 
-use crate::idr::types::{Type, Layout, TypeSystem};
+use crate::idr::types::{Type, Layout, TypeSystem, PrimitiveType};
 
 
 #[derive(Debug, Clone, Default)]
@@ -35,16 +35,21 @@ pub enum Statement {
         /// The value to assign to the left value.
         value: Expression,
     },
-    /// A conditional code.
+    /// A conditional code section.
     If {
         /// The expression that returns an integer, true if different from zero.
         cond: Expression,
-        /// Index of the first statement to execute if condition is true.
-        then_index: usize,
         /// Index of the first statement to execute if the condition is false. This is
         /// also the end of the *then* section.
         else_index: usize, 
         /// Exclusive index of the last statement of the *else* section.
+        end_index: usize,
+    },
+    /// A while code section.
+    While {
+        /// The expression
+        cond: Expression,
+        /// Index of the last statement.
         end_index: usize,
     },
     /// Goto a specific statement's index.
@@ -65,14 +70,16 @@ pub struct Place {
     /// indirection is used.
     local: LocalRef,
     /// The optional indirection of this assignment.
-    indirection: u32,
+    indirection: u8,
 }
 
 /// Represent an operand in an expression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operand {
-    /// A literal 64-bit integer.
-    LiteralInt(u64),
+    /// A literal unsigned 64-bit integer.
+    LiteralUnsigned(u64),
+    /// A literal signed 64-bit integer.
+    LiteralSigned(i64),
     /// The value of the operand come from the local.
     Local(LocalRef),
 }
@@ -86,18 +93,21 @@ pub enum Expression {
         /// Index of the local that should be a pointer.
         pointer: Operand,
         /// Level of indirection of the dereference.
-        indirection: u32,
+        indirection: u8,
     },
     /// Get a pointer to a local variable.
     Ref(LocalRef),
-    /// Cast a source local of a given type to another destination type.
+    /// Cast a source local of a given type to another to the destination type of
+    /// assigned local variable.
     Cast(LocalRef),
+    /// Call a function from a pointer and an argument list.
     Call {
         /// The function pointer, either static or dynamic from a place.
         pointer: Operand,
         /// List of arguments to pass to the function.
         arguments: Vec<Operand>,
     },
+    /// Perform a binary comparison that produces a boolean value (theoretically 1-bit).
     Comparison {
         left: Operand,
         operator: ComparisonOperator,
@@ -138,7 +148,7 @@ impl Place {
         Self { local, indirection: 0 }
     }
 
-    pub const fn new_indirect(local: LocalRef, indirection: u32) -> Self {
+    pub const fn new_indirect(local: LocalRef, indirection: u8) -> Self {
         Self { local, indirection }
     }
 
@@ -167,6 +177,15 @@ impl Function {
         self.locals.push(local);
         LocalRef(index)
 
+    }
+
+    pub fn place_type(&self, place: Place) -> Type {
+        let ty = self.local_type(place.local);
+        if ty.indirection >= place.indirection {
+            ty.deref(place.indirection)
+        } else {
+            PrimitiveType::Void.plain()
+        }
     }
 
     pub fn local_type(&self, local: LocalRef) -> Type {
@@ -217,8 +236,9 @@ impl fmt::Display for Place {
 impl fmt::Display for Operand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            Operand::LiteralInt(int @ 0..=9) => write!(f, "{int}"),
-            Operand::LiteralInt(int) => write!(f, "0x{int:X}"),
+            Operand::LiteralUnsigned(int @ 0..=9) => write!(f, "{int}"),
+            Operand::LiteralUnsigned(int) => write!(f, "0x{int:X}"),
+            Operand::LiteralSigned(int) => write!(f, "{int}"),
             Operand::Local(local) => write!(f, "{local}"),
         }
     }
@@ -260,7 +280,8 @@ impl fmt::Display for Expression {
             Expression::Cast(local) => write!(f, "{local} as _"),
             Expression::Call { pointer, ref arguments } => {
                 match pointer {
-                    Operand::LiteralInt(int) => write!(f, "fn_{int:08X}")?,
+                    Operand::LiteralUnsigned(int) => write!(f, "fn_{int:08X}")?,
+                    Operand::LiteralSigned(int) => write!(f, "fn_{int:08X}")?,
                     Operand::Local(local) => write!(f, "({local})")?,
                 }
                 write!(f, "(args: {})", arguments.len())
@@ -284,6 +305,26 @@ impl fmt::Display for Expression {
     }
 }
 
+/// An expression with additional context of the type that it should produce, it's used
+/// as debug purpose and provides a display implementation for expressions.
+pub struct ContextualExpression<'e, 't> {
+    pub inner: &'e Expression,
+    pub type_system: &'t TypeSystem,
+    pub ty: Type,
+}
+
+impl fmt::Display for ContextualExpression<'_, '_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+
+        if let Expression::Cast(local) = *self.inner {
+            write!(f, "{local} as {}", self.type_system.name(self.ty))
+        } else {
+            self.inner.fmt(f)
+        }
+
+    }
+}
+
 
 pub fn write_function(mut f: impl io::Write, function: &Function, type_system: &TypeSystem) -> io::Result<()> {
 
@@ -300,6 +341,8 @@ pub fn write_function(mut f: impl io::Write, function: &Function, type_system: &
         Else,
         CloseBlock,
     }
+
+    const TY_BOOL: Type = PrimitiveType::Unsigned(1).plain();
 
     let mut next_prints = Vec::new();
     let mut indent = String::new();
@@ -329,25 +372,39 @@ pub fn write_function(mut f: impl io::Write, function: &Function, type_system: &
             Statement::Assign { 
                 place, 
                 ref value
-            } => writeln!(f, "{place} = {value}")?,
+            } => {
+                let ty = function.place_type(place);
+                writeln!(f, "{place} = {}", ContextualExpression { inner: value, type_system, ty })?;
+            }
             Statement::If {
                 ref cond, 
-                then_index: _, 
                 else_index, 
                 end_index
             } => {
 
-                writeln!(f, "if ({cond}) {{")?;
-
-                indent.push_str("  ");
+                writeln!(f, "if ({}) {{", ContextualExpression { inner: cond, type_system, ty: TY_BOOL })?;
 
                 if end_index > i {
+                    indent.push_str("  ");
                     next_prints.push((end_index, PrintKind::CloseBlock));
                 }
                 
                 // If there is an else branch.
                 if else_index > i && else_index < end_index {
                     next_prints.push((else_index, PrintKind::Else));
+                }
+
+            }
+            Statement::While { 
+                ref cond, 
+                end_index
+            } => {
+
+                writeln!(f, "while ({}) {{", ContextualExpression { inner: cond, type_system, ty: TY_BOOL })?;
+
+                if end_index > i {
+                    indent.push_str("  ");
+                    next_prints.push((end_index, PrintKind::CloseBlock));
                 }
 
             }

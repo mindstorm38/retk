@@ -55,7 +55,9 @@ impl TypeSystem {
         // }).as_str()
         let mut name = String::new();
         match ty.primitive {
-            PrimitiveType::Int(n) => write!(name, "u{n}").unwrap(),
+            PrimitiveType::Void => write!(name, "void").unwrap(),
+            PrimitiveType::Unsigned(n) => write!(name, "u{n}").unwrap(),
+            PrimitiveType::Signed(n) => write!(name, "i{n}").unwrap(),
             PrimitiveType::Float => name.write_str("f32").unwrap(),
             PrimitiveType::Double => name.write_str("f64").unwrap(),
             PrimitiveType::Struct(s) => {
@@ -87,7 +89,9 @@ impl TypeSystem {
         }
 
         match ty.primitive {
-            PrimitiveType::Int(n) => {
+            PrimitiveType::Void => Some(Layout { size: 0, align: 0 }),
+            PrimitiveType::Unsigned(n) |
+            PrimitiveType::Signed(n) => {
                 let bytes = self.bits_to_bytes(n as u64);
                 Some(Layout { size: bytes, align: bytes })
             }
@@ -147,8 +151,13 @@ pub struct StructType(u32);
 /// Primitive data type definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PrimitiveType {
-    /// An integer of the given bits size.
-    Int(u32),
+    /// An 0-bit type, usually as a pointer. Its layout specifies zero size or alignment,
+    /// so it make no sense for it to be instantiated.
+    Void,
+    /// An unsigned integer of the given bits size.
+    Unsigned(u32),
+    /// A signed integer of the given bits size.
+    Signed(u32),
     /// Single-precision IEEE-754 floating point number.
     Float,
     /// Double-precision IEEE-754 floating point number.
@@ -192,6 +201,35 @@ impl Type {
     /// current type is already a pointer, this indirection is added to the existing one.
     pub const fn pointer(self, indirection: u8) -> Type {
         Type { primitive: self.primitive, indirection: self.indirection + indirection }
+    }
+
+    /// Get a new type from the type being dereferenced, this implies that this type 
+    /// should be a pointer.
+    pub const fn deref(self, indirection: u8) -> Type {
+        Type { primitive: self.primitive, indirection: self.indirection - indirection }
+    }
+
+    #[inline]
+    pub const fn is_pointer(self) -> bool {
+        self.indirection != 0
+    }
+
+    /// Return true if this type is an integer, signed or not.
+    #[inline]
+    pub const fn is_integer(self) -> bool {
+        matches!(self, Type {
+            indirection: 0, 
+            primitive: PrimitiveType::Signed(_) | PrimitiveType::Unsigned(_),
+        })
+    }
+
+    /// Return true if this type is a floating point decimal number.
+    #[inline]
+    pub const fn is_float(self) -> bool {
+        matches!(self, Type {
+            indirection: 0, 
+            primitive: PrimitiveType::Float | PrimitiveType::Double,
+        })
     }
 
 }
