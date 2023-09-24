@@ -80,6 +80,10 @@ struct PseudoDecoder {
     basic_blocks: HashMap<u64, Vec<usize>>,
     /// Information about the last comparison.
     last_cmp: Option<Cmp>,
+    /// TODO: A list of errors that remains at the end of this pass, the decoding need
+    /// to be retried in another pass. Errors can be basic blocks that were missing and
+    /// therefore needs recalculation, or local variable transfers across basic blocks.
+    errors: Vec<()>,
 }
 
 impl PseudoDecoder {
@@ -97,6 +101,7 @@ impl PseudoDecoder {
             ip_to_index: HashMap::new(),
             basic_blocks: HashMap::new(),
             last_cmp: None,
+            errors: Vec::new(),
         }
     }
     
