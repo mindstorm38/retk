@@ -10,9 +10,11 @@ use crate::idr::types::{Type, Layout, TypeSystem, PrimitiveType};
 pub struct Function {
     /// List of local variables, parameters are also part of the these locals.
     pub locals: Vec<Local>,
-    /// Parameters as reference to local variables.
-    pub parameters: Vec<LocalRef>,
-    /// Sequence of statements.
+    /// Sequence of statements, this sequence of statements ultimately forms a sequence
+    /// of basic blocks. Basic blocks are a sequence of assignments that are not branch
+    /// statements (branch(cond)/ret), each branch statements marks the end of a basic
+    /// block, and the start of another one directly after it, basic blocks are referred
+    /// to by the index of their first statement.
     pub statements: Vec<Statement>,
 }
 
@@ -23,6 +25,8 @@ pub struct Local {
     pub ty: Type,
     /// Layout of the local variable's type.
     pub layout: Layout,
+    /// An optional comment to help debugging the local when displayed.
+    pub comment: String,
 }
 
 /// Represent a statement in a pseudo-code function.
@@ -35,25 +39,21 @@ pub enum Statement {
         /// The value to assign to the left value.
         value: Expression,
     },
-    /// A conditional code section.
-    If {
-        /// The expression that returns an integer, true if different from zero.
-        cond: Expression,
-        /// Index of the first statement to execute if the condition is false. This is
-        /// also the end of the *then* section.
-        else_index: usize, 
-        /// Exclusive index of the last statement of the *else* section.
-        end_index: usize,
+    /// A divergence in the basic block graph depending on a boolean condition.
+    BranchConditional {
+        /// The expression that produces a boolean value to take the correct branch.
+        value: Expression,
+        /// The index of the statement starting the basic block to take if the
+        /// value of the expression resolves to true (!= 0).
+        branch_true: usize,
+        /// The index of the statement starting the basic block to take if the
+        /// value of the expression resolves to false (== 0).
+        branch_false: usize,
     },
-    /// A while code section.
-    While {
-        /// The expression
-        cond: Expression,
-        /// Index of the last statement.
-        end_index: usize,
+    /// Unconditionally go to another statement that starts a new basic block.
+    Branch {
+        branch: usize,
     },
-    /// Goto a specific statement's index.
-    Goto(usize),
     /// Return the given local's value from the function.
     Return(LocalRef),
 }
@@ -163,15 +163,29 @@ impl Local {
 
 }
 
+impl Statement {
+
+    /// Return true if this statement is a branch to another basic block or return.
+    pub const fn is_branch(&self) -> bool {
+        matches!(self, Self::BranchConditional { .. } | Self::Branch { .. } | Self::Return(_))
+    }
+
+}
+
 impl Function {
 
     /// Create a new local in this function.
-    pub fn new_local(&mut self, type_system: &TypeSystem, ty: Type) -> LocalRef {
+    pub fn new_local(&mut self, type_system: &TypeSystem, ty: Type, comment: impl Into<String>) -> LocalRef {
 
         let index = u32::try_from(self.locals.len())
             .expect("out of locals");
 
-        let mut local = Local { ty, layout: Layout::default() };
+        let mut local = Local { 
+            ty, 
+            layout: Layout::default(), 
+            comment: comment.into(),
+        };
+
         local.update_layout(type_system);
 
         self.locals.push(local);
@@ -328,45 +342,25 @@ impl fmt::Display for ContextualExpression<'_, '_> {
 
 pub fn write_function(mut f: impl io::Write, function: &Function, type_system: &TypeSystem) -> io::Result<()> {
 
-    writeln!(f, "---------")?;
+    writeln!(f, "---------------------")?;
 
     for (i, local) in function.locals.iter().enumerate() {
-        writeln!(f, "{} {}", type_system.name(local.ty), LocalRef(i as _))?;
-    }
-
-    writeln!(f, "---------")?;
-
-    #[derive(Clone, Copy)]
-    enum PrintKind {
-        Else,
-        CloseBlock,
+        writeln!(f, "{} {}   \t// {}", type_system.name(local.ty), LocalRef(i as _), local.comment)?;
     }
 
     const TY_BOOL: Type = PrimitiveType::Unsigned(1).plain();
 
-    let mut next_prints = Vec::new();
-    let mut indent = String::new();
+    // Indicate if the next statement is the first of a new basic block.
+    let mut basic_block_start = true;
 
     for (i, stmt) in function.statements.iter().enumerate() {
 
-        if let Some(&(next_print_i, next_print_kind)) = next_prints.last() {
-            if next_print_i == i {
-
-                next_prints.pop().unwrap();
-                if let PrintKind::CloseBlock = next_print_kind {
-                    indent.truncate(indent.len() - 2);
-                }
-
-                write!(f, "    | {indent}")?;
-                match next_print_kind {
-                    PrintKind::Else => writeln!(f, "}} else {{")?,
-                    PrintKind::CloseBlock => writeln!(f, "}}")?,
-                }
-
-            }
+        if basic_block_start {
+            writeln!(f, "----+----------------")?;
+            basic_block_start = false;
         }
 
-        write!(f, "{i:03} | {indent}")?;
+        write!(f, "{i:03} | ")?;
 
         match *stmt {
             Statement::Assign { 
@@ -376,45 +370,30 @@ pub fn write_function(mut f: impl io::Write, function: &Function, type_system: &
                 let ty = function.place_type(place);
                 writeln!(f, "{place} = {}", ContextualExpression { inner: value, type_system, ty })?;
             }
-            Statement::If {
-                ref cond, 
-                else_index, 
-                end_index
+            Statement::BranchConditional { 
+                ref value,
+                branch_true,
+                branch_false
             } => {
-
-                writeln!(f, "if ({}) {{", ContextualExpression { inner: cond, type_system, ty: TY_BOOL })?;
-
-                if end_index > i {
-                    indent.push_str("  ");
-                    next_prints.push((end_index, PrintKind::CloseBlock));
-                }
-                
-                // If there is an else branch.
-                if else_index > i && else_index < end_index {
-                    next_prints.push((else_index, PrintKind::Else));
-                }
-
+                basic_block_start = true;
+                writeln!(f, "branch {} ? {branch_true:03} : {branch_false:03}", 
+                    ContextualExpression { inner: value, type_system, ty: TY_BOOL })?;
             }
-            Statement::While { 
-                ref cond, 
-                end_index
+            Statement::Branch { 
+                branch
             } => {
-
-                writeln!(f, "while ({}) {{", ContextualExpression { inner: cond, type_system, ty: TY_BOOL })?;
-
-                if end_index > i {
-                    indent.push_str("  ");
-                    next_prints.push((end_index, PrintKind::CloseBlock));
-                }
-
+                basic_block_start = true;
+                writeln!(f, "branch {branch:03}")?;
             }
-            Statement::Goto(index) => writeln!(f, "goto {index:03}")?,
-            Statement::Return(local) => writeln!(f, "return {local}")?,
+            Statement::Return(local) => {
+                basic_block_start = true;
+                writeln!(f, "return {local}")?;
+            }
         }
         
     }
 
-    writeln!(f, "---------")?;
+    writeln!(f, "---------------------")?;
     
     Ok(())
 

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use iced_x86::{Instruction, Code, Register, ConditionCode};
 
 use crate::pseudo::{LocalRef, Function, Statement, Expression, Place, BinaryExpression, Operand, ComparisonOperator};
-use crate::idr::types::{TypeSystem, Type, PrimitiveType, Layout};
+use crate::idr::types::{TypeSystem, Type, PrimitiveType};
 use crate::analyzer::{Analysis, Analyzer};
 
 use super::Backend;
@@ -35,7 +35,7 @@ impl<'data> Analysis<Backend<'data>> for PseudoAnalysis {
         while let Some(inst) = decoder.decode() {
             pseudo_decoder.feed(inst);
             i += 1;
-            if i > 20000 {
+            if i > 200 {
                 break
             }
         }
@@ -45,33 +45,42 @@ impl<'data> Analysis<Backend<'data>> for PseudoAnalysis {
 }
 
 
+/// The pseudo-code decoder from sequence of x86 instructions.
+/// 
+/// This structure is not yet optimized for performance, many hash maps are not suited
+/// for performance and can be replaced, but it's simpler for now!
 struct PseudoDecoder {
     /// Internal pseudo function being decoded.
     function: Function,
     /// The type system we use to compute type sizes and support structs.
     type_system: TypeSystem,
-    /// Instruction pointer of the current instruction being decoded, every new
-    /// statements will be mapped to this instruction pointer.
-    ip: u64,
     /// Current stack pointer value.
     stack_pointer: i32,
-    /// Mapping of registers to the local they are storing.
-    register_locals: HashMap<Register, LocalRef>,
-    register_unused_locals: HashMap<Type, LocalRef>,
-
-    /// MApping of stack offset to the local they are storing.
+    /// Mapping of stack offset to the local they are storing.
     stack_locals: HashMap<i32, LocalRef>,
-    
-    /// Mapping of parameter locations to their the local they are initializing.
-    parameter_locals: HashMap<Location, LocalRef>,
+    /// Mapping of local variables and which tuple register/type is holding them. 
+    /// Registers in this mapping are in their "full", for example CX/ECX -> RCX.
+    /// Storing the type with the register allows us to decode all basic block without
+    /// knowing each others required locals, the required locals are resolved in a 
+    /// second pass when done with the function.
+    register_typed_locals: HashMap<(Register, Type), LocalRef>,
+    /// For the current basic block, map each register's family to the optional import
+    /// and last local variable bound to the family.
+    register_block_locals: HashMap<Register, RegisterBlockLocals>,
+    /// For each type of data, provides an allocator temporary local variables, these
+    /// variables should not cross basic block boundaries.
+    temp_block_locals: HashMap<Type, TempBlockLocals>,
+    /// Pending instruction pointers that needs to be mapped to a future statement,
+    /// when a function's statement is added, all of these instruction pointers are
+    /// associated (in `ip_to_index` map) to this statement.
+    ip_pending: Vec<u64>,
+    /// Mapping of instruction pointer to statement index.
+    ip_to_index: HashMap<u64, usize>,
+    /// Mapping of basic blocks pending to be created when their associated instruction
+    /// pointer is reached. If reached, the vector contains each statement to relocate.
+    basic_blocks: HashMap<u64, Vec<usize>>,
     /// Information about the last comparison.
     last_cmp: Option<Cmp>,
-    /// Mapping of instruction pointer to statement index.
-    statements_mapping: HashMap<u64, usize>,
-    /// Mapping of instruction pointer to a goto statement that needs to be updated.
-    goto_updates_mapping: HashMap<u64, Vec<usize>>,
-    /// List of goto updates that needs to be applied on the next statement's push.
-    goto_updates: Vec<usize>,
 }
 
 impl PseudoDecoder {
@@ -80,21 +89,113 @@ impl PseudoDecoder {
         Self {
             function: Function::default(),
             type_system: TypeSystem::new(64, 8),
-            ip: 0,
             stack_pointer: 0,
-            register_locals: HashMap::new(),
-            register_unused_locals: HashMap::new(),
             stack_locals: HashMap::new(),
-            parameter_locals: HashMap::new(),
+            register_typed_locals: HashMap::new(),
+            register_block_locals: HashMap::new(),
+            temp_block_locals: HashMap::new(),
+            ip_pending: Vec::new(),
+            ip_to_index: HashMap::new(),
+            basic_blocks: HashMap::new(),
             last_cmp: None,
-            statements_mapping: HashMap::new(),
-            goto_updates_mapping: HashMap::new(),
-            goto_updates: Vec::new(),
         }
     }
     
-    fn reset(&mut self) {
+    /// Finalize the current function, save it and reset the state to go to the next one.
+    fn finalize_function(&mut self) {
+
+        // Finalize the last basic block if relevant before finalizing the function.
+        self.finalize_basic_block();
+
+        /// Relocate the branch at the given index to target the given index.
+        fn relocate_branch(branch: &mut Statement, target_index: usize) {
+            match branch {
+                Statement::Branch { branch } => *branch = target_index,
+                Statement::BranchConditional { branch_true, .. } => *branch_true = target_index,
+                stmt => panic!("statement cannot be relocated: {stmt:?}"),
+            }
+        }
+
+        let mut missing_basic_blocks = Vec::new();
+
+        // Finalize all basic block and ensure that they are existing.
+        for (ip, branch_indexes) in self.basic_blocks.drain() {
+            
+            let index = self.ip_to_index.get(&ip).copied()
+                .unwrap_or_else(|| panic!("missing statement index for instruction at {ip:08X}"));
+
+            // Here we check that the statement just before the basic block's index is
+            // a branch statement, if not we'll need to create a simple goto statement
+            // at this index in order to mark the new basic block.
+            if index > 0 && !self.function.statements[index - 1].is_branch() {
+                missing_basic_blocks.push((index, branch_indexes));
+            } else {
+                // If the basic block is valid, relocate all branches to point to it.
+                for branch_index in branch_indexes {
+                    relocate_branch(&mut self.function.statements[branch_index], index);
+                }
+            }
+
+        }
+
+        // For each missing basic, in reverse order (because of pop), we add a
+        // goto statement at the index where we want to create a basic block.
+        // NOTE!! After doing this, the 'ip_to_index' cache is no longer valid, don't use.
+        while let Some((index, branch_indexes)) = missing_basic_blocks.pop() {
+            
+            // We're inserting a branch statement at 'index', so to accommodate for that
+            // we need to increment every reference to basic block after that index.
+            for stmt in &mut self.function.statements {
+                match stmt {
+                    Statement::Branch { branch } => {
+                        if *branch >= index { *branch += 1; }
+                    }
+                    Statement::BranchConditional { branch_true, branch_false, .. } => {
+                        if *branch_true >= index { *branch_true += 1; }
+                        if *branch_false >= index { *branch_false += 1; }
+                    }
+                    _ => continue
+                }
+            }
+
+            self.function.statements.insert(index, Statement::Branch { 
+                branch: index + 1
+            });
+
+            // After the goto statement is added, we update every branch referring it.
+            for branch_index in branch_indexes {
+                relocate_branch(&mut self.function.statements[branch_index], index + 1);
+            }
+
+            // Really important! We need to adjust pending missing basic blocks if there
+            // referring branch index is past the statement we inserted.
+            for (_, branch_indexes) in &mut missing_basic_blocks {
+                for branch_index in branch_indexes {
+                    if *branch_index >= index {
+                        *branch_index += 1;
+                    }
+                }
+            }
+
+        }
+
+        self.debug_function();
+
         *self = Self::new();
+        // TODO: Save the function.
+
+    }
+
+    /// Finalize the current basic block, reset the state to go to the next one.
+    fn finalize_basic_block(&mut self) {
+
+        self.register_block_locals.clear();
+
+        // Free all temporary locals.
+        for locals in self.temp_block_locals.values_mut() {
+            locals.cursor = 0;
+        }
+
     }
 
     /// Decode the index part of a memory operand if present, and return the local
@@ -109,7 +210,7 @@ impl PseudoDecoder {
                 let index_reg_local = self.decode_register_preserve(index_reg, TY_PTR_DIFF);
 
                 if index_stride > 1 {
-                    let result_local = self.function.new_local(&self.type_system, TY_PTR_DIFF);
+                    let result_local = self.alloc_temp_local(TY_PTR_DIFF);
                     self.push_assign(Place::new_direct(result_local), Expression::Mul(BinaryExpression {
                         left: Operand::Local(index_reg_local),
                         right: Operand::LiteralUnsigned(index_stride as u64),
@@ -138,7 +239,7 @@ impl PseudoDecoder {
             Register::RIP => {
                 // Special handling for RIP addressing, because displacement contains the
                 // absolute value of the address to load.
-                let addr_local = self.function.new_local(&self.type_system, ty.pointer(1));
+                let addr_local = self.alloc_temp_local(ty.pointer(1));
                 if let Some(index_local) = index_local {
                     self.push_assign(Place::new_direct(addr_local), Expression::Add(BinaryExpression {
                         left: Operand::LiteralUnsigned(mem_displ as u64),
@@ -159,7 +260,7 @@ impl PseudoDecoder {
 
                 if let Some(index_local) = index_local {
 
-                    let temp_local = self.function.new_local(&self.type_system, ty.pointer(1));
+                    let temp_local = self.alloc_temp_local(ty.pointer(1));
 
                     self.push_assign(Place::new_direct(temp_local), Expression::Ref(stack_local));
                     self.push_assign(Place::new_direct(temp_local), Expression::Add(BinaryExpression {
@@ -181,7 +282,7 @@ impl PseudoDecoder {
 
                 if mem_displ != 0 || index_local.is_some() {
 
-                    let temp_local = self.function.new_local(&self.type_system, ty.pointer(1));
+                    let temp_local = self.alloc_temp_local(ty.pointer(1));
 
                     if mem_displ != 0 {
                         self.push_assign(Place::new_direct(temp_local), Expression::Add(BinaryExpression {
@@ -224,12 +325,12 @@ impl PseudoDecoder {
             Register::EIP |
             Register::RIP => {
 
-                local = self.function.new_local(&self.type_system, ty);
+                local = self.alloc_temp_local(ty);
 
                 let pointer;
                 if let Some(index_local) = index_local {
                     
-                    let temp_local = self.function.new_local(&self.type_system, TY_PTR_DIFF);
+                    let temp_local = self.alloc_temp_local(TY_PTR_DIFF);
                     self.push_assign(Place::new_direct(temp_local), Expression::Add(BinaryExpression {
                         left: Operand::LiteralUnsigned(mem_displ as u64),
                         right: Operand::Local(index_local),
@@ -258,7 +359,7 @@ impl PseudoDecoder {
                 // TODO: Later, check if the stride can be used for array-like access.
                 if let Some(index_local) = index_local {
                     
-                    let temp_local = self.function.new_local(&self.type_system, ty.pointer(1));
+                    let temp_local = self.alloc_temp_local(ty.pointer(1));
 
                     self.push_assign(Place::new_direct(temp_local), Expression::Ref(stack_local));
                     self.push_assign(Place::new_direct(temp_local), Expression::Add(BinaryExpression {
@@ -266,7 +367,7 @@ impl PseudoDecoder {
                         right: Operand::Local(index_local),
                     }));
 
-                    local = self.function.new_local(&self.type_system, ty);
+                    local = self.alloc_temp_local(ty);
                     self.push_assign(Place::new_direct(local), Expression::Deref { 
                         pointer: Operand::Local(temp_local),
                         indirection: 1,
@@ -284,7 +385,7 @@ impl PseudoDecoder {
 
                 if mem_displ != 0 || index_local.is_some() {
 
-                    let temp_local = self.function.new_local(&self.type_system, ty.pointer(1));
+                    let temp_local = self.alloc_temp_local(ty.pointer(1));
 
                     if mem_displ != 0 {
                         self.push_assign(Place::new_direct(temp_local), Expression::Add(BinaryExpression {
@@ -304,7 +405,7 @@ impl PseudoDecoder {
 
                 }
 
-                local = self.function.new_local(&self.type_system, ty);
+                local = self.alloc_temp_local(ty);
                 self.push_assign(Place::new_direct(local), Expression::Deref { 
                     pointer: Operand::Local(reg_local),
                     indirection: 1,
@@ -489,61 +590,61 @@ impl PseudoDecoder {
         let src_reg = self.decode_register_preserve(Register::RSI, mov_ty_ptr);
         let dst_reg = self.decode_register_preserve(Register::RDI, mov_ty_ptr);
 
-        let mut rep_data = None;
+        // let mut rep_data = None;
 
-        // NOTE: movs only support REP, not REPZ or REPNZ
-        if inst.has_rep_prefix() {
+        // // NOTE: movs only support REP, not REPZ or REPNZ
+        // if inst.has_rep_prefix() {
             
-            // Repeat for the number of iteration given in RCX.
-            let count_reg = self.decode_register_preserve(Register::RCX, TY_PTR_DIFF);
+        //     // Repeat for the number of iteration given in RCX.
+        //     let count_reg = self.decode_register_preserve(Register::RCX, TY_PTR_DIFF);
 
-            let while_index = self.push_statement(Statement::While { 
-                cond: Expression::Comparison { 
-                    left: Operand::Local(count_reg), 
-                    operator: ComparisonOperator::NotEqual, 
-                    right: Operand::LiteralUnsigned(0),
-                },
-                end_index: 0
-            });
+        //     let while_index = self.push_statement(Statement::While { 
+        //         cond: Expression::Comparison { 
+        //             left: Operand::Local(count_reg), 
+        //             operator: ComparisonOperator::NotEqual, 
+        //             right: Operand::LiteralUnsigned(0),
+        //         },
+        //         end_index: 0
+        //     });
 
-            rep_data = Some((count_reg, while_index));
+        //     rep_data = Some((count_reg, while_index));
 
-        }
+        // }
 
-        // A simple copy from src to dst.
-        self.push_assign(Place::new_indirect(dst_reg, 1), Expression::Deref { 
-            pointer: Operand::Local(src_reg), 
-            indirection: 1,
-        });
+        // // A simple copy from src to dst.
+        // self.push_assign(Place::new_indirect(dst_reg, 1), Expression::Deref { 
+        //     pointer: Operand::Local(src_reg), 
+        //     indirection: 1,
+        // });
 
-        // TODO: Decrement if DF=1
+        // // TODO: Decrement if DF=1
         
-        self.push_assign(Place::new_direct(src_reg), Expression::Add(BinaryExpression {
-            left: Operand::Local(src_reg),
-            right: Operand::LiteralUnsigned(1),
-        }));
+        // self.push_assign(Place::new_direct(src_reg), Expression::Add(BinaryExpression {
+        //     left: Operand::Local(src_reg),
+        //     right: Operand::LiteralUnsigned(1),
+        // }));
 
-        self.push_assign(Place::new_direct(dst_reg), Expression::Add(BinaryExpression {
-            left: Operand::Local(dst_reg),
-            right: Operand::LiteralUnsigned(1),
-        }));
+        // self.push_assign(Place::new_direct(dst_reg), Expression::Add(BinaryExpression {
+        //     left: Operand::Local(dst_reg),
+        //     right: Operand::LiteralUnsigned(1),
+        // }));
 
-        if let Some((count_reg, while_index)) = rep_data {
+        // if let Some((count_reg, while_index)) = rep_data {
 
-            let index = self.push_assign(Place::new_direct(count_reg), Expression::Sub(BinaryExpression { 
-                left: Operand::Local(count_reg), 
-                right: Operand::LiteralUnsigned(1),
-            }));
+        //     let index = self.push_assign(Place::new_direct(count_reg), Expression::Sub(BinaryExpression { 
+        //         left: Operand::Local(count_reg), 
+        //         right: Operand::LiteralUnsigned(1),
+        //     }));
 
-            if let Statement::While { end_index, .. } = &mut self.function.statements[while_index] {
-                *end_index = index + 1;
-            } else {
-                panic!();
-            }
+        //     if let Statement::While { end_index, .. } = &mut self.function.statements[while_index] {
+        //         *end_index = index + 1;
+        //     } else {
+        //         panic!();
+        //     }
 
-        }
+        // }
 
-        self.debug_function();
+        self.finalize_function();
         panic!()
 
     }
@@ -829,48 +930,42 @@ impl PseudoDecoder {
             }
         }
 
-        let if_index = self.push_statement(Statement::If { 
-            cond: cond_expr, 
-            else_index: 0, 
-            end_index: 0 
+        let branch_index = self.push_statement_with(|index| {
+            Statement::BranchConditional { 
+                value: cond_expr, 
+                branch_true: 0, // Will be modified if upon basic block creation.
+                branch_false: index + 1, // False jcc go to the next instruction.
+            }
         });
 
-        let goto_index = self.push_goto(pointer);
-
-        if let Statement::If { end_index, .. } = &mut self.function.statements[if_index] {
-            *end_index = goto_index + 1;
-        }
+        self.ensure_basic_block(pointer, branch_index);
+        self.finalize_basic_block();
 
     }
 
     fn decode_jmp(&mut self, inst: &Instruction) {
+
         let pointer = inst.near_branch64();
-        self.push_goto(pointer);
+        
+        let goto_index = self.push_statement(Statement::Branch { branch: 0 });
+        self.ensure_basic_block(pointer, goto_index);
+        self.finalize_basic_block();
+
     }
 
-    fn decode_ret(&mut self, inst: &Instruction) {
+    fn decode_ret(&mut self, _inst: &Instruction) {
 
         let ret_place = self.decode_register_preserve(Register::RAX, TY_PTR_DIFF);
         self.push_statement(Statement::Return(ret_place));
 
-        self.debug_function();
-
-        // TODO: Later before resetting, register the final function.
-        self.reset();
-
-        panic!()
+        self.finalize_function();
 
     }
 
     fn feed(&mut self, inst: &Instruction) {
-
+        
+        self.ip_pending.push(inst.ip());
         println!("[{:08X}] {inst}", inst.ip());
-
-        self.ip = inst.ip();
-
-        if let Some(updates) = self.goto_updates_mapping.remove(&inst.ip()) {
-            self.goto_updates.extend(updates);
-        }
 
         match inst.code() {
             // NOP
@@ -1051,60 +1146,44 @@ impl PseudoDecoder {
         println!("  sp: {}", self.stack_pointer);
     }
 
-    /// Decode a register read/write access for the given type, if the current type 
-    /// associated to the register is not correct, a new local (or an existing one
-    /// of the same type if possible) is used. If the `preserve` argument is given 
-    /// true then the new local will be set to the previous one's value by casting.
+    /// Decode a register access for the given type, if the tuple register/ty doesn't
+    /// have a local variable yet, it's created. If a new local variable is created,
+    /// and the given `import` argument is true then the value of the register family 
+    /// is preserved in the new local, using a cast assignment.
     #[track_caller]
-    fn decode_register(&mut self, register: Register, ty: Type, preserve: bool) -> LocalRef {
-
-        assert!(!register.is_gpr() || ty.is_integer() || ty.is_pointer(), 
-            "general purpose register can only hold integer type and pointers");
+    fn decode_register(&mut self, register: Register, ty: Type, import: bool) -> LocalRef {
 
         let full_register = register.full_register();
-        assert_ne!(full_register, Register::RSP, "cannot read from sp register");
 
-        match self.register_locals.entry(full_register) {
-            Entry::Occupied(mut o) => {
+        // Debug purpose asserts to avoid programming errors.
+        if full_register.is_gpr() {
+            assert!(ty.is_integer() || ty.is_pointer(), "general purpose register can only hold integer type and pointers");
+        }
 
-                let current_local = *o.get();
-                let current_ty = self.function.local_type(current_local);
+        let local = *self.register_typed_locals.entry((register, ty))
+            .or_insert_with(|| self.function.new_local(&self.type_system, ty, format!("register: {full_register:?}")));
 
-                if current_ty != ty {
+        match self.register_block_locals.entry(full_register) {
+            Entry::Occupied(o) => {
 
-                    // Try to get a free local of this type, or create a new one.
-                    let new_local = self.register_unused_locals.remove(&ty)
-                        .unwrap_or_else(|| self.function.new_local(&self.type_system, ty));
+                let locals = o.into_mut();
+                let current_local = locals.last;
+                locals.last = local;
 
-                    self.register_unused_locals.insert(current_ty, current_local);
-
-                    o.insert(new_local);
-
-                    if preserve {
-                        self.push_assign(Place::new_direct(new_local), Expression::Cast(current_local));
-                    }
-
-                    new_local
-
-                } else {
-                    current_local
+                if import && self.function.local_type(current_local) != ty {
+                    self.push_assign(Place::new_direct(local), Expression::Cast(current_local));
                 }
 
             }
             Entry::Vacant(v) => {
-
-                let new_local = self.register_unused_locals.remove(&ty)
-                    .unwrap_or_else(|| self.function.new_local(&self.type_system, ty));
-
-                if preserve {
-                    self.parameter_locals.insert(Location::Register(full_register), new_local);
-                }
-
-                v.insert(new_local);
-                new_local
-
+                v.insert(RegisterBlockLocals { 
+                    import: import.then_some(local),  // Only import if requested.
+                    last: local,
+                });
             }
         }
+
+        local
 
     }
 
@@ -1121,47 +1200,52 @@ impl PseudoDecoder {
     /// Get a local usable to write from the given stack offset.
     fn ensure_stack_local(&mut self, offset: i32, ty: Type) -> LocalRef {
         *self.stack_locals.entry(offset)
-            .or_insert_with(|| self.function.new_local(&self.type_system, ty))
+            .or_insert_with(|| self.function.new_local(&self.type_system, ty, format!("stack: {offset}")))
     }
 
-    fn ensure_stack_slot(&mut self, offset: i32, size: u32) {
+    /// Allocate a temporary variable to hold the given type, the local will be freed
+    /// automatically when the current basic block is exited, this local variable can't
+    /// be used between basic blocks.
+    fn alloc_temp_local(&mut self, ty: Type) -> LocalRef {
+        let locals = self.temp_block_locals.entry(ty).or_default();
+        let new_local = locals.list.get(locals.cursor)
+            .copied()
+            .unwrap_or_else(|| {
+                let new_local = self.function.new_local(&self.type_system, ty, format!("temporary variable {}", locals.cursor));
+                locals.list.push(new_local);
+                new_local
+            });
+        locals.cursor += 1;
+        new_local
+    }
 
-        // TODO:
-
+    /// Push a new statement with a producer closure that take the future statement's
+    /// index as parameter.
+    fn push_statement_with<F: FnOnce(usize) -> Statement>(&mut self, func: F) -> usize {
+        let statement_index = self.function.statements.len();
+        self.function.statements.push(func(statement_index));
+        for ip_pending in self.ip_pending.drain(..) {
+            self.ip_to_index.insert(ip_pending, statement_index);
+        }
+        statement_index
     }
 
     /// Push a new statement.
     fn push_statement(&mut self, statement: Statement) -> usize {
-
-        let statement_index = self.function.statements.len();
-        self.function.statements.push(statement);
-        self.statements_mapping.entry(self.ip).or_insert(statement_index);
-
-        // Update goto statements that needs it.
-        for goto_index in self.goto_updates.drain(..) {
-            if let Statement::Goto(index) = &mut self.function.statements[goto_index] {
-                *index = statement_index;
-            } else {
-                panic!("invalid goto update: not a goto statement at {goto_index}");
-            }
-        }
-
-        statement_index
-
+        self.push_statement_with(|_| statement)
     }
 
     fn push_assign(&mut self, place: Place, value: Expression) -> usize {
         self.push_statement(Statement::Assign { place, value })
     }
 
-    fn push_goto(&mut self, target_ip: u64) -> usize {
-        let target_index = self.statements_mapping.get(&target_ip).copied();
-        let goto_index = self.push_statement(Statement::Goto(target_index.unwrap_or(0)));
-        // If the target statement's index is unknown, update it later.
-        if target_index.is_none() {
-            self.goto_updates_mapping.entry(target_ip).or_default().push(goto_index);
-        }
-        goto_index
+    /// Ensure that a basic block exists or will exists at the given instruction pointer.
+    /// If the basic block cuts an existing basic block, a goto branch is set on the
+    /// previous block and point to the new one. The given branch index will be used to
+    /// relocate the statement at this index to point to the final index of the basic
+    /// block when known.
+    fn ensure_basic_block(&mut self, ip: u64, branch_index: usize) {
+        self.basic_blocks.entry(ip).or_default().push(branch_index);
     }
 
     fn debug_function(&self) {
@@ -1223,23 +1307,23 @@ enum CmpKind {
     Test,
 }
 
-/// Internally used to denote possible locations for a local variable or parameter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Location {
-    /// The local variable or parameter is stored in the given register (only *full*
-    /// register are used).
-    Register(Register),
-    /// The local variable or parameter is stored on the stack at the given offset.
-    Stack(i32),
+/// Saves for each register family, their optional imported local and the last local
+/// bound to them for the current basic block being resolved.
+#[derive(Debug)]
+struct RegisterBlockLocals {
+    /// If relevant, the local variable corresponding to this register family that needs
+    /// to be given by the caller basic blocks.
+    import: Option<LocalRef>,
+    /// The last local variable that has been bound to the register family.
+    last: LocalRef,
 }
 
-
-#[derive(Debug, Clone)]
-struct StackSlot {
-    /// Offset of the slot from the stack frame origin.
-    offset: i32,
-    /// The local stored in this slot.
-    local: LocalRef,
-    /// Layout of the stack slot.
-    layout: Layout,
+/// Provides a local allocator for a given type.
+#[derive(Debug, Default)]
+struct TempBlockLocals {
+    /// Internal list of local for the given type.
+    list: Vec<LocalRef>,
+    /// Index of the next local to allocate, if that equals the length of the locals,
+    /// then a new local will be created.
+    cursor: usize,
 }
