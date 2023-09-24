@@ -189,6 +189,7 @@ impl PseudoDecoder {
     fn finalize_basic_block(&mut self) {
 
         self.register_block_locals.clear();
+        self.last_cmp = None;
 
         // Free all temporary locals.
         for locals in self.temp_block_locals.values_mut() {
