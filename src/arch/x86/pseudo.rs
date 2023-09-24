@@ -49,13 +49,17 @@ impl<'data> Analysis<Backend<'data>> for PseudoAnalysis {
 /// This structure is not yet optimized for performance, many hash maps are not suited
 /// for performance and can be replaced, but it's simpler for now!
 struct PseudoDecoder {
+    /// Mapping of all already decoded functions to their instruction pointer.
+    functions: HashMap<u64, Function>,
     /// Internal pseudo function being decoded.
     function: Function,
     /// The type system we use to compute type sizes and support structs.
     type_system: TypeSystem,
     /// Current stack pointer value.
+    /// **This is reset between passes.**
     stack_pointer: i32,
     /// Mapping of stack offset to the local they are storing.
+    /// **This is reset between passes.**
     stack_locals: HashMap<i32, LocalRef>,
     /// Mapping of local variables and which tuple register/type is holding them. 
     /// Registers in this mapping are in their "full", for example CX/ECX -> RCX.
@@ -65,31 +69,35 @@ struct PseudoDecoder {
     register_typed_locals: HashMap<(Register, Type), LocalRef>,
     /// For the current basic block, map each register's family to the optional import
     /// and last local variable bound to the family.
+    /// **This is reset between basic blocks.**
     register_block_locals: HashMap<Register, RegisterBlockLocals>,
     /// For each type of data, provides an allocator temporary local variables, these
     /// variables should not cross basic block boundaries.
     temp_block_locals: HashMap<Type, TempBlockLocals>,
+    /// Mapping of basic blocks to their first instruction pointer.
+    basic_blocks: HashMap<u64, BasicBlock>,
     /// Pending instruction pointers that needs to be mapped to a future statement,
     /// when a function's statement is added, all of these instruction pointers are
     /// associated (in `ip_to_index` map) to this statement.
-    ip_pending: Vec<u64>,
+    /// **This is reset between passes.**
+    pending_ip: Vec<u64>,
     /// Mapping of instruction pointer to statement index.
+    /// **This is reset between passes.**
     ip_to_index: HashMap<u64, usize>,
-    /// Mapping of basic blocks pending to be created when their associated instruction
-    /// pointer is reached. If reached, the vector contains each statement to relocate.
-    basic_blocks: HashMap<u64, Vec<usize>>,
-    /// Information about the last comparison.
+    /// First instruction pointer of the current function.
+    function_ip: Option<u64>,
+    /// First instruction pointer of the current basic block.
+    basic_block_ip: u64,
+    /// Information about the last comparison. 
+    /// **This is reset between passes.**
     last_cmp: Option<Cmp>,
-    /// TODO: A list of errors that remains at the end of this pass, the decoding need
-    /// to be retried in another pass. Errors can be basic blocks that were missing and
-    /// therefore needs recalculation, or local variable transfers across basic blocks.
-    errors: Vec<()>,
 }
 
 impl PseudoDecoder {
 
     fn new() -> Self {
         Self {
+            functions: HashMap::new(),
             function: Function::default(),
             type_system: TypeSystem::new(64, 8),
             stack_pointer: 0,
@@ -97,33 +105,26 @@ impl PseudoDecoder {
             register_typed_locals: HashMap::new(),
             register_block_locals: HashMap::new(),
             temp_block_locals: HashMap::new(),
-            ip_pending: Vec::new(),
-            ip_to_index: HashMap::new(),
             basic_blocks: HashMap::new(),
+            pending_ip: Vec::new(),
+            ip_to_index: HashMap::new(),
+            function_ip: None,
+            basic_block_ip: 0,
             last_cmp: None,
-            errors: Vec::new(),
         }
     }
     
     /// Finalize the current function, save it and reset the state to go to the next one.
-    fn finalize_function(&mut self) {
+    fn finalize_function(&mut self) -> Option<u64> {
 
         // Finalize the last basic block if relevant before finalizing the function.
         self.finalize_basic_block();
 
-        /// Relocate the branch at the given index to target the given index.
-        fn relocate_branch(branch: &mut Statement, target_index: usize) {
-            match branch {
-                Statement::Branch { branch } => *branch = target_index,
-                Statement::BranchConditional { branch_true, .. } => *branch_true = target_index,
-                stmt => panic!("statement cannot be relocated: {stmt:?}"),
-            }
-        }
-
-        let mut missing_basic_blocks = Vec::new();
+        // Check if there are missing basic blocks.
+        let mut missing_basic_blocks = false;
 
         // Finalize all basic block and ensure that they are existing.
-        for (ip, branch_indexes) in self.basic_blocks.drain() {
+        for (ip, block) in &mut self.basic_blocks {
             
             let index = self.ip_to_index.get(&ip).copied()
                 .unwrap_or_else(|| panic!("missing statement index for instruction at {ip:08X}"));
@@ -132,71 +133,73 @@ impl PseudoDecoder {
             // a branch statement, if not we'll need to create a simple goto statement
             // at this index in order to mark the new basic block.
             if index > 0 && !self.function.statements[index - 1].is_branch() {
-                missing_basic_blocks.push((index, branch_indexes));
+                missing_basic_blocks = true;
             } else {
                 // If the basic block is valid, relocate all branches to point to it.
-                for branch_index in branch_indexes {
-                    relocate_branch(&mut self.function.statements[branch_index], index);
-                }
-            }
-
-        }
-
-        // For each missing basic, in reverse order (because of pop), we add a
-        // goto statement at the index where we want to create a basic block.
-        // NOTE!! After doing this, the 'ip_to_index' cache is no longer valid, don't use.
-        while let Some((index, branch_indexes)) = missing_basic_blocks.pop() {
-            
-            // We're inserting a branch statement at 'index', so to accommodate for that
-            // we need to increment every reference to basic block after that index.
-            for stmt in &mut self.function.statements {
-                match stmt {
-                    Statement::Branch { branch } => {
-                        if *branch >= index { *branch += 1; }
-                    }
-                    Statement::BranchConditional { branch_true, branch_false, .. } => {
-                        if *branch_true >= index { *branch_true += 1; }
-                        if *branch_false >= index { *branch_false += 1; }
-                    }
-                    _ => continue
-                }
-            }
-
-            self.function.statements.insert(index, Statement::Branch { 
-                branch: index + 1
-            });
-
-            // After the goto statement is added, we update every branch referring it.
-            for branch_index in branch_indexes {
-                relocate_branch(&mut self.function.statements[branch_index], index + 1);
-            }
-
-            // Really important! We need to adjust pending missing basic blocks if there
-            // referring branch index is past the statement we inserted.
-            for (_, branch_indexes) in &mut missing_basic_blocks {
-                for branch_index in branch_indexes {
-                    if *branch_index >= index {
-                        *branch_index += 1;
+                // NOTE: We drain this relocation list because we don't want to keep it 
+                // for the next pass, it will be reconstructed as needed.
+                for branch_index in block.branch_indices_to_relocate.drain(..) {
+                    match &mut self.function.statements[branch_index] {
+                        Statement::Branch { branch } => *branch = index,
+                        Statement::BranchConditional { branch_true, .. } => *branch_true = index,
+                        stmt => panic!("statement cannot be relocated: {stmt:?}"),
                     }
                 }
             }
 
         }
+
+        println!("missing_basic_blocks: {missing_basic_blocks}");
+        println!("basic blocks: {:?}", self.basic_blocks);
 
         self.debug_function();
 
-        *self = Self::new();
-        // TODO: Save the function.
+        let function_ip = self.function_ip.unwrap();
+
+        // Reset states that should not stay to another pass or another function.
+        self.stack_pointer = 0;
+        self.stack_locals.clear();
+        self.pending_ip.clear();
+        self.ip_to_index.clear();
+        self.function_ip = None;
+        self.basic_block_ip = 0;
+        
+        if missing_basic_blocks {
+
+            // We request a second pass.
+            Some(function_ip)
+
+        } else {
+
+            // Continuing to another function, we don't keep basic blocks.
+            self.basic_blocks.clear();
+            self.temp_block_locals.clear();
+            self.register_typed_locals.clear();
+
+            // Save the function for later...
+            self.functions.insert(function_ip, std::mem::take(&mut self.function));
+
+            None
+
+        }
 
     }
 
-    /// Finalize the current basic block, reset the state to go to the next one.
+    /// Finalize the current basic block, reset the state to go to the next one. 
     fn finalize_basic_block(&mut self) {
 
-        self.register_block_locals.clear();
+        // Compute the register family/local tuple that this basic block needs.
+        // Also drain because we don't want to keep these for the next basic block.
+        let imported_locals = self.register_block_locals.drain()
+            .filter_map(|(register, locals)| locals.import.map(|local| (register, local)))
+            .collect();
+
+        self.current_basic_block().imported_locals = Some(imported_locals);
+
+        // Don't track comparisons across basic blocks.
         self.last_cmp = None;
 
-        // Free all temporary locals.
+        // Free basic block temporary locals.
         for locals in self.temp_block_locals.values_mut() {
             locals.cursor = 0;
         }
@@ -943,8 +946,36 @@ impl PseudoDecoder {
             }
         });
 
-        self.ensure_basic_block(pointer, branch_index);
-        self.finalize_basic_block();
+        let mut exported_locals = Vec::new();
+        let mut correct_branch = true;
+
+        // TODO: Rework to look better...
+
+        // We added a branch statement, this implied existence of two basic blocks.
+        let true_block = self.ensure_basic_block(pointer);
+        true_block.branch_indices_to_relocate.push(branch_index);
+        if let Some(imported_locals) = &true_block.imported_locals {
+            exported_locals.extend_from_slice(&imported_locals);
+        } else {
+            correct_branch = false;
+        }
+
+        let false_block = self.ensure_basic_block(inst.next_ip());
+        if let Some(imported_locals) = &false_block.imported_locals {
+            exported_locals.extend_from_slice(&imported_locals);
+        } else {
+            correct_branch = false;
+        }
+
+        if correct_branch {
+            for (register, local) in exported_locals {
+                let ty = self.function.local_type(local);
+                assert_eq!(self.decode_register(register, ty, true), local);
+            }
+        }
+
+        self.current_basic_block().correct_branch = correct_branch;
+
 
     }
 
@@ -952,35 +983,89 @@ impl PseudoDecoder {
 
         let pointer = inst.near_branch64();
         
-        let goto_index = self.push_statement(Statement::Branch { branch: 0 });
-        self.ensure_basic_block(pointer, goto_index);
-        self.finalize_basic_block();
+        let branch_index = self.push_statement(Statement::Branch { branch: 0 });
+
+        // Read above.
+        let target_block = self.ensure_basic_block(pointer);
+        target_block.branch_indices_to_relocate.push(branch_index);
+        
+        // TODO: Rework to look better...
+        if let Some(imported_locals) = &target_block.imported_locals {
+            for (register, local) in imported_locals.clone() {
+                let ty = self.function.local_type(local);
+                assert_eq!(self.decode_register(register, ty, true), local);
+            }
+            self.current_basic_block().correct_branch = true;
+        } else {
+            self.current_basic_block().correct_branch = false;
+        }
+
+        self.ensure_basic_block(inst.next_ip());
 
     }
 
-    fn decode_ret(&mut self, _inst: &Instruction) {
+    fn decode_ret(&mut self, _inst: &Instruction) -> Option<u64> {
 
         let ret_place = self.decode_register_preserve(Register::RAX, TY_PTR_DIFF);
         self.push_statement(Statement::Return(ret_place));
 
-        self.finalize_function();
+        // Return statement is always a correct branch.
+        self.current_basic_block().correct_branch = true;
+        self.finalize_function()
 
     }
 
-    fn feed(&mut self, inst: &Instruction) {
-        
-        self.ip_pending.push(inst.ip());
-        println!("[{:08X}] {inst}", inst.ip());
+    /// Feed a new instruction to the decoder, if some instruction is returned, the 
+    /// feeder must goto to the given instruction and start feed from it.
+    fn feed(&mut self, inst: &Instruction) -> Option<u64> {
+
+        let ip = inst.ip();
+        println!("[{:08X}] {inst}", ip);
+
+        if self.function_ip.is_none() {
+            match inst.code() {
+                Code::Nopw |
+                Code::Nopd |
+                Code::Nopq |
+                Code::Nop_rm16 |
+                Code::Nop_rm32 |
+                Code::Nop_rm64 |
+                Code::Int3 => return None,
+                _ => {
+                    // Initialize the start pointer of the function.
+                    self.function_ip = Some(ip);
+                    // There is _always_ at least one basic block starting at entry.
+                    self.basic_blocks.clear();
+                    self.basic_blocks.insert(ip, BasicBlock::default());
+                }
+            }
+        };
+
+        // Register this instruction to be mapped to future statements.
+        self.pending_ip.push(ip);
+
+        // Check if this instruction is the starting point of a new basic block.
+        if self.basic_blocks.contains_key(&ip) {
+            // Finalize the previous basic block (only if this is not the first one ofc).
+            if ip != self.function_ip.unwrap() {
+                self.finalize_basic_block();
+            }
+            // If a basic block starts at this instruction, we should add a branch statement
+            // before decoding this instruction (if not already the case), so that future 
+            // statements will be in a new basic block.
+            if let Some(stmt) = self.function.statements.last() {
+                if !stmt.is_branch() {
+                    // NOTE: We don't use our method 'push_statement' to avoid associating
+                    // this statement with pending instruction pointers.
+                    let branch_index = self.function.statements.len();
+                    self.function.statements.push(Statement::Branch { branch: branch_index + 1 });
+                }
+            }
+            // Set the instruction pointer of the new basic block being decoded.
+            self.basic_block_ip = ip;
+        }
 
         match inst.code() {
-            // NOP
-            Code::Nopw |
-            Code::Nopd |
-            Code::Nopq |
-            Code::Nop_rm16 |
-            Code::Nop_rm32 |
-            Code::Nop_rm64 |
-            Code::Int3 => {}
             // PUSH
             Code::Push_r64 |
             Code::Push_r32 |
@@ -1132,12 +1217,22 @@ impl PseudoDecoder {
             Code::Retfw |
             Code::Retfq_imm16 |
             Code::Retfd_imm16 |
-            Code::Retfw_imm16 => self.decode_ret(inst),
+            Code::Retfw_imm16 => return self.decode_ret(inst),
+            // NOP
+            Code::Nopw |
+            Code::Nopd |
+            Code::Nopq |
+            Code::Nop_rm16 |
+            Code::Nop_rm32 |
+            Code::Nop_rm64 |
+            Code::Int3 => {},
             _ => {
                 self.debug_function();
                 unimplemented!("unsupported opcode: {inst:?}");
             }
         }
+
+        None
         
     }
 
@@ -1209,8 +1304,8 @@ impl PseudoDecoder {
     }
 
     /// Allocate a temporary variable to hold the given type, the local will be freed
-    /// automatically when the current basic block is exited, this local variable can't
-    /// be used between basic blocks.
+    /// automatically when the current basic block is exited, this local variable
+    /// ***should not be used between two basic blocks***.
     fn alloc_temp_local(&mut self, ty: Type) -> LocalRef {
         let locals = self.temp_block_locals.entry(ty).or_default();
         let new_local = locals.list.get(locals.cursor)
@@ -1229,7 +1324,7 @@ impl PseudoDecoder {
     fn push_statement_with<F: FnOnce(usize) -> Statement>(&mut self, func: F) -> usize {
         let statement_index = self.function.statements.len();
         self.function.statements.push(func(statement_index));
-        for ip_pending in self.ip_pending.drain(..) {
+        for ip_pending in self.pending_ip.drain(..) {
             self.ip_to_index.insert(ip_pending, statement_index);
         }
         statement_index
@@ -1244,13 +1339,17 @@ impl PseudoDecoder {
         self.push_statement(Statement::Assign { place, value })
     }
 
-    /// Ensure that a basic block exists or will exists at the given instruction pointer.
-    /// If the basic block cuts an existing basic block, a goto branch is set on the
-    /// previous block and point to the new one. The given branch index will be used to
-    /// relocate the statement at this index to point to the final index of the basic
-    /// block when known.
-    fn ensure_basic_block(&mut self, ip: u64, branch_index: usize) {
-        self.basic_blocks.entry(ip).or_default().push(branch_index);
+    /// Ensure that a basic block exists at the given instruction and returns a reference
+    /// to it. These basic blocks are different from implied basic blocks into the 
+    /// decoded function, because they are mapped to start instruction pointers, and
+    /// not statement indices.
+    fn ensure_basic_block(&mut self, ip: u64) -> &mut BasicBlock {
+        self.basic_blocks.entry(ip).or_default()
+    }
+
+    #[track_caller]
+    fn current_basic_block(&mut self) -> &mut BasicBlock {
+        self.basic_blocks.get_mut(&self.basic_block_ip).unwrap()
     }
 
     fn debug_function(&self) {
@@ -1331,4 +1430,19 @@ struct TempBlockLocals {
     /// Index of the next local to allocate, if that equals the length of the locals,
     /// then a new local will be created.
     cursor: usize,
+}
+
+/// Information about a basic block.
+#[derive(Debug, Default)]
+struct BasicBlock {
+    /// The list of branches statements' index to relocate to point to this basic block
+    /// when the function is finalized. 
+    branch_indices_to_relocate: Vec<usize>,
+    /// When the basic block has been decoded, it contains the list of register family
+    /// and their local that should be correctly bound before branching to the block.
+    imported_locals: Option<Vec<(Register, LocalRef)>>,
+    /// Indicates if this basic block has a correct branch statement. A branch statement
+    /// is correct when the targeted basic block(s) are given the correctly mapped local
+    /// variables depending, this depends on `imported_locals` of target basic block(s).
+    correct_branch: bool,
 }
