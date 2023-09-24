@@ -3,10 +3,6 @@
 use iced_x86::{Decoder, DecoderOptions, Instruction};
 
 
-// mod idr;
-// pub use idr::IdrAnalysis;
-
-
 mod pseudo;
 pub use pseudo::PseudoAnalysis;
 

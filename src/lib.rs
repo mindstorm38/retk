@@ -14,7 +14,7 @@ use object::read::pe::{PeFile64, Import};
 use object::pe::ImageNtHeaders64;
 use object::LittleEndian as LE;
 
-pub mod idr;
+pub mod ty;
 pub mod pseudo;
 
 pub mod analyzer;

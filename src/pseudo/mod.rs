@@ -3,7 +3,7 @@
 use std::fmt::{self, Write as _};
 use std::io;
 
-use crate::idr::types::{Type, Layout, TypeSystem, PrimitiveType};
+use crate::ty::{Type, Layout, TypeSystem, PrimitiveType};
 
 
 #[derive(Debug, Clone, Default)]

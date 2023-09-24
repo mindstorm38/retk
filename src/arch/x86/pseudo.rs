@@ -6,11 +6,10 @@ use std::collections::HashMap;
 use iced_x86::{Instruction, Code, Register, ConditionCode};
 
 use crate::pseudo::{LocalRef, Function, Statement, Expression, Place, BinaryExpression, Operand, ComparisonOperator};
-use crate::idr::types::{TypeSystem, Type, PrimitiveType};
+use crate::ty::{TypeSystem, Type, PrimitiveType};
 use crate::analyzer::{Analysis, Analyzer};
 
 use super::Backend;
-
 
 
 /// This analysis fetch every instruction and construct a first primitive IDR.

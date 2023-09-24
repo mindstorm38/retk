@@ -1,4 +1,5 @@
-//! Type system module for IDR, providing a way of defining complex data types.
+//! Type system module, providing a way of defining complex data types as well as simple
+//! ones efficiently for pseudo-code decoders.
 
 use std::collections::HashMap;
 use std::fmt::Write;
