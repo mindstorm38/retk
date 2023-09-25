@@ -76,18 +76,10 @@ struct PseudoDecoder {
     temp_block_locals: HashMap<Type, TempBlockLocals>,
     /// Mapping of basic blocks to their first instruction pointer.
     basic_blocks: HashMap<u64, BasicBlock>,
-    /// Pending instruction pointers that needs to be mapped to a future statement,
-    /// when a function's statement is added, all of these instruction pointers are
-    /// associated (in `ip_to_index` map) to this statement.
-    /// **This is reset between passes.**
-    pending_ip: Vec<u64>,
-    /// Mapping of instruction pointer to statement index.
-    /// **This is reset between passes.**
-    ip_to_index: HashMap<u64, usize>,
     /// First instruction pointer of the current function.
     function_ip: Option<u64>,
     /// First instruction pointer of the current basic block.
-    basic_block_ip: u64,
+    basic_block_ip: Option<u64>,
     /// Information about the last comparison. 
     /// **This is reset between passes.**
     last_cmp: Option<Cmp>,
@@ -106,10 +98,8 @@ impl PseudoDecoder {
             register_block_locals: HashMap::new(),
             temp_block_locals: HashMap::new(),
             basic_blocks: HashMap::new(),
-            pending_ip: Vec::new(),
-            ip_to_index: HashMap::new(),
             function_ip: None,
-            basic_block_ip: 0,
+            basic_block_ip: None,
             last_cmp: None,
         }
     }
@@ -121,20 +111,13 @@ impl PseudoDecoder {
         self.finalize_basic_block();
 
         // Check if there are missing basic blocks.
-        let mut missing_basic_blocks = false;
+        let mut need_another_pass = false;
 
         // Finalize all basic block and ensure that they are existing.
-        for (ip, block) in &mut self.basic_blocks {
-            
-            let index = self.ip_to_index.get(&ip).copied()
-                .unwrap_or_else(|| panic!("missing statement index for instruction at {ip:08X}"));
-
-            // Here we check that the statement just before the basic block's index is
-            // a branch statement, if not we'll need to create a simple goto statement
-            // at this index in order to mark the new basic block.
-            if index > 0 && !self.function.statements[index - 1].is_branch() {
-                missing_basic_blocks = true;
-            } else {
+        for block in self.basic_blocks.values_mut() {
+            if block.exported_register_locals_outdated {
+                need_another_pass = true;
+            } else if let Some(index) = block.index {
                 // If the basic block is valid, relocate all branches to point to it.
                 // NOTE: We drain this relocation list because we don't want to keep it 
                 // for the next pass, it will be reconstructed as needed.
@@ -145,12 +128,15 @@ impl PseudoDecoder {
                         stmt => panic!("statement cannot be relocated: {stmt:?}"),
                     }
                 }
+            } else {
+                // The basic block was not know when decoding its statements, we need
+                // another pass where it will know that.
+                need_another_pass = true;
             }
-
         }
 
-        println!("missing_basic_blocks: {missing_basic_blocks}");
         println!("basic blocks: {:?}", self.basic_blocks);
+        println!("need_another_pass: {need_another_pass}");
 
         self.debug_function();
 
@@ -159,14 +145,13 @@ impl PseudoDecoder {
         // Reset states that should not stay to another pass or another function.
         self.stack_pointer = 0;
         self.stack_locals.clear();
-        self.pending_ip.clear();
-        self.ip_to_index.clear();
         self.function_ip = None;
-        self.basic_block_ip = 0;
+        self.basic_block_ip = None;
         
-        if missing_basic_blocks {
+        if need_another_pass {
 
-            // We request a second pass.
+            // Clear function's statement because the second pass recreate them.
+            self.function.statements.clear();
             Some(function_ip)
 
         } else {
@@ -188,13 +173,36 @@ impl PseudoDecoder {
     /// Finalize the current basic block, reset the state to go to the next one. 
     fn finalize_basic_block(&mut self) {
 
+        let Some(block_ip) = self.basic_block_ip else { return };
+        let block = self.basic_blocks.get_mut(&block_ip).unwrap();
+
         // Compute the register family/local tuple that this basic block needs.
         // Also drain because we don't want to keep these for the next basic block.
         let imported_locals = self.register_block_locals.drain()
             .filter_map(|(register, locals)| locals.import.map(|local| (register, local)))
-            .collect();
+            .collect::<Vec<_>>();
 
-        self.current_basic_block().imported_locals = Some(imported_locals);
+        // If the current imported locals has not the same length, we know that a new
+        // register has been added. Registers that were already present should not have
+        // changed their required type.
+        if imported_locals.len() != block.imported_register_locals.len() {
+
+            debug_assert!(imported_locals.len() > block.imported_register_locals.len(),
+                "imported locals cannot shrink between passes");
+            
+            block.imported_register_locals = imported_locals;
+
+            // We can take because backward ips should be reset between passes.
+            let backward_ips = std::mem::take(&mut block.backward_ips);
+
+            // For each backward ip, we invalidate the block to let it know that some of
+            // its branch has more imported locals.
+            for backward_block_ip in backward_ips {
+                self.basic_blocks.get_mut(&backward_block_ip).unwrap()
+                    .exported_register_locals_outdated = true;
+            }
+
+        }
 
         // Don't track comparisons across basic blocks.
         self.last_cmp = None;
@@ -938,6 +946,7 @@ impl PseudoDecoder {
             }
         }
 
+        // FIXME: Move this after exported registers.
         let branch_index = self.push_statement_with(|index| {
             Statement::BranchConditional { 
                 value: cond_expr, 
@@ -946,36 +955,22 @@ impl PseudoDecoder {
             }
         });
 
-        let mut exported_locals = Vec::new();
-        let mut correct_branch = true;
-
-        // TODO: Rework to look better...
+        let block_ip = self.basic_block_ip.unwrap();
+        let mut imported_locals = Vec::new();
 
         // We added a branch statement, this implied existence of two basic blocks.
         let true_block = self.ensure_basic_block(pointer);
         true_block.branch_indices_to_relocate.push(branch_index);
-        if let Some(imported_locals) = &true_block.imported_locals {
-            exported_locals.extend_from_slice(&imported_locals);
-        } else {
-            correct_branch = false;
-        }
+        true_block.backward_ips.push(block_ip);
+        imported_locals.extend_from_slice(&true_block.imported_register_locals);
 
         let false_block = self.ensure_basic_block(inst.next_ip());
-        if let Some(imported_locals) = &false_block.imported_locals {
-            exported_locals.extend_from_slice(&imported_locals);
-        } else {
-            correct_branch = false;
+        false_block.backward_ips.push(block_ip);
+        imported_locals.extend_from_slice(&false_block.imported_register_locals);
+
+        for (register, ty) in imported_locals {
+            self.decode_register(register, ty, true);
         }
-
-        if correct_branch {
-            for (register, local) in exported_locals {
-                let ty = self.function.local_type(local);
-                assert_eq!(self.decode_register(register, ty, true), local);
-            }
-        }
-
-        self.current_basic_block().correct_branch = correct_branch;
-
 
     }
 
@@ -983,24 +978,22 @@ impl PseudoDecoder {
 
         let pointer = inst.near_branch64();
         
+        // FIXME: Move this after exported registers.
         let branch_index = self.push_statement(Statement::Branch { branch: 0 });
+
+        let block_ip = self.basic_block_ip.unwrap();
 
         // Read above.
         let target_block = self.ensure_basic_block(pointer);
         target_block.branch_indices_to_relocate.push(branch_index);
-        
-        // TODO: Rework to look better...
-        if let Some(imported_locals) = &target_block.imported_locals {
-            for (register, local) in imported_locals.clone() {
-                let ty = self.function.local_type(local);
-                assert_eq!(self.decode_register(register, ty, true), local);
-            }
-            self.current_basic_block().correct_branch = true;
-        } else {
-            self.current_basic_block().correct_branch = false;
-        }
+        target_block.backward_ips.push(block_ip);
+        let imported_locals = target_block.imported_register_locals.clone();
 
         self.ensure_basic_block(inst.next_ip());
+
+        for (register, ty) in imported_locals {
+            self.decode_register(register, ty, true);
+        }
 
     }
 
@@ -1009,8 +1002,8 @@ impl PseudoDecoder {
         let ret_place = self.decode_register_preserve(Register::RAX, TY_PTR_DIFF);
         self.push_statement(Statement::Return(ret_place));
 
-        // Return statement is always a correct branch.
-        self.current_basic_block().correct_branch = true;
+        // Return statement goes nowhere so exported locals are correct.
+        // self.current_basic_block().exported_locals_correct = true;
         self.finalize_function()
 
     }
@@ -1041,28 +1034,32 @@ impl PseudoDecoder {
             }
         };
 
-        // Register this instruction to be mapped to future statements.
-        self.pending_ip.push(ip);
+        let mut next_block_ip = None;
 
         // Check if this instruction is the starting point of a new basic block.
-        if self.basic_blocks.contains_key(&ip) {
-            // Finalize the previous basic block (only if this is not the first one ofc).
-            if ip != self.function_ip.unwrap() {
-                self.finalize_basic_block();
-            }
+        if let Some(block) = self.basic_blocks.get_mut(&ip) {
             // If a basic block starts at this instruction, we should add a branch statement
             // before decoding this instruction (if not already the case), so that future 
             // statements will be in a new basic block.
             if let Some(stmt) = self.function.statements.last() {
                 if !stmt.is_branch() {
-                    // NOTE: We don't use our method 'push_statement' to avoid associating
-                    // this statement with pending instruction pointers.
+                    // NOTE: Can't use 'push_statement' because of borrowing.
                     let branch_index = self.function.statements.len();
                     self.function.statements.push(Statement::Branch { branch: branch_index + 1 });
+                    // We added an artificial branch, register the current block as the
+                    // parent of the next one.
+                    block.backward_ips.push(self.basic_block_ip.unwrap());
                 }
             }
-            // Set the instruction pointer of the new basic block being decoded.
-            self.basic_block_ip = ip;
+            // Update the index of the basic block to point to the future statement.
+            block.index = Some(self.function.statements.len());
+            next_block_ip = Some(ip);
+        }
+        
+        // If we need to go switch to a new basic block, finalize the current one.
+        if let Some(next_block_ip) = next_block_ip {
+            self.finalize_basic_block();
+            self.basic_block_ip = Some(next_block_ip);
         }
 
         match inst.code() {
@@ -1277,7 +1274,7 @@ impl PseudoDecoder {
             }
             Entry::Vacant(v) => {
                 v.insert(RegisterBlockLocals { 
-                    import: import.then_some(local),  // Only import if requested.
+                    import: import.then_some(ty),  // Only import if requested.
                     last: local,
                 });
             }
@@ -1287,11 +1284,13 @@ impl PseudoDecoder {
 
     }
 
+    #[track_caller]
     #[inline]
     fn decode_register_preserve(&mut self, register: Register, ty: Type) -> LocalRef {
         self.decode_register(register, ty, true)
     }
 
+    #[track_caller]
     #[inline]
     fn decode_register_overwrite(&mut self, register: Register, ty: Type) -> LocalRef {
         self.decode_register(register, ty, false)
@@ -1324,9 +1323,6 @@ impl PseudoDecoder {
     fn push_statement_with<F: FnOnce(usize) -> Statement>(&mut self, func: F) -> usize {
         let statement_index = self.function.statements.len();
         self.function.statements.push(func(statement_index));
-        for ip_pending in self.pending_ip.drain(..) {
-            self.ip_to_index.insert(ip_pending, statement_index);
-        }
         statement_index
     }
 
@@ -1335,6 +1331,7 @@ impl PseudoDecoder {
         self.push_statement_with(|_| statement)
     }
 
+    /// Push an assignment statement.
     fn push_assign(&mut self, place: Place, value: Expression) -> usize {
         self.push_statement(Statement::Assign { place, value })
     }
@@ -1345,11 +1342,6 @@ impl PseudoDecoder {
     /// not statement indices.
     fn ensure_basic_block(&mut self, ip: u64) -> &mut BasicBlock {
         self.basic_blocks.entry(ip).or_default()
-    }
-
-    #[track_caller]
-    fn current_basic_block(&mut self) -> &mut BasicBlock {
-        self.basic_blocks.get_mut(&self.basic_block_ip).unwrap()
     }
 
     fn debug_function(&self) {
@@ -1415,9 +1407,11 @@ enum CmpKind {
 /// bound to them for the current basic block being resolved.
 #[derive(Debug)]
 struct RegisterBlockLocals {
-    /// If relevant, the local variable corresponding to this register family that needs
-    /// to be given by the caller basic blocks.
-    import: Option<LocalRef>,
+    /// If this register is read but is not already bound in the current basic block, it
+    /// needs to be imported from caller basic block(s). This specifies the type of the
+    /// register family local to bind, this register family/type should be present in
+    /// the `register_typed_locals` map.
+    import: Option<Type>,
     /// The last local variable that has been bound to the register family.
     last: LocalRef,
 }
@@ -1435,14 +1429,22 @@ struct TempBlockLocals {
 /// Information about a basic block.
 #[derive(Debug, Default)]
 struct BasicBlock {
-    /// The list of branches statements' index to relocate to point to this basic block
-    /// when the function is finalized. 
+    /// Index of the first statement in the basic block. None means that this basic block
+    /// has been added as a back reference by a branch, this means that we know that a
+    /// branch statement is missing just before the basic block.
+    index: Option<usize>,
+    /// The list of branch statements indices to relocate to point to this basic block
+    /// when the function is finalized. **This is reset between passes.**
     branch_indices_to_relocate: Vec<usize>,
     /// When the basic block has been decoded, it contains the list of register family
     /// and their local that should be correctly bound before branching to the block.
-    imported_locals: Option<Vec<(Register, LocalRef)>>,
-    /// Indicates if this basic block has a correct branch statement. A branch statement
-    /// is correct when the targeted basic block(s) are given the correctly mapped local
-    /// variables depending, this depends on `imported_locals` of target basic block(s).
-    correct_branch: bool,
+    /// **This is kept between passes if no new import is required.**
+    imported_register_locals: Vec<(Register, Type)>,
+    /// Indicates if this basic block has outdated branch statement. A branch statement
+    /// is outdated when the targeted basic block(s) have changed their imported locals
+    /// and therefore this basic block needs to be updated.
+    exported_register_locals_outdated: bool,
+    /// Instruction pointers of basic blocks that branches to this one.
+    /// **This is reset between passes.**
+    backward_ips: Vec<u64>,
 }
