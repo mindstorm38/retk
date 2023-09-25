@@ -2,9 +2,8 @@
 
 use iced_x86::{Decoder, DecoderOptions, Instruction};
 
-
-mod pseudo;
-pub use pseudo::PseudoAnalysis;
+mod early;
+mod idr;
 
 
 /// The x86 backend for analyzer.
@@ -30,15 +29,47 @@ impl<'data> Backend<'data> {
         }
     }
 
-    pub fn goto(&mut self, begin_ip: u64, end_ip: u64) {
+    pub fn analyse(&mut self) {
 
-        let section = self.sections.get_code_section_at(begin_ip)
-            .expect("the given ip is not in a code section");
+        println!("== Analyzing early functions...");
+        let early_functions = early::analyze_early_functions(&mut *self);
+        println!(" = Basic blocks count: {}", early_functions.basic_blocks_count());
+        println!(" = Functions count: {}", early_functions.functions_count());
 
-        let offset = begin_ip - section.begin_addr;
-        self.decoder.goto_range_at(section.pos + offset as usize, begin_ip, end_ip);
+        println!("== Analyzing intermediate decompilation representation...");
+        idr::analyze_idr(&mut *self, &early_functions);
+        println!(" = Done.");
+
+        // println!();
+        
+        // for function in early_functions.iter_functions().take(10) {
+
+        //     let section = self.sections.get_code_section_at(function.begin()).unwrap();
+        //     let offset = function.begin() - section.begin_addr;
+        //     self.decoder.goto_range_at(section.pos + offset as usize, function.begin(), function.end());
+
+        //     while let Some(inst) = self.decoder.decode() {
+        //         if function.contains_block(inst.ip()) {
+        //             println!("================");
+        //         }
+        //         println!("[{:08X}] {inst}", inst.ip());
+        //     }
+
+        //     println!();
+
+        // }
 
     }
+
+    // pub fn goto(&mut self, begin_ip: u64, end_ip: u64) {
+
+    //     let section = self.sections.get_code_section_at(begin_ip)
+    //         .expect("the given ip is not in a code section");
+
+    //     let offset = begin_ip - section.begin_addr;
+    //     self.decoder.goto_range_at(section.pos + offset as usize, begin_ip, end_ip);
+
+    // }
 
 }
 
@@ -53,8 +84,8 @@ pub struct Sections {
 impl Sections {
 
     #[inline]
-    pub fn add_code_section(&mut self, pos: usize, first_addr: u64, last_addr: u64) {
-        self.code.push(Section { pos, begin_addr: first_addr, end_addr: last_addr });
+    pub fn add_code_section(&mut self, pos: usize, begin_addr: u64, end_addr: u64) {
+        self.code.push(Section { pos, begin_addr, end_addr });
     }
 
     /// Returns the maximum code address, 0 if no code sections is set.
@@ -92,8 +123,8 @@ pub struct Section {
 }
 
 
-/// A wrapper for the x86 [`Decoder`] that provides a way to restrict
-/// the decoding to a given range.
+/// A wrapper for the x86 [`Decoder`] that provides a way to restrict the decoding to a 
+/// given range and easily set read position and instruction pointer.
 pub struct RangeDecoder<'data> {
     /// The original decoder.
     decoder: Decoder<'data>,

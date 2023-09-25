@@ -1,4 +1,4 @@
-//! Module for representing a reverse-engineered pseudo-code.
+//! Intermediate Decompilation Representation.
 
 use std::fmt::{self, Write as _};
 use std::io;

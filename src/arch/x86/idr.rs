@@ -1,42 +1,32 @@
-//! Pseudo-code decoder from machine code.
+//! IDR decoder from machine code.
 
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use iced_x86::{Instruction, Code, Register, ConditionCode};
 
-use crate::pseudo::{LocalRef, Function, Statement, Expression, Place, BinaryExpression, Operand, ComparisonOperator};
+use crate::idr::{LocalRef, Function, Statement, Expression, Place, BinaryExpression, Operand, ComparisonOperator};
 use crate::ty::{TypeSystem, Type, PrimitiveType};
-use crate::analyzer::{Analysis, Analyzer};
 
+use super::early::{EarlyFunctions, EarlyFunction};
 use super::Backend;
 
 
-/// This analysis fetch every instruction and construct a first primitive IDR.
-#[derive(Default)]
-pub struct PseudoAnalysis { }
+/// Analyze all IDR functions.
+pub fn analyze_idr(backend: &mut Backend, functions: &EarlyFunctions) {
 
-impl<'data> Analysis<Backend<'data>> for PseudoAnalysis {
+    let mut type_system = TypeSystem::new(backend.pointer_size, 8);
 
-    fn analyze(&mut self, analyzer: &mut Analyzer<Backend<'data>>) {
-        
-        let decoder = &mut analyzer.backend.decoder;
-        let mut pseudo_decoder = PseudoDecoder::new();
+    for function in functions.iter_functions().take(10) {
 
-        // Start from the first section.
-        let Some(section) = analyzer.backend.sections.code.first() else {
-            return;
-        };
+        let section = backend.sections.get_code_section_at(function.begin()).unwrap();
+        let offset = function.begin() - section.begin_addr;
+        backend.decoder.goto_range_at(section.pos + offset as usize, function.begin(), function.end());
 
-        decoder.goto_range_at(section.pos, section.begin_addr, section.end_addr);
+        let mut decoder = IdrDecoder::new(&mut type_system, function);
 
-        let mut i = 0;
-        while let Some(inst) = decoder.decode() {
-            pseudo_decoder.feed(inst);
-            i += 1;
-            if i > 200 {
-                break
-            }
+        while let Some(inst) = backend.decoder.decode() {
+            decoder.feed(inst);
         }
 
     }
@@ -44,17 +34,17 @@ impl<'data> Analysis<Backend<'data>> for PseudoAnalysis {
 }
 
 
-/// The pseudo-code decoder from sequence of x86 instructions.
+/// The IDR decoder from sequence of x86 instructions.
 /// 
 /// This structure is not yet optimized for performance, many hash maps are not suited
 /// for performance and can be replaced, but it's simpler for now!
-struct PseudoDecoder {
-    /// Mapping of all already decoded functions to their instruction pointer.
-    functions: HashMap<u64, Function>,
+struct IdrDecoder<'e, 't> {
+    /// Type system.
+    type_system: &'t mut TypeSystem,
+    /// The early data of the function being decoded.
+    early_function: EarlyFunction<'e>,
     /// Internal pseudo function being decoded.
     function: Function,
-    /// The type system we use to compute type sizes and support structs.
-    type_system: TypeSystem,
     /// Current stack pointer value.
     /// **This is reset between passes.**
     stack_pointer: i32,
@@ -74,135 +64,139 @@ struct PseudoDecoder {
     /// For each type of data, provides an allocator temporary local variables, these
     /// variables should not cross basic block boundaries.
     temp_block_locals: HashMap<Type, TempBlockLocals>,
-    /// Mapping of basic blocks to their first instruction pointer.
+    /// Additional informations about basic blocks, these basic blocks are guaranteed
+    /// to also be present in the early function's basic blocks.
     basic_blocks: HashMap<u64, BasicBlock>,
-    /// First instruction pointer of the current function.
-    function_ip: Option<u64>,
-    /// First instruction pointer of the current basic block.
-    basic_block_ip: Option<u64>,
+    /// Instruction pointer of the current basic block being decoded.
+    basic_block_ip: u64,
     /// Information about the last comparison. 
     /// **This is reset between passes.**
     last_cmp: Option<Cmp>,
 }
 
-impl PseudoDecoder {
+impl<'e, 't> IdrDecoder<'e, 't> {
 
-    fn new() -> Self {
+    fn new(type_system: &'t mut TypeSystem, early_function: EarlyFunction<'e>) -> Self {
         Self {
-            functions: HashMap::new(),
+            type_system,
+            early_function,
             function: Function::default(),
-            type_system: TypeSystem::new(64, 8),
             stack_pointer: 0,
             stack_locals: HashMap::new(),
             register_typed_locals: HashMap::new(),
             register_block_locals: HashMap::new(),
             temp_block_locals: HashMap::new(),
             basic_blocks: HashMap::new(),
-            function_ip: None,
-            basic_block_ip: None,
+            basic_block_ip: 0, // Will be initialized at first instruction.
             last_cmp: None,
         }
     }
     
     /// Finalize the current function, save it and reset the state to go to the next one.
-    fn finalize_function(&mut self) -> Option<u64> {
+    fn finalize_function(&mut self) {
 
         // Finalize the last basic block if relevant before finalizing the function.
-        self.finalize_basic_block();
+        self.finalize_basic_block(u64::MAX);  // FIXME: Avoid calling this in finalize function because last statement is always 'Return'.
 
-        // Check if there are missing basic blocks.
-        let mut need_another_pass = false;
+        println!("self.basic_blocks: {:?}", self.basic_blocks);
 
         // Finalize all basic block and ensure that they are existing.
         for block in self.basic_blocks.values_mut() {
-            if block.exported_register_locals_outdated {
-                need_another_pass = true;
-            } else if let Some(index) = block.index {
-                // If the basic block is valid, relocate all branches to point to it.
-                // NOTE: We drain this relocation list because we don't want to keep it 
-                // for the next pass, it will be reconstructed as needed.
-                for branch_index in block.branch_indices_to_relocate.drain(..) {
-                    match &mut self.function.statements[branch_index] {
-                        Statement::Branch { branch } => *branch = index,
-                        Statement::BranchConditional { branch_true, .. } => *branch_true = index,
-                        stmt => panic!("statement cannot be relocated: {stmt:?}"),
-                    }
+            let index = block.begin_index.expect("block decoding is missing");
+            // If the basic block is valid, relocate all branches to point to it.
+            // NOTE: We drain this relocation list because we don't want to keep it 
+            // for the next pass, it will be reconstructed as needed.
+            for branch_index in block.branch_indices_to_relocate.drain(..) {
+                match &mut self.function.statements[branch_index] {
+                    Statement::Branch { branch } => *branch = index,
+                    Statement::BranchConditional { branch_true, .. } => *branch_true = index,
+                    stmt => panic!("statement cannot be relocated: {stmt:?}"),
                 }
-            } else {
-                // The basic block was not know when decoding its statements, we need
-                // another pass where it will know that.
-                need_another_pass = true;
             }
         }
 
-        println!("basic blocks: {:?}", self.basic_blocks);
-        println!("need_another_pass: {need_another_pass}");
+        // Here we want to fix every basic block's exported variable for its branches.
+        let mut export_fixes = HashSet::new();
+        let mut branches_imports = Vec::new();
+        for (&block_ip, block) in &self.basic_blocks {
+
+            if let Some(true_branch) = block.true_branch {
+                let true_block = self.basic_blocks.get(&true_branch).unwrap();
+                branches_imports.extend(true_block.iter_import_register_locals());
+            }
+
+            if let Some(false_branch) = block.false_branch {
+                let false_block = self.basic_blocks.get(&false_branch).unwrap();
+                branches_imports.extend(false_block.iter_import_register_locals());
+            }
+            
+            // For each imported local/register in the branch block, check if we have this
+            // register.
+            for (register, import_local) in branches_imports.drain(..) {
+                if let Some(self_locals) = self.register_block_locals.get(&register) {
+                    if self_locals.last == import_local {
+                        // Nothing to do, we already export this variable.
+                    } else {
+                        // We already used the register, but it's of the wrong type.
+                        export_fixes.insert(ExportFix {
+                            block_ip,
+                            kind: ExportFixKind::Cast { 
+                                from: self_locals.last,
+                                to: import_local,
+                            }
+                        });
+                    }
+                } else {
+                    // We don't know the register yet.
+                    export_fixes.insert(ExportFix {
+                        block_ip,
+                        kind: ExportFixKind::Import { 
+                            register, 
+                            local: import_local,
+                        }
+                    });
+                }
+            }
+
+        }
+
+        println!("export_fixes: {export_fixes:?}");
 
         self.debug_function();
 
-        let function_ip = self.function_ip.unwrap();
-
-        // Reset states that should not stay to another pass or another function.
-        self.stack_pointer = 0;
-        self.stack_locals.clear();
-        self.function_ip = None;
-        self.basic_block_ip = None;
-        
-        if need_another_pass {
-
-            // Clear function's statement because the second pass recreate them.
-            self.function.statements.clear();
-            Some(function_ip)
-
-        } else {
-
-            // Continuing to another function, we don't keep basic blocks.
-            self.basic_blocks.clear();
-            self.temp_block_locals.clear();
-            self.register_typed_locals.clear();
-
-            // Save the function for later...
-            self.functions.insert(function_ip, std::mem::take(&mut self.function));
-
-            None
-
-        }
-
     }
 
-    /// Finalize the current basic block, reset the state to go to the next one. 
-    fn finalize_basic_block(&mut self) {
+    /// Finalize the current basic block, reset the state to go to the next one. This
+    /// should be called directly after insertion of the branch statement of the basic
+    /// block.
+    fn finalize_basic_block(&mut self, next_ip: u64) {
 
-        let Some(block_ip) = self.basic_block_ip else { return };
-        let block = self.basic_blocks.get_mut(&block_ip).unwrap();
+        let mut added_branch = false;
 
-        // Compute the register family/local tuple that this basic block needs.
-        // Also drain because we don't want to keep these for the next basic block.
-        let imported_locals = self.register_block_locals.drain()
-            .filter_map(|(register, locals)| locals.import.map(|local| (register, local)))
-            .collect::<Vec<_>>();
-
-        // If the current imported locals has not the same length, we know that a new
-        // register has been added. Registers that were already present should not have
-        // changed their required type.
-        if imported_locals.len() != block.imported_register_locals.len() {
-
-            debug_assert!(imported_locals.len() > block.imported_register_locals.len(),
-                "imported locals cannot shrink between passes");
-            
-            block.imported_register_locals = imported_locals;
-
-            // We can take because backward ips should be reset between passes.
-            let backward_ips = std::mem::take(&mut block.backward_ips);
-
-            // For each backward ip, we invalidate the block to let it know that some of
-            // its branch has more imported locals.
-            for backward_block_ip in backward_ips {
-                self.basic_blocks.get_mut(&backward_block_ip).unwrap()
-                    .exported_register_locals_outdated = true;
+        if let Some(stmt) = self.function.statements.last() {
+            // Add a simple branch if not already the case to ensure that the block exits.
+            if !stmt.is_branch() {
+                // NOTE: Can't use 'push_statement' because of borrowing.
+                let branch_index = self.function.statements.len();
+                self.function.statements.push(Statement::Branch { branch: branch_index + 1 });
+                added_branch = true;
             }
-
+        } else {
+            // This function is called for the first instruction when initializing the 
+            // first basic block, in this case there is no current basic block.
+            return;
         }
+
+        let block = self.basic_blocks.get_mut(&self.basic_block_ip).unwrap();        
+        block.branch_index = Some(self.function.statements.len() - 1);
+        
+        if added_branch {
+            block.true_branch = Some(next_ip);
+        }
+
+        // Steal register block locals, will be used when finalizing the function to
+        // add missing registers 
+        block.register_locals = std::mem::take(&mut self.register_block_locals);
 
         // Don't track comparisons across basic blocks.
         self.last_cmp = None;
@@ -946,7 +940,6 @@ impl PseudoDecoder {
             }
         }
 
-        // FIXME: Move this after exported registers.
         let branch_index = self.push_statement_with(|index| {
             Statement::BranchConditional { 
                 value: cond_expr, 
@@ -955,22 +948,14 @@ impl PseudoDecoder {
             }
         });
 
-        let block_ip = self.basic_block_ip.unwrap();
-        let mut imported_locals = Vec::new();
+        let block = self.basic_blocks.get_mut(&self.basic_block_ip).unwrap();
+        block.true_branch = Some(pointer);
+        block.false_branch = Some(inst.next_ip());
 
         // We added a branch statement, this implied existence of two basic blocks.
         let true_block = self.ensure_basic_block(pointer);
         true_block.branch_indices_to_relocate.push(branch_index);
-        true_block.backward_ips.push(block_ip);
-        imported_locals.extend_from_slice(&true_block.imported_register_locals);
-
-        let false_block = self.ensure_basic_block(inst.next_ip());
-        false_block.backward_ips.push(block_ip);
-        imported_locals.extend_from_slice(&false_block.imported_register_locals);
-
-        for (register, ty) in imported_locals {
-            self.decode_register(register, ty, true);
-        }
+        let _false_block = self.ensure_basic_block(inst.next_ip());
 
     }
 
@@ -978,88 +963,39 @@ impl PseudoDecoder {
 
         let pointer = inst.near_branch64();
         
-        // FIXME: Move this after exported registers.
         let branch_index = self.push_statement(Statement::Branch { branch: 0 });
+        let block = self.basic_blocks.get_mut(&self.basic_block_ip).unwrap();
+        block.true_branch = Some(pointer);
 
-        let block_ip = self.basic_block_ip.unwrap();
-
-        // Read above.
+        // TODO: For tail-call, the pointed basic block may no exists! Support tail-call.
         let target_block = self.ensure_basic_block(pointer);
         target_block.branch_indices_to_relocate.push(branch_index);
-        target_block.backward_ips.push(block_ip);
-        let imported_locals = target_block.imported_register_locals.clone();
-
-        self.ensure_basic_block(inst.next_ip());
-
-        for (register, ty) in imported_locals {
-            self.decode_register(register, ty, true);
-        }
 
     }
 
-    fn decode_ret(&mut self, _inst: &Instruction) -> Option<u64> {
+    fn decode_ret(&mut self, _inst: &Instruction) {
 
         let ret_place = self.decode_register_preserve(Register::RAX, TY_PTR_DIFF);
         self.push_statement(Statement::Return(ret_place));
-
-        // Return statement goes nowhere so exported locals are correct.
-        // self.current_basic_block().exported_locals_correct = true;
-        self.finalize_function()
+        self.finalize_function();
 
     }
 
     /// Feed a new instruction to the decoder, if some instruction is returned, the 
     /// feeder must goto to the given instruction and start feed from it.
-    fn feed(&mut self, inst: &Instruction) -> Option<u64> {
+    fn feed(&mut self, inst: &Instruction) {
 
         let ip = inst.ip();
         println!("[{:08X}] {inst}", ip);
 
-        if self.function_ip.is_none() {
-            match inst.code() {
-                Code::Nopw |
-                Code::Nopd |
-                Code::Nopq |
-                Code::Nop_rm16 |
-                Code::Nop_rm32 |
-                Code::Nop_rm64 |
-                Code::Int3 => return None,
-                _ => {
-                    // Initialize the start pointer of the function.
-                    self.function_ip = Some(ip);
-                    // There is _always_ at least one basic block starting at entry.
-                    self.basic_blocks.clear();
-                    self.basic_blocks.insert(ip, BasicBlock::default());
-                }
-            }
-        };
-
-        let mut next_block_ip = None;
-
-        // Check if this instruction is the starting point of a new basic block.
-        if let Some(block) = self.basic_blocks.get_mut(&ip) {
-            // If a basic block starts at this instruction, we should add a branch statement
-            // before decoding this instruction (if not already the case), so that future 
-            // statements will be in a new basic block.
-            if let Some(stmt) = self.function.statements.last() {
-                if !stmt.is_branch() {
-                    // NOTE: Can't use 'push_statement' because of borrowing.
-                    let branch_index = self.function.statements.len();
-                    self.function.statements.push(Statement::Branch { branch: branch_index + 1 });
-                    // We added an artificial branch, register the current block as the
-                    // parent of the next one.
-                    block.backward_ips.push(self.basic_block_ip.unwrap());
-                }
-            }
-            // Update the index of the basic block to point to the future statement.
-            block.index = Some(self.function.statements.len());
-            next_block_ip = Some(ip);
-        }
-        
-        // If we need to go switch to a new basic block, finalize the current one.
-        if let Some(next_block_ip) = next_block_ip {
-            self.finalize_basic_block();
-            self.basic_block_ip = Some(next_block_ip);
+        if self.early_function.contains_block(ip) {
+            // Once that we made sure that a branch statement is present, finalize it.
+            self.finalize_basic_block(ip);
+            // Prepare next basic block.
+            let block = self.basic_blocks.entry(ip).or_default();
+            block.begin_index = Some(self.function.statements.len());
+            // Set the new basic block ip being decoded.
+            self.basic_block_ip = ip;
         }
 
         match inst.code() {
@@ -1214,7 +1150,7 @@ impl PseudoDecoder {
             Code::Retfw |
             Code::Retfq_imm16 |
             Code::Retfd_imm16 |
-            Code::Retfw_imm16 => return self.decode_ret(inst),
+            Code::Retfw_imm16 => self.decode_ret(inst),
             // NOP
             Code::Nopw |
             Code::Nopd |
@@ -1229,8 +1165,6 @@ impl PseudoDecoder {
             }
         }
 
-        None
-        
     }
 
     fn add_sp(&mut self, delta: i32) {
@@ -1274,7 +1208,7 @@ impl PseudoDecoder {
             }
             Entry::Vacant(v) => {
                 v.insert(RegisterBlockLocals { 
-                    import: import.then_some(ty),  // Only import if requested.
+                    import: import.then_some(local),  // Only import if requested.
                     last: local,
                 });
             }
@@ -1336,16 +1270,16 @@ impl PseudoDecoder {
         self.push_statement(Statement::Assign { place, value })
     }
 
-    /// Ensure that a basic block exists at the given instruction and returns a reference
-    /// to it. These basic blocks are different from implied basic blocks into the 
-    /// decoded function, because they are mapped to start instruction pointers, and
-    /// not statement indices.
+    /// Ensure that a basic block is existing at the given ip, for debugging purpose this
+    /// function panics if the given ip is not containing within early function.
+    #[track_caller]
     fn ensure_basic_block(&mut self, ip: u64) -> &mut BasicBlock {
+        assert!(self.early_function.contains_block(ip), "incoherent basic block with early function");
         self.basic_blocks.entry(ip).or_default()
     }
 
     fn debug_function(&self) {
-        crate::pseudo::write_function(std::io::stdout().lock(), &self.function, &self.type_system).unwrap();
+        crate::idr::write_function(std::io::stdout().lock(), &self.function, &self.type_system).unwrap();
     }
 
 }
@@ -1411,7 +1345,7 @@ struct RegisterBlockLocals {
     /// needs to be imported from caller basic block(s). This specifies the type of the
     /// register family local to bind, this register family/type should be present in
     /// the `register_typed_locals` map.
-    import: Option<Type>,
+    import: Option<LocalRef>,
     /// The last local variable that has been bound to the register family.
     last: LocalRef,
 }
@@ -1432,19 +1366,52 @@ struct BasicBlock {
     /// Index of the first statement in the basic block. None means that this basic block
     /// has been added as a back reference by a branch, this means that we know that a
     /// branch statement is missing just before the basic block.
-    index: Option<usize>,
+    begin_index: Option<usize>,
+    /// Index of the the branch statement of this basic block, by definition this is the
+    /// last and only branch statement in this basic block.
+    /// FIXME: Currently useless!
+    branch_index: Option<usize>,
     /// The list of branch statements indices to relocate to point to this basic block
     /// when the function is finalized. **This is reset between passes.**
     branch_indices_to_relocate: Vec<usize>,
-    /// When the basic block has been decoded, it contains the list of register family
-    /// and their local that should be correctly bound before branching to the block.
-    /// **This is kept between passes if no new import is required.**
-    imported_register_locals: Vec<(Register, Type)>,
-    /// Indicates if this basic block has outdated branch statement. A branch statement
-    /// is outdated when the targeted basic block(s) have changed their imported locals
-    /// and therefore this basic block needs to be updated.
-    exported_register_locals_outdated: bool,
-    /// Instruction pointers of basic blocks that branches to this one.
-    /// **This is reset between passes.**
-    backward_ips: Vec<u64>,
+    /// Instruction pointer of the basic block taken if condition is true.
+    true_branch: Option<u64>,
+    /// Instruction pointer of the basic block token if condition is false.
+    false_branch: Option<u64>,
+    /// Per register family usage.
+    register_locals: HashMap<Register, RegisterBlockLocals>,
+}
+
+impl BasicBlock {
+
+    /// Iterate over all register locals that were used by this basic block and needs to
+    /// be imported from through the given local (mapped to the given register family).
+    fn iter_import_register_locals(&self) -> impl Iterator<Item = (Register, LocalRef)> + '_ {
+        self.register_locals.iter().filter_map(|(&register, locals)| {
+            Some((register, locals.import?))
+        })
+    }
+
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ExportFix {
+    block_ip: u64,
+    kind: ExportFixKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ExportFixKind {
+    /// The export can be fixed by casting from one variable to another.
+    Cast {
+        from: LocalRef,
+        to: LocalRef,
+    },
+    /// The export can be fixed by importing the variable from outside.
+    Import {
+        /// The register family containing the local variable to import.
+        register: Register,
+        /// The local variable to import.
+        local: LocalRef,
+    },
 }

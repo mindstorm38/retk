@@ -8,9 +8,9 @@ use std::fmt::Write;
 /// The type system.
 pub struct TypeSystem {
     /// Pointer size on this system, in bits.
-    pointer_size: u64,
+    pointer_size: u32,
     /// Size of bytes on this system, in bits.
-    byte_size: u64,
+    byte_size: u32,
     /// Cache for type names (TODO: rework it to avoid needing mutation).
     _name_cache: HashMap<Type, String>,
     /// The list of struct definitions.
@@ -19,7 +19,7 @@ pub struct TypeSystem {
 
 impl TypeSystem {
 
-    pub fn new(pointer_size: u64, byte_size: u64) -> Self {
+    pub fn new(pointer_size: u32, byte_size: u32) -> Self {
         Self { 
             pointer_size,
             byte_size,
@@ -29,12 +29,12 @@ impl TypeSystem {
     }
 
     /// Get the pointer size of this type system, int bits.
-    pub fn pointer_size(&self) -> u64 {
+    pub fn pointer_size(&self) -> u32 {
         self.pointer_size
     }
 
     /// Get the byte size of this type system, int bits.
-    pub fn byte_size(&self) -> u64 {
+    pub fn byte_size(&self) -> u32 {
         self.byte_size
     }
 
@@ -72,20 +72,20 @@ impl TypeSystem {
 
     /// Round the given number of bits up to get the number of bytes needed to store.
     pub fn bits_to_bytes(&self, bits: u64) -> u32 {
-        u32::try_from((bits + self.byte_size - 1) / self.byte_size)
+        u32::try_from((bits + self.byte_size as u64 - 1) / self.byte_size as u64)
             .expect("to much bits")
     }
 
     /// Calculate the number of bits given a number of bytes.
     pub fn bytes_to_bits(&self, bytes: u32) -> u64 {
-        bytes as u64 * self.byte_size
+        bytes as u64 * self.byte_size as u64
     }
 
     /// Return the layout of the given type
     pub fn layout(&self, ty: Type) -> Option<Layout> {
 
         if ty.indirection != 0 {
-            let bytes = self.bits_to_bytes(self.pointer_size);
+            let bytes = self.bits_to_bytes(self.pointer_size as u64);
             return Some(Layout { size: bytes, align: bytes });
         }
 

@@ -15,18 +15,15 @@ use object::pe::ImageNtHeaders64;
 use object::LittleEndian as LE;
 
 pub mod ty;
-pub mod pseudo;
-
-pub mod analyzer;
+pub mod idr;
 pub mod arch;
 
 
 pub fn analyse(data: &[u8]) {
 
-    use analyzer::Analyzer;
     use arch::x86;
 
-    let mut analyzer = Analyzer::new(x86::Backend::new(data, 64), 8);
+    let mut backend = x86::Backend::new(data, 64);
 
     // LOADING PE //
 
@@ -72,7 +69,7 @@ pub fn analyse(data: &[u8]) {
         if section.kind() == SectionKind::Text {
             if let Some((pos, size)) = section.file_range() {
                 let addr = section.address();
-                analyzer.backend.sections.add_code_section(pos as usize, addr, addr + size);
+                backend.sections.add_code_section(pos as usize, addr, addr + size);
             }
         }
     }
@@ -87,8 +84,7 @@ pub fn analyse(data: &[u8]) {
     // analyzer.run(common::FunctionGraphAnalysis::default());
     // println!("done: {} functions", analyzer.database.functions.len());
 
-    // analyzer.run(x86::IdrAnalysis::default());
-    analyzer.run(x86::PseudoAnalysis::default());
+    backend.analyse();
 
     // let func = &analyzer.database.functions[&0x1409AB740];
     // let begin_ip = func.body.as_ref().unwrap().begin_ip;
