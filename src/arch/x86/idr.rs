@@ -13,21 +13,24 @@ use super::Backend;
 
 
 /// Analyze all IDR functions.
-pub fn analyze_idr(backend: &mut Backend, functions: &EarlyFunctions) {
+pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
 
     let mut type_system = TypeSystem::new(backend.pointer_size, 8);
+    let mut functions = HashMap::new();
 
-    for function in functions.iter_functions().take(10) {
+    for early_function in early_functions.iter_functions().take(10) {
 
-        let section = backend.sections.get_code_section_at(function.begin()).unwrap();
-        let offset = function.begin() - section.begin_addr;
-        backend.decoder.goto_range_at(section.pos + offset as usize, function.begin(), function.end());
+        let section = backend.sections.get_code_section_at(early_function.begin()).unwrap();
+        let offset = early_function.begin() - section.begin_addr;
+        backend.decoder.goto_range_at(section.pos + offset as usize, early_function.begin(), early_function.end());
 
-        let mut decoder = IdrDecoder::new(&mut type_system, function);
+        let mut decoder = IdrDecoder::new(&mut type_system, early_function);
 
         while let Some(inst) = backend.decoder.decode() {
             decoder.feed(inst);
         }
+
+        functions.insert(decoder.early_function.begin(), decoder.function);
 
     }
 
@@ -98,8 +101,6 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         // Finalize the last basic block if relevant before finalizing the function.
         self.finalize_basic_block(u64::MAX);  // FIXME: Avoid calling this in finalize function because last statement is always 'Return'.
 
-        println!("self.basic_blocks: {:?}", self.basic_blocks);
-
         // Finalize all basic block and ensure that they are existing.
         for block in self.basic_blocks.values_mut() {
             let index = block.begin_index.expect("block decoding is missing");
@@ -118,49 +119,108 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         // Here we want to fix every basic block's exported variable for its branches.
         let mut export_fixes = HashSet::new();
         let mut branches_imports = Vec::new();
-        for (&block_ip, block) in &self.basic_blocks {
+        let mut cast_statements = Vec::new();
 
-            if let Some(true_branch) = block.true_branch {
-                let true_block = self.basic_blocks.get(&true_branch).unwrap();
-                branches_imports.extend(true_block.iter_import_register_locals());
-            }
+        for _ in 0..100 {
 
-            if let Some(false_branch) = block.false_branch {
-                let false_block = self.basic_blocks.get(&false_branch).unwrap();
-                branches_imports.extend(false_block.iter_import_register_locals());
-            }
-            
-            // For each imported local/register in the branch block, check if we have this
-            // register.
-            for (register, import_local) in branches_imports.drain(..) {
-                if let Some(self_locals) = self.register_block_locals.get(&register) {
-                    if self_locals.last == import_local {
-                        // Nothing to do, we already export this variable.
+            for (&block_ip, block) in &self.basic_blocks {
+
+                if let Some(true_branch) = block.true_branch {
+                    let true_block = self.basic_blocks.get(&true_branch).unwrap();
+                    branches_imports.extend(true_block.iter_import_register_locals());
+                }
+
+                if let Some(false_branch) = block.false_branch {
+                    let false_block = self.basic_blocks.get(&false_branch).unwrap();
+                    branches_imports.extend(false_block.iter_import_register_locals());
+                }
+                
+                // For each imported local/register in the branch block, check if we have this
+                // register.
+                for (register, import_local) in branches_imports.drain(..) {
+                    if let Some(self_locals) = block.register_locals.get(&register) {
+                        if self_locals.last == import_local {
+                            // Nothing to do, we already export this variable.
+                        } else {
+                            // We already used the register, but it's of the wrong type.
+                            export_fixes.insert(ExportFix {
+                                block_ip,
+                                register,
+                                kind: ExportFixKind::Cast { 
+                                    from: self_locals.last,
+                                    to: import_local,
+                                }
+                            });
+                        }
                     } else {
-                        // We already used the register, but it's of the wrong type.
+                        // We don't know the register yet.
                         export_fixes.insert(ExportFix {
                             block_ip,
-                            kind: ExportFixKind::Cast { 
-                                from: self_locals.last,
-                                to: import_local,
+                            register,
+                            kind: ExportFixKind::Import { 
+                                local: import_local,
                             }
                         });
                     }
-                } else {
-                    // We don't know the register yet.
-                    export_fixes.insert(ExportFix {
-                        block_ip,
-                        kind: ExportFixKind::Import { 
-                            register, 
-                            local: import_local,
-                        }
-                    });
                 }
+
+            }
+
+            // We converged toward no fixes, break loop to apply fixes if any.
+            if export_fixes.is_empty() { break; }
+
+            for export_fix in export_fixes.drain() {
+                let block = self.basic_blocks.get_mut(&export_fix.block_ip).unwrap();
+                match export_fix.kind {
+                    ExportFixKind::Cast { from, to } => {
+                        // We need to a cast assignment expression just before the branch.
+                        let branch_index = block.branch_index.unwrap();
+                        cast_statements.push((branch_index, Statement::Assign { 
+                            place: Place::new_direct(to), 
+                            value: Expression::Cast(from),
+                        }));
+                        // This register is already existing, we just update last local.
+                        block.register_locals.get_mut(&export_fix.register).unwrap().last = to;
+                    }
+                    ExportFixKind::Import { local } => {
+                        // This register local was missing, add it as import-only.
+                        block.register_locals.insert(export_fix.register, RegisterBlockLocals { 
+                            import: Some(local), 
+                            last: local,
+                        });
+                    }
+                };
+                
             }
 
         }
 
-        println!("export_fixes: {export_fixes:?}");
+        cast_statements.sort_unstable_by_key(|&(index, _)| index);
+
+        let count_cast_before = |index: usize| {
+            match cast_statements.binary_search_by_key(&index, |&(index, _)| index) {
+                Ok(index) => index,
+                Err(index) => index,
+            }
+        };
+
+        for statement in &mut self.function.statements {
+            match statement {
+                Statement::BranchConditional { branch_true, branch_false, .. } => {
+                    *branch_true += count_cast_before(*branch_true);
+                    *branch_false += count_cast_before(*branch_false);
+                }
+                Statement::Branch { branch } => {
+                    *branch += count_cast_before(*branch);
+                }
+                _ => {}
+            }
+        }
+
+        // Insert in reverse order to indices are valid.
+        for (index, stmt) in cast_statements.into_iter().rev() {
+            self.function.statements.insert(index, stmt);
+        }
 
         self.debug_function();
 
@@ -1369,7 +1429,6 @@ struct BasicBlock {
     begin_index: Option<usize>,
     /// Index of the the branch statement of this basic block, by definition this is the
     /// last and only branch statement in this basic block.
-    /// FIXME: Currently useless!
     branch_index: Option<usize>,
     /// The list of branch statements indices to relocate to point to this basic block
     /// when the function is finalized. **This is reset between passes.**
@@ -1396,7 +1455,10 @@ impl BasicBlock {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ExportFix {
+    /// The block instruction pointer we want to fix.
     block_ip: u64,
+    /// The register family of the local variable to export.
+    register: Register,
     kind: ExportFixKind,
 }
 
@@ -1409,8 +1471,6 @@ enum ExportFixKind {
     },
     /// The export can be fixed by importing the variable from outside.
     Import {
-        /// The register family containing the local variable to import.
-        register: Register,
         /// The local variable to import.
         local: LocalRef,
     },
