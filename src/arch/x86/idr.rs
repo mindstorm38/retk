@@ -18,7 +18,7 @@ pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
     let mut type_system = TypeSystem::new(backend.pointer_size, 8);
     let mut functions = HashMap::new();
 
-    for early_function in early_functions.iter_functions().take(10) {
+    for early_function in early_functions.iter_functions() {
 
         let section = backend.sections.get_code_section_at(early_function.begin()).unwrap();
         let offset = early_function.begin() - section.begin_addr;
@@ -98,9 +98,6 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     /// Finalize the current function, save it and reset the state to go to the next one.
     fn finalize_function(&mut self) {
 
-        // Finalize the last basic block if relevant before finalizing the function.
-        self.finalize_basic_block(u64::MAX);  // FIXME: Avoid calling this in finalize function because last statement is always 'Return'.
-
         // Finalize all basic block and ensure that they are existing.
         for block in self.basic_blocks.values_mut() {
             let index = block.begin_index.expect("block decoding is missing");
@@ -119,7 +116,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         // Here we want to fix every basic block's exported variable for its branches.
         let mut export_fixes = HashSet::new();
         let mut branches_imports = Vec::new();
-        let mut cast_statements = Vec::new();
+        let mut new_statements = Vec::new();
 
         for _ in 0..100 {
 
@@ -175,7 +172,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                     ExportFixKind::Cast { from, to } => {
                         // We need to a cast assignment expression just before the branch.
                         let branch_index = block.branch_index.unwrap();
-                        cast_statements.push((branch_index, Statement::Assign { 
+                        new_statements.push((branch_index, Statement::Assign { 
                             place: Place::new_direct(to), 
                             value: Expression::Cast(from),
                         }));
@@ -195,10 +192,13 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
         }
 
-        cast_statements.sort_unstable_by_key(|&(index, _)| index);
+        // Our statements need to be order in order to use binary search on them.
+        new_statements.sort_unstable_by_key(|&(index, _)| index);
 
-        let count_cast_before = |index: usize| {
-            match cast_statements.binary_search_by_key(&index, |&(index, _)| index) {
+        // Temporary function to count how many statements will be added before a given
+        // statement index.
+        let count_statements_before = |index: usize| {
+            match new_statements.binary_search_by_key(&index, |&(index, _)| index) {
                 Ok(index) => index,
                 Err(index) => index,
             }
@@ -207,51 +207,38 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         for statement in &mut self.function.statements {
             match statement {
                 Statement::BranchConditional { branch_true, branch_false, .. } => {
-                    *branch_true += count_cast_before(*branch_true);
-                    *branch_false += count_cast_before(*branch_false);
+                    *branch_true += count_statements_before(*branch_true);
+                    *branch_false += count_statements_before(*branch_false);
                 }
                 Statement::Branch { branch } => {
-                    *branch += count_cast_before(*branch);
+                    *branch += count_statements_before(*branch);
                 }
                 _ => {}
             }
         }
 
         // Insert in reverse order to indices are valid.
-        for (index, stmt) in cast_statements.into_iter().rev() {
+        for (index, stmt) in new_statements.into_iter().rev() {
             self.function.statements.insert(index, stmt);
         }
 
-        self.debug_function();
+        // self.debug_function();
 
     }
 
     /// Finalize the current basic block, reset the state to go to the next one. This
     /// should be called directly after insertion of the branch statement of the basic
     /// block.
-    fn finalize_basic_block(&mut self, next_ip: u64) {
-
-        let mut added_branch = false;
-
-        if let Some(stmt) = self.function.statements.last() {
-            // Add a simple branch if not already the case to ensure that the block exits.
-            if !stmt.is_branch() {
-                // NOTE: Can't use 'push_statement' because of borrowing.
-                let branch_index = self.function.statements.len();
-                self.function.statements.push(Statement::Branch { branch: branch_index + 1 });
-                added_branch = true;
-            }
-        } else {
-            // This function is called for the first instruction when initializing the 
-            // first basic block, in this case there is no current basic block.
-            return;
-        }
+    /// 
+    /// The true branch can be forced to a given value if needed, this is used if a 
+    /// branch statement has been artificially added to form a new basic block.
+    fn finalize_basic_block(&mut self, add_true_branch: Option<u64>) {
 
         let block = self.basic_blocks.get_mut(&self.basic_block_ip).unwrap();        
         block.branch_index = Some(self.function.statements.len() - 1);
         
-        if added_branch {
-            block.true_branch = Some(next_ip);
+        if let Some(true_branch) = add_true_branch {
+            block.true_branch = Some(true_branch);
         }
 
         // Steal register block locals, will be used when finalizing the function to
@@ -1037,6 +1024,9 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
         let ret_place = self.decode_register_preserve(Register::RAX, TY_PTR_DIFF);
         self.push_statement(Statement::Return(ret_place));
+
+        // We directly finalize the basic block here because our function ends here.
+        self.finalize_basic_block(None);
         self.finalize_function();
 
     }
@@ -1046,11 +1036,22 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     fn feed(&mut self, inst: &Instruction) {
 
         let ip = inst.ip();
-        println!("[{:08X}] {inst}", ip);
+        // println!("[{:08X}] {inst}", ip);
 
         if self.early_function.contains_block(ip) {
-            // Once that we made sure that a branch statement is present, finalize it.
-            self.finalize_basic_block(ip);
+            if let Some(stmt) = self.function.statements.last() {
+                let mut add_true_branch = None;
+                // Add a simple branch if not already the case to ensure that the block exits.
+                if !stmt.is_branch() {
+                    // NOTE: Can't use 'push_statement' because of borrowing.
+                    let branch_index = self.function.statements.len();
+                    self.function.statements.push(Statement::Branch { branch: branch_index + 1 });
+                    add_true_branch = Some(ip);
+                }
+                // If there is at least one statement, this mean that we are past the 
+                // first basic block, we can finalize the current one.
+                self.finalize_basic_block(add_true_branch);
+            }
             // Prepare next basic block.
             let block = self.basic_blocks.entry(ip).or_default();
             block.begin_index = Some(self.function.statements.len());
@@ -1229,12 +1230,12 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
     fn add_sp(&mut self, delta: i32) {
         self.stack_pointer += delta;
-        println!("  sp: {}", self.stack_pointer);
+        // println!("  sp: {}", self.stack_pointer);
     }
 
     fn sub_sp(&mut self, delta: i32) {
         self.stack_pointer -= delta;
-        println!("  sp: {}", self.stack_pointer);
+        // println!("  sp: {}", self.stack_pointer);
     }
 
     /// Decode a register access for the given type, if the tuple register/ty doesn't
