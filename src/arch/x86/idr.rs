@@ -21,6 +21,9 @@ pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
 
     let functions_count = early_functions.functions_count();
 
+    let mut missing_mnemonics = HashMap::<_, usize>::new();
+    let mut missing_opcodes = HashMap::<_, usize>::new();
+
     'func: for (i, early_function) in early_functions.iter_functions().enumerate() {
 
         print!(" = At {:08X} ({:03}%)... ", early_function.begin(), i as f32 / functions_count as f32 * 100.0);
@@ -33,8 +36,15 @@ pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
 
         while let Some(inst) = backend.decoder.decode() {
             if let Err(e) = decoder.feed(inst) {
+
+                if let Some(inst) = e.downcast_ref::<Instruction>() {
+                    *missing_mnemonics.entry(inst.mnemonic()).or_default() += 1;
+                    *missing_opcodes.entry(inst.code()).or_default() += 1;
+                }
+
                 println!("Error: {e}");
                 continue 'func;
+
             }
         }
 
@@ -44,6 +54,8 @@ pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
     }
 
     println!(" = Success rate: {}%", functions.len() as f32 / functions_count as f32 * 100.0);
+    println!(" = Missing mnemonics: {missing_mnemonics:#?}");
+    println!(" = Missing opcodes: {missing_opcodes:#?}");
 
 }
 
@@ -746,6 +758,46 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
     }
 
+    /// Decode instruction `inc/dec <rm>`: 
+    /// - https://www.felixcloutier.com/x86/inc
+    /// - https://www.felixcloutier.com/x86/dec
+    /// 
+    /// Increment or decrement a memory or register by 1.
+    fn decode_int_op_rm_literal(&mut self, inst: &Instruction, op: IntOp, literal: i64) -> AnyResult<()> {
+        
+        let place;
+        let local;
+        match inst.op0_register() {
+            Register::None => {
+                // inc/dec <m>
+                let mem_ty = ty_signed_from_bytes(inst.memory_size().size());
+                place = self.decode_mem_operand_place(inst, mem_ty)?;
+                local = self.decode_mem_operand_read(inst, mem_ty)?;
+            }
+            Register::SP |
+            Register::ESP |
+            Register::RSP => {
+                // inc/dec sp
+                match op {
+                    IntOp::Add => self.add_sp(1),
+                    IntOp::Sub => self.sub_sp(1),
+                    _ => bail!("decode_int_op_rm_literal: illegal op {op:?}"),
+                }
+                return Ok(());
+            }
+            reg => {
+                // inc/dec <reg>
+                let reg_ty = ty_signed_from_bytes(reg.size());
+                local = self.decode_register_preserve(reg, reg_ty);
+                place = Place::new_direct(local);
+            }
+        }
+
+        self.push_assign(place, op.to_expr(Operand::Local(local), Operand::LiteralSigned(literal)));
+        Ok(())
+
+    }
+
     /// Abstraction function to decode every instruction `<op> <rm>,<imm>` where `op` is
     /// an integer binary operation that write the result in the left operand.
     fn decode_int_op_rm_imm(&mut self, inst: &Instruction, op: IntOp) -> AnyResult<()> {
@@ -753,7 +805,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         let imm = inst.immediate32to64();
         match inst.op0_register() {
             Register::None => {
-                // <op> <rm>,<imm>
+                // <op> <m>,<imm>
                 let mem_ty = ty_signed_from_bytes(inst.memory_size().size());
                 let mem_place = self.decode_mem_operand_place(inst, mem_ty)?;
                 let mem_local = self.decode_mem_operand_read(inst, mem_ty)?;
@@ -845,6 +897,35 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         self.last_cmp = Some(Cmp {
             left: Operand::Local(left_local),
             right: Operand::Local(right_local),
+            kind: CmpKind::Test,
+        });
+
+        Ok(())
+
+    }
+
+    /// Decode instruction `test <rm>,<imm>`:
+    /// - https://www.felixcloutier.com/x86/test
+    /// 
+    /// Read above.
+    fn decode_test_rm_imm(&mut self, inst: &Instruction) -> AnyResult<()> {
+
+        let imm = inst.immediate32to64();
+
+        let left_local = match inst.op0_register() {
+            Register::None => {
+                let ty = ty_signed_from_bytes(inst.memory_size().size());
+                self.decode_mem_operand_read(inst, ty)?
+            }
+            reg => {
+                let ty = ty_signed_from_bytes(reg.size());
+                self.decode_register_preserve(reg, ty)
+            }
+        };
+
+        self.last_cmp = Some(Cmp {
+            left: Operand::Local(left_local),
+            right: Operand::LiteralSigned(imm),
             kind: CmpKind::Test,
         });
 
@@ -951,7 +1032,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     fn decode_jcc(&mut self, inst: &Instruction) -> AnyResult<()> {
 
         let cmp = self.last_cmp.take()
-            .ok_or_else(|| anyhow!("decode_jcc: no previous cmp"))?;
+            .ok_or_else(|| anyhow!("decode_jcc: no previous cmp ({inst})"))?;
 
         let pointer = inst.near_branch64();
         let cond_expr;
@@ -973,7 +1054,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                    ConditionCode::ge => ComparisonOperator::GreaterOrEqual,
                    ConditionCode::l => ComparisonOperator::Less,
                    ConditionCode::le => ComparisonOperator::LessOrEqual,
-                   _ => bail!("decode_jcc (cmp): unsupported condition {:?}", inst.condition_code())
+                   _ => bail!("decode_jcc (cmp): unsupported condition ({inst})")
                 };
 
                 cond_expr = Expression::Comparison {
@@ -993,7 +1074,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                     let operator = match inst.condition_code() {
                         ConditionCode::ne => ComparisonOperator::NotEqual,
                         ConditionCode::e => ComparisonOperator::Equal,
-                        _ => bail!("decode_jcc (test): unsupported condition {:?}", inst.condition_code())
+                        _ => bail!("decode_jcc (test): unsupported condition ({inst})")
                     };
 
                     cond_expr = Expression::Comparison { 
@@ -1003,7 +1084,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                     };
 
                 } else {
-                    bail!("decode_jcc (test): unsupported different operands");
+                    bail!("decode_jcc (test): unsupported different operands ({inst})");
                 }
 
             }
@@ -1139,11 +1220,25 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Movsd_m32_m32 |
             Code::Movsw_m16_m16 |
             Code::Movsb_m8_m8 => self.decode_movs_m_m(inst),
-            // MOVSS/MOVSD
+            // MOVSS/MOVSD (mov f32/f64)
             Code::Movss_xmm_xmmm32 |
             Code::Movss_xmmm32_xmm => self.decode_movs_rm_rm(inst, false)?,
             Code::Movsd_xmm_xmmm64 |
             Code::Movsd_xmmm64_xmm => self.decode_movs_rm_rm(inst, true)?,
+            // INC
+            Code::Inc_rm8 |
+            Code::Inc_rm16 |
+            Code::Inc_rm32 |
+            Code::Inc_rm64 |
+            Code::Inc_r16 |
+            Code::Inc_r32 => self.decode_int_op_rm_literal(inst, IntOp::Add, 1)?,
+            // DEC
+            Code::Dec_rm8 |
+            Code::Dec_rm16 |
+            Code::Dec_rm32 |
+            Code::Dec_rm64 |
+            Code::Dec_r16 |
+            Code::Dec_r32 => self.decode_int_op_rm_literal(inst, IntOp::Add, 1)?,
             // ADD
             Code::Add_rm64_imm8 |
             Code::Add_rm32_imm8 |
@@ -1183,7 +1278,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::And_rm8_imm8 |
             Code::And_rm64_imm32 |
             Code::And_rm32_imm32 |
-            Code::And_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::Xor)?,
+            Code::And_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::And)?,
             Code::And_r64_rm64 |
             Code::And_r32_rm32 |
             Code::And_r16_rm16 |
@@ -1191,7 +1286,23 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::And_rm64_r64 |
             Code::And_rm32_r32 |
             Code::And_rm16_r16 |
-            Code::And_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Xor)?,
+            Code::And_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::And)?,
+            // OR
+            Code::Or_rm64_imm8 |
+            Code::Or_rm32_imm8 |
+            Code::Or_rm16_imm8 |
+            Code::Or_rm8_imm8 |
+            Code::Or_rm64_imm32 |
+            Code::Or_rm32_imm32 |
+            Code::Or_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::Or)?,
+            Code::Or_r64_rm64 |
+            Code::Or_r32_rm32 |
+            Code::Or_r16_rm16 |
+            Code::Or_r8_rm8 |
+            Code::Or_rm64_r64 |
+            Code::Or_rm32_r32 |
+            Code::Or_rm16_r16 |
+            Code::Or_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Or)?,
             // SUB
             Code::Xor_rm64_imm8 |
             Code::Xor_rm32_imm8 |
@@ -1208,15 +1319,27 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Xor_rm32_r32 |
             Code::Xor_rm16_r16 |
             Code::Xor_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Xor)?,
+            // XORPS (xor packed f32)
+            
             // TEST
+            Code::Test_RAX_imm32 |
+            Code::Test_EAX_imm32 |
+            Code::Test_AX_imm16 |
+            Code::Test_AL_imm8 |
+            Code::Test_rm64_imm32 |
+            Code::Test_rm32_imm32 |
+            Code::Test_rm16_imm16 |
+            Code::Test_rm8_imm8 => self.decode_test_rm_imm(inst)?,
             Code::Test_rm64_r64 |
             Code::Test_rm32_r32 |
             Code::Test_rm16_r16 |
             Code::Test_rm8_r8 => self.decode_test_rm_r(inst)?,
-            // TMP
+            // CMP
             Code::Cmp_rm64_imm8 |
             Code::Cmp_rm32_imm8 |
             Code::Cmp_rm16_imm8 |
+            Code::Cmp_rm8_imm8 |
+            Code::Cmp_rm8_imm8_82 |
             Code::Cmp_rm64_imm32 |
             Code::Cmp_rm32_imm32 |
             Code::Cmp_rm16_imm16 => self.decode_cmp_rm_imm(inst)?,
@@ -1265,7 +1388,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Nop_rm64 |
             Code::Int3 => {},
             _ => {
-                return Err(anyhow!("unsupported opcode: {inst}"));
+                return Err(anyhow!(inst.clone()));
             }
         }
 
@@ -1416,6 +1539,7 @@ enum IntOp {
     Add,
     Sub,
     And,
+    Or,
     Xor,
 }
 
@@ -1426,6 +1550,7 @@ impl IntOp {
             IntOp::Add => Expression::Add(BinaryExpression { left, right }),
             IntOp::Sub => Expression::Sub(BinaryExpression { left, right }),
             IntOp::And => Expression::And(BinaryExpression { left, right }),
+            IntOp::Or => Expression::Or(BinaryExpression { left, right }),
             IntOp::Xor => Expression::Xor(BinaryExpression { left, right }),
         }
     }
