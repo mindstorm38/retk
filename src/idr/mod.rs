@@ -39,7 +39,7 @@ pub enum Statement {
         /// The value to assign to the left value.
         value: Expression,
     },
-    /// Represent a memory copy
+    /// Memory copy intrinsic.
     MemCopy {
         /// The source pointer of the memory copy.
         src: Operand,
@@ -83,17 +83,19 @@ pub struct Place {
 }
 
 /// Represent an operand in an expression.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Operand {
     /// A literal unsigned 64-bit integer.
     LiteralUnsigned(u64),
     /// A literal signed 64-bit integer.
     LiteralSigned(i64),
+    /// A literal floating point number.
+    LiteralFloat(f64),
     /// The value of the operand come from the local.
     Local(LocalRef),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
     /// Bitwise copy of the operand's value.
     Copy(Operand),
@@ -129,10 +131,12 @@ pub enum Expression {
     And(BinaryExpression),
     Or(BinaryExpression),
     Xor(BinaryExpression),
+    ShiftLeft(BinaryExpression),
+    ShiftRight(BinaryExpression),
 }
 
 /// Base type for binary expressions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BinaryExpression {
     /// Left local on the binary expression.
     pub left: Operand,
@@ -262,6 +266,7 @@ impl fmt::Display for Operand {
             Operand::LiteralUnsigned(int @ 0..=9) => write!(f, "{int}"),
             Operand::LiteralUnsigned(int) => write!(f, "0x{int:X}"),
             Operand::LiteralSigned(int) => write!(f, "{int}"),
+            Operand::LiteralFloat(num) => write!(f, "{num}"),
             Operand::Local(local) => write!(f, "{local}"),
         }
     }
@@ -306,6 +311,7 @@ impl fmt::Display for Expression {
                     Operand::LiteralUnsigned(int) => write!(f, "fn_{int:08X}")?,
                     Operand::LiteralSigned(int) => write!(f, "fn_{int:08X}")?,
                     Operand::Local(local) => write!(f, "({local})")?,
+                    Operand::LiteralFloat(_) => unimplemented!(),
                 }
                 write!(f, "(args: {})", arguments.len())
             }
@@ -323,6 +329,8 @@ impl fmt::Display for Expression {
             Expression::And(ref b) => write_binary(f, b, "&"),
             Expression::Or(ref b) => write_binary(f, b, "|"),
             Expression::Xor(ref b) => write_binary(f, b, "^"),
+            Expression::ShiftLeft(ref b) => write_binary(f, b, "<<"),
+            Expression::ShiftRight(ref b) => write_binary(f, b, ">>"),
         }
 
     }

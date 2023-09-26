@@ -21,10 +21,9 @@ pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
 
     let functions_count = early_functions.functions_count();
 
-    let mut missing_mnemonics = HashMap::<_, usize>::new();
     let mut missing_opcodes = HashMap::<_, usize>::new();
 
-    'func: for (i, early_function) in early_functions.iter_functions().enumerate() {
+    'func: for (i, early_function) in early_functions.iter_functions().enumerate().take(10) {
 
         print!(" = At {:08X} ({:03}%)... ", early_function.begin(), i as f32 / functions_count as f32 * 100.0);
 
@@ -38,24 +37,33 @@ pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
             if let Err(e) = decoder.feed(inst) {
 
                 if let Some(inst) = e.downcast_ref::<Instruction>() {
-                    *missing_mnemonics.entry(inst.mnemonic()).or_default() += 1;
                     *missing_opcodes.entry(inst.code()).or_default() += 1;
+                    println!("Error: {inst} ({:?})", inst.code());
+                } else {
+                    println!("Error: {e}");
                 }
 
-                println!("Error: {e}");
                 continue 'func;
 
             }
         }
+
+        decoder.debug_function();
 
         functions.insert(decoder.early_function.begin(), decoder.function);
         println!("done.");
         
     }
 
+    let mut missing_opcodes = missing_opcodes.into_iter().collect::<Vec<_>>();
+    missing_opcodes.sort_unstable_by_key(|&(code, _)| code.mnemonic());
+
+    println!(" = Missing opcodes ({}):", missing_opcodes.len());
+    for (opcode, count) in missing_opcodes {
+        println!("   {opcode:?}: {count}");
+    }
+
     println!(" = Success rate: {}%", functions.len() as f32 / functions_count as f32 * 100.0);
-    println!(" = Missing mnemonics: {missing_mnemonics:#?}");
-    println!(" = Missing opcodes: {missing_opcodes:#?}");
 
 }
 
@@ -287,7 +295,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             index_reg => {
                 
                 let index_stride = inst.memory_index_scale();
-                let index_reg_local = self.decode_register_preserve(index_reg, TY_PTR_DIFF);
+                let index_reg_local = self.decode_register(index_reg, DecodeType::Exact(TY_PTR_DIFF), true);
 
                 if index_stride > 1 {
                     let result_local = self.alloc_temp_local(TY_PTR_DIFF);
@@ -358,7 +366,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Register::None => bail!("decode_mem_operand_place: no base ({inst})"),
             base_reg => {
 
-                let mut reg_local = self.decode_register_preserve(base_reg, ty.pointer(1));
+                let mut reg_local = self.decode_register_import(base_reg, ty.pointer(1));
 
                 if mem_displ != 0 || index_local.is_some() {
 
@@ -461,7 +469,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Register::None => bail!("decode_mem_operand_read: no base ({inst})"),
             base_reg => {
 
-                let mut reg_local = self.decode_register_preserve(base_reg, ty.pointer(1));
+                let mut reg_local = self.decode_register_import(base_reg, ty.pointer(1));
 
                 if mem_displ != 0 || index_local.is_some() {
 
@@ -509,7 +517,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         match inst.memory_base() {
             Register::EIP |
             Register::RIP => {
-                let local = self.decode_register_overwrite(reg0, TY_VOID.pointer(1));
+                let local = self.decode_register_write(reg0, TY_VOID.pointer(1));
                 if let Some(index_local) = index_local {
                     self.push_assign(Place::new_direct(local), Expression::Add(BinaryExpression {
                         left: Operand::LiteralUnsigned(mem_displ as u64),
@@ -527,7 +535,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                 let offset = self.stack_pointer + i32::try_from(mem_displ).unwrap();
                 let stack_local = self.ensure_stack_local(offset, TY_VOID);
                 let stack_ty = self.function.local_type(stack_local);
-                let local = self.decode_register_overwrite(reg0, stack_ty.pointer(1));
+                let local = self.decode_register_write(reg0, stack_ty.pointer(1));
 
                 self.push_assign(Place::new_direct(local), Expression::Ref(stack_local));
                 
@@ -543,9 +551,9 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             base_reg => {
 
                 // NOTE: Using void* by default, but it should usually be present.
-                let mut base_reg_local = self.decode_register_preserve(base_reg, TY_VOID.pointer(1));
+                let mut base_reg_local = self.decode_register_import(base_reg, TY_VOID.pointer(1));
                 let base_reg_ty = self.function.local_type(base_reg_local);
-                let local = self.decode_register_overwrite(reg0, base_reg_ty);
+                let local = self.decode_register_write(reg0, base_reg_ty);
 
                 if mem_displ != 0 {
                     self.push_assign(Place::new_direct(local), Expression::Add(BinaryExpression {
@@ -578,7 +586,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         self.sub_sp(reg.size() as i32);
 
         let stack_local = self.ensure_stack_local(self.stack_pointer, reg_ty);
-        let reg_local = self.decode_register_preserve(reg, reg_ty);
+        let reg_local = self.decode_register_import(reg, reg_ty);
 
         self.push_assign(Place::new_direct(stack_local), Expression::Copy(Operand::Local(reg_local)));
 
@@ -591,7 +599,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         let reg_ty = ty_unsigned_from_bytes(reg.size());
         
         let stack_local = self.ensure_stack_local(self.stack_pointer, reg_ty);
-        let reg_local = self.decode_register_overwrite(reg, reg_ty);
+        let reg_local = self.decode_register_write(reg, reg_ty);
         
         self.push_assign(Place::new_direct(reg_local), Expression::Copy(Operand::Local(stack_local)));
         self.add_sp(reg.size() as i32);
@@ -619,8 +627,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             }
             reg => {
                 // mov <reg>,<imm>
-                let reg_ty = ty_signed_from_bytes(reg.size());
-                let reg_local = self.decode_register_overwrite(reg, reg_ty);
+                let reg_local = self.decode_register(reg, DecodeType::Integer, false);
                 self.push_assign(Place::new_direct(reg_local), Expression::Copy(Operand::LiteralSigned(imm)));
             }
         }
@@ -641,18 +648,18 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             (Register::RSP, _) => bail!("statically unknown: mov sp,<rm> ({inst})"),
             (Register::None, reg1) => {
                 let ty = ty_signed_from_bytes(reg1.size());
-                operand = Operand::Local(self.decode_register_preserve(reg1, ty));
+                operand = Operand::Local(self.decode_register_import(reg1, ty));
                 place = self.decode_mem_operand_place(inst, ty)?;
             }
             (reg0, Register::None) => {
                 let ty = ty_signed_from_bytes(reg0.size());
                 operand = Operand::Local(self.decode_mem_operand_read(inst, ty)?);
-                place = Place::new_direct(self.decode_register_overwrite(reg0, ty));
+                place = Place::new_direct(self.decode_register_write(reg0, ty));
             }
             (reg0, reg1) => {
                 let ty = ty_signed_from_bytes(reg0.size());
-                operand = Operand::Local(self.decode_register_preserve(reg1, ty));
-                place = Place::new_direct(self.decode_register_overwrite(reg0, ty));
+                operand = Operand::Local(self.decode_register_import(reg1, ty));
+                place = Place::new_direct(self.decode_register_write(reg0, ty));
             }
         }
 
@@ -681,12 +688,12 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         
         // NOTE: RSI/RDI/RCX only if pointer size == 64.
 
-        let src_reg = self.decode_register_preserve(Register::RSI, mov_ty_ptr);
-        let dst_reg = self.decode_register_preserve(Register::RDI, mov_ty_ptr);
+        let src_reg = self.decode_register_import(Register::RSI, mov_ty_ptr);
+        let dst_reg = self.decode_register_import(Register::RDI, mov_ty_ptr);
         
         // NOTE: movs only support REP, not REPZ or REPNZ
         let len_reg = inst.has_rep_prefix()
-            .then(|| self.decode_register_preserve(Register::RCX, TY_PTR_DIFF));
+            .then(|| self.decode_register_import(Register::RCX, TY_PTR_DIFF));
 
         self.push_statement(Statement::MemCopy { 
             src: Operand::Local(src_reg),
@@ -727,43 +734,12 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
     }
 
-    /// Decode instruction `movss/movsd <rm>,<rm>`: 
-    /// - https://www.felixcloutier.com/x86/movss
-    /// - https://www.felixcloutier.com/x86/movsd
-    /// 
-    /// Such instructions move single value between scalar registers.
-    fn decode_movs_rm_rm(&mut self, inst: &Instruction, double: bool) -> AnyResult<()> {
-        
-        let ty = if double { TY_DOUBLE } else { TY_FLOAT };
-        let place;
-        let operand;
-
-        match (inst.op0_register(), inst.op1_register()) {
-            (Register::None, reg1) => {
-                operand = Operand::Local(self.decode_register_preserve(reg1, ty));
-                place = self.decode_mem_operand_place(inst, ty)?;
-            }
-            (reg0, Register::None) => {
-                operand = Operand::Local(self.decode_mem_operand_read(inst, ty)?);
-                place = Place::new_direct(self.decode_register_overwrite(reg0, ty));
-            }
-            (reg0, reg1) => {
-                operand = Operand::Local(self.decode_register_preserve(reg1, ty));
-                place = Place::new_direct(self.decode_register_overwrite(reg0, ty));
-            }
-        }
-
-        self.push_assign(place, Expression::Copy(operand));
-        Ok(())
-
-    }
-
     /// Decode instruction `inc/dec <rm>`: 
     /// - https://www.felixcloutier.com/x86/inc
     /// - https://www.felixcloutier.com/x86/dec
     /// 
     /// Increment or decrement a memory or register by 1.
-    fn decode_int_op_rm_literal(&mut self, inst: &Instruction, op: IntOp, literal: i64) -> AnyResult<()> {
+    fn decode_int_op_rm_literal(&mut self, inst: &Instruction, op: IntOp, layout: IntLayout, literal: i64) -> AnyResult<()> {
         
         let place;
         let local;
@@ -787,8 +763,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             }
             reg => {
                 // inc/dec <reg>
-                let reg_ty = ty_signed_from_bytes(reg.size());
-                local = self.decode_register_preserve(reg, reg_ty);
+                local = self.decode_register(reg, DecodeType::Integer, true);
                 place = Place::new_direct(local);
             }
         }
@@ -800,7 +775,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
     /// Abstraction function to decode every instruction `<op> <rm>,<imm>` where `op` is
     /// an integer binary operation that write the result in the left operand.
-    fn decode_int_op_rm_imm(&mut self, inst: &Instruction, op: IntOp) -> AnyResult<()> {
+    fn decode_int_op_rm_imm(&mut self, inst: &Instruction, op: IntOp, layout: IntLayout) -> AnyResult<()> {
 
         let imm = inst.immediate32to64();
         match inst.op0_register() {
@@ -824,11 +799,9 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             }
             reg => {
                 // <op> <reg>,<imm>
-                let reg_ty = ty_signed_from_bytes(reg.size());
-                let reg_read_local = self.decode_register_preserve(reg, reg_ty);
-                let reg_write_local = self.decode_register_overwrite(reg, reg_ty);
-                self.push_assign(Place::new_direct(reg_write_local), 
-                    op.to_expr(Operand::Local(reg_read_local), Operand::LiteralUnsigned(imm as u64)));
+                let reg_local = self.decode_register(reg, DecodeType::Integer, true);
+                self.push_assign(Place::new_direct(reg_local), 
+                    op.to_expr(Operand::Local(reg_local), Operand::LiteralUnsigned(imm as u64)));
             }
         }
         
@@ -838,7 +811,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
     /// Abstraction function to decode every instruction `<op> <rm>,<rm>` where `op` is
     /// an integer binary operation that write the result in the left operand.
-    fn decode_int_op_rm_rm(&mut self, inst: &Instruction, op: IntOp) -> AnyResult<()> {
+    fn decode_int_op_rm_rm(&mut self, inst: &Instruction, op: IntOp, layout: IntLayout) -> AnyResult<()> {
 
         let place;
         let left;
@@ -848,32 +821,108 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             (_, Register::RSP) => bail!("statically unknown: <op> <rm>,sp ({inst})"),
             (Register::RSP, _) => bail!("statically unknown: <op> sp,<rm> ({inst})"),
             (Register::None, reg1) => {
-                let ty = ty_signed_from_bytes(reg1.size());
-                place = self.decode_mem_operand_place(inst, ty)?;
-                left = Operand::Local(self.decode_mem_operand_read(inst, ty)?);
-                right = Operand::Local(self.decode_register_preserve(reg1, ty));
+                let reg_local = self.decode_register(reg1, DecodeType::Integer, true);
+                let reg_ty = self.function.local_type(reg_local);
+                place = self.decode_mem_operand_place(inst, reg_ty)?;
+                left = Operand::Local(self.decode_mem_operand_read(inst, reg_ty)?);
+                right = Operand::Local(reg_local);
             }
             (reg0, Register::None) => {
-                let ty = ty_signed_from_bytes(reg0.size());
-                right = Operand::Local(self.decode_mem_operand_read(inst, ty)?);
-                left = Operand::Local(self.decode_register_preserve(reg0, ty));
-                place = Place::new_direct(self.decode_register_overwrite(reg0, ty));
+                let reg_local = self.decode_register(reg0, DecodeType::Integer, true);
+                let reg_ty = self.function.local_type(reg_local);
+                left = Operand::Local(reg_local);
+                right = Operand::Local(self.decode_mem_operand_read(inst, reg_ty)?);
+                place = Place::new_direct(reg_local);
             }
             (reg0, reg1) if op == IntOp::Xor && reg0 == reg1 => {
-                let ty = ty_signed_from_bytes(reg0.size());
-                let place = Place::new_direct(self.decode_register_overwrite(reg0, ty));
+                let reg_local = self.decode_register(reg0, DecodeType::Integer, false);
+                let place = Place::new_direct(reg_local);
                 self.push_assign(place, Expression::Copy(Operand::LiteralUnsigned(0)));
                 return Ok(());
             }
             (reg0, reg1) => {
-                let ty = ty_signed_from_bytes(reg0.size());
-                right = Operand::Local(self.decode_register_preserve(reg1, ty));
-                left = Operand::Local(self.decode_register_preserve(reg0, ty));
-                place = Place::new_direct(self.decode_register_overwrite(reg0, ty));
+                let reg0_local = self.decode_register(reg0, DecodeType::Integer, true);
+                let reg0_ty = self.function.local_type(reg0_local);
+                let reg1_local = self.decode_register(reg1, DecodeType::Exact(reg0_ty), true);
+                left = Operand::Local(reg0_local);
+                right = Operand::Local(reg1_local);
+                place = Place::new_direct(reg0_local);
             }
         }
 
         self.push_assign(place, op.to_expr(left, right));
+        Ok(())
+
+    }
+
+    /// Decode instruction `movss/movsd/movaps/movapd <rm>,<rm>`: 
+    /// - https://www.felixcloutier.com/x86/movss
+    /// - https://www.felixcloutier.com/x86/movsd
+    /// - https://www.felixcloutier.com/x86/movaps
+    /// - https://www.felixcloutier.com/x86/movapd
+    /// 
+    /// Such instructions move single value between scalar registers.
+    fn decode_mov_simd_rm_rm(&mut self, inst: &Instruction, double: bool, packed: bool) -> AnyResult<()> {
+        
+        let get_ty = move |bytes: usize| {
+            if packed {
+                if double {
+                    ty_float_vec_from_bytes(bytes)
+                } else {
+                    ty_double_vec_from_bytes(bytes)
+                }
+            } else {
+                if double { TY_DOUBLE } else { TY_FLOAT }
+            }
+        };
+        
+        let place;
+        let operand;
+
+        match (inst.op0_register(), inst.op1_register()) {
+            (Register::None, reg1) => {
+                let ty = get_ty(reg1.size());
+                operand = Operand::Local(self.decode_register_import(reg1, ty));
+                place = self.decode_mem_operand_place(inst, ty)?;
+            }
+            (reg0, Register::None) => {
+                let ty = get_ty(reg0.size());
+                operand = Operand::Local(self.decode_mem_operand_read(inst, ty)?);
+                place = Place::new_direct(self.decode_register_write(reg0, ty));
+            }
+            (reg0, reg1) => {
+                let ty = get_ty(reg0.size());
+                operand = Operand::Local(self.decode_register_import(reg1, ty));
+                place = Place::new_direct(self.decode_register_write(reg0, ty));
+            }
+        }
+
+        self.push_assign(place, Expression::Copy(operand));
+        Ok(())
+
+    }
+
+    /// Decode instruction `xorps/xorpd <r>,<rm>`: 
+    /// - https://www.felixcloutier.com/x86/xorps
+    /// - https://www.felixcloutier.com/x86/xorpd
+    /// 
+    /// Perform XOR on two packed vector registers.
+    fn decode_xorp_r_rm(&mut self, inst: &Instruction, double: bool) -> AnyResult<()> {
+
+        let ty = if double { TY_DOUBLE } else { TY_FLOAT };
+
+        // TODO: For now we only support xorp for zeroing registers.
+        // TODO: Support zero-ing the vector, if relevant.
+        if inst.op0_register() == inst.op1_register() {
+
+            let reg = inst.op0_register();
+            let reg_local = self.decode_register_write(reg, ty);
+            self.push_assign(Place::new_direct(reg_local), Expression::Copy(Operand::LiteralFloat(0.0)));
+
+        } else {
+            bail!("decode_xorp_r_rm: different registers ({inst})");
+        }
+
         Ok(())
 
     }
@@ -887,11 +936,11 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
         let reg1 = inst.op1_register();
         let ty = ty_signed_from_bytes(reg1.size());
-        let right_local = self.decode_register_preserve(reg1, ty);
+        let right_local = self.decode_register_import(reg1, ty);
 
         let left_local = match inst.op0_register() {
             Register::None => self.decode_mem_operand_read(inst, ty)?,
-            reg0 => self.decode_register_preserve(reg0, ty),
+            reg0 => self.decode_register_import(reg0, ty),
         };
 
         self.last_cmp = Some(Cmp {
@@ -919,7 +968,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             }
             reg => {
                 let ty = ty_signed_from_bytes(reg.size());
-                self.decode_register_preserve(reg, ty)
+                self.decode_register_import(reg, ty)
             }
         };
 
@@ -950,7 +999,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             }
             reg => {
                 ty = ty_signed_from_bytes(reg.size());
-                left_local = self.decode_register_preserve(reg, ty);
+                left_local = self.decode_register_import(reg, ty);
             }
         };
 
@@ -978,7 +1027,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Register::SP |
             Register::ESP |
             Register::RSP => bail!("statically unknown: cmp sp,<rm> ({inst})"),
-            reg0 => Operand::Local(self.decode_register_preserve(reg0, ty)),
+            reg0 => Operand::Local(self.decode_register_import(reg0, ty)),
         };
 
         let right = match inst.op1_register() {
@@ -986,7 +1035,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Register::SP |
             Register::ESP |
             Register::RSP => bail!("statically unknown: cmp <rm>,sp ({inst})"),
-            reg1 => Operand::Local(self.decode_register_preserve(reg1, ty)),
+            reg1 => Operand::Local(self.decode_register_import(reg1, ty)),
         };
 
         self.last_cmp = Some(Cmp {
@@ -1002,7 +1051,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     fn decode_call_rel(&mut self, inst: &Instruction) {
         
         let pointer = inst.memory_displacement64();
-        let ret_local = self.decode_register_overwrite(Register::RAX, TY_PTR_DIFF);
+        let ret_local = self.decode_register_write(Register::RAX, TY_PTR_DIFF);
 
         self.push_assign(Place::new_direct(ret_local), Expression::Call { 
             pointer: Operand::LiteralUnsigned(pointer), 
@@ -1015,10 +1064,10 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
         let pointer_local = match inst.op0_register() {
             Register::None => self.decode_mem_operand_read(inst, TY_VOID.pointer(1))?,
-            reg => self.decode_register_preserve(reg, TY_VOID.pointer(1)),
+            reg => self.decode_register_import(reg, TY_VOID.pointer(1)),
         };
 
-        let ret_local = self.decode_register_overwrite(Register::RAX, TY_PTR_DIFF);
+        let ret_local = self.decode_register_write(Register::RAX, TY_PTR_DIFF);
 
         self.push_assign(Place::new_direct(ret_local), Expression::Call {
             pointer: Operand::Local(pointer_local),
@@ -1129,7 +1178,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
     fn decode_ret(&mut self, _inst: &Instruction) -> AnyResult<()> {
 
-        let ret_place = self.decode_register_preserve(Register::RAX, TY_PTR_DIFF);
+        let ret_place = self.decode_register_import(Register::RAX, TY_PTR_DIFF);
         self.push_statement(Statement::Return(ret_place));
 
         // We directly finalize the basic block here because our function ends here.
@@ -1220,33 +1269,32 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Movsd_m32_m32 |
             Code::Movsw_m16_m16 |
             Code::Movsb_m8_m8 => self.decode_movs_m_m(inst),
-            // MOVSS/MOVSD (mov f32/f64)
-            Code::Movss_xmm_xmmm32 |
-            Code::Movss_xmmm32_xmm => self.decode_movs_rm_rm(inst, false)?,
-            Code::Movsd_xmm_xmmm64 |
-            Code::Movsd_xmmm64_xmm => self.decode_movs_rm_rm(inst, true)?,
             // INC
             Code::Inc_rm8 |
             Code::Inc_rm16 |
             Code::Inc_rm32 |
             Code::Inc_rm64 |
             Code::Inc_r16 |
-            Code::Inc_r32 => self.decode_int_op_rm_literal(inst, IntOp::Add, 1)?,
+            Code::Inc_r32 => self.decode_int_op_rm_literal(inst, IntOp::Add, IntLayout::Inherited, 1)?,
             // DEC
             Code::Dec_rm8 |
             Code::Dec_rm16 |
             Code::Dec_rm32 |
             Code::Dec_rm64 |
             Code::Dec_r16 |
-            Code::Dec_r32 => self.decode_int_op_rm_literal(inst, IntOp::Add, 1)?,
+            Code::Dec_r32 => self.decode_int_op_rm_literal(inst, IntOp::Sub, IntLayout::Inherited, 1)?,
             // ADD
+            Code::Add_RAX_imm32 |
+            Code::Add_EAX_imm32 |
+            Code::Add_AX_imm16 |
+            Code::Add_AL_imm8 |
             Code::Add_rm64_imm8 |
             Code::Add_rm32_imm8 |
             Code::Add_rm16_imm8 |
             Code::Add_rm8_imm8 |
             Code::Add_rm64_imm32 |
             Code::Add_rm32_imm32 |
-            Code::Add_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::Add)?,
+            Code::Add_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::Add, IntLayout::Inherited)?,
             Code::Add_r64_rm64 |
             Code::Add_r32_rm32 |
             Code::Add_r16_rm16 |
@@ -1254,15 +1302,19 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Add_rm64_r64 |
             Code::Add_rm32_r32 |
             Code::Add_rm16_r16 |
-            Code::Add_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Add)?,
+            Code::Add_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Add, IntLayout::Inherited)?,
             // SUB
+            Code::Sub_RAX_imm32 |
+            Code::Sub_EAX_imm32 |
+            Code::Sub_AX_imm16 |
+            Code::Sub_AL_imm8 |
             Code::Sub_rm64_imm8 |
             Code::Sub_rm32_imm8 |
             Code::Sub_rm16_imm8 |
             Code::Sub_rm8_imm8 |
             Code::Sub_rm64_imm32 |
             Code::Sub_rm32_imm32 |
-            Code::Sub_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::Sub)?,
+            Code::Sub_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::Sub, IntLayout::Inherited)?,
             Code::Sub_r64_rm64 |
             Code::Sub_r32_rm32 |
             Code::Sub_r16_rm16 |
@@ -1270,15 +1322,19 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Sub_rm64_r64 |
             Code::Sub_rm32_r32 |
             Code::Sub_rm16_r16 |
-            Code::Sub_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Sub)?,
+            Code::Sub_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Sub, IntLayout::Inherited)?,
             // AND
+            Code::And_RAX_imm32 |
+            Code::And_EAX_imm32 |
+            Code::And_AX_imm16 |
+            Code::And_AL_imm8 |
             Code::And_rm64_imm8 |
             Code::And_rm32_imm8 |
             Code::And_rm16_imm8 |
             Code::And_rm8_imm8 |
             Code::And_rm64_imm32 |
             Code::And_rm32_imm32 |
-            Code::And_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::And)?,
+            Code::And_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::And, IntLayout::Inherited)?,
             Code::And_r64_rm64 |
             Code::And_r32_rm32 |
             Code::And_r16_rm16 |
@@ -1286,15 +1342,19 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::And_rm64_r64 |
             Code::And_rm32_r32 |
             Code::And_rm16_r16 |
-            Code::And_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::And)?,
+            Code::And_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::And, IntLayout::Inherited)?,
             // OR
+            Code::Or_RAX_imm32 |
+            Code::Or_EAX_imm32 |
+            Code::Or_AX_imm16 |
+            Code::Or_AL_imm8 |
             Code::Or_rm64_imm8 |
             Code::Or_rm32_imm8 |
             Code::Or_rm16_imm8 |
             Code::Or_rm8_imm8 |
             Code::Or_rm64_imm32 |
             Code::Or_rm32_imm32 |
-            Code::Or_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::Or)?,
+            Code::Or_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::Or, IntLayout::Inherited)?,
             Code::Or_r64_rm64 |
             Code::Or_r32_rm32 |
             Code::Or_r16_rm16 |
@@ -1302,15 +1362,19 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Or_rm64_r64 |
             Code::Or_rm32_r32 |
             Code::Or_rm16_r16 |
-            Code::Or_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Or)?,
-            // SUB
+            Code::Or_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Or, IntLayout::Inherited)?,
+            // XOR
+            Code::Xor_RAX_imm32 |
+            Code::Xor_EAX_imm32 |
+            Code::Xor_AX_imm16 |
+            Code::Xor_AL_imm8 |
             Code::Xor_rm64_imm8 |
             Code::Xor_rm32_imm8 |
             Code::Xor_rm16_imm8 |
             Code::Xor_rm8_imm8 |
             Code::Xor_rm64_imm32 |
             Code::Xor_rm32_imm32 |
-            Code::Xor_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::Xor)?,
+            Code::Xor_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::Xor, IntLayout::Inherited)?,
             Code::Xor_r64_rm64 |
             Code::Xor_r32_rm32 |
             Code::Xor_r16_rm16 |
@@ -1318,9 +1382,34 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Xor_rm64_r64 |
             Code::Xor_rm32_r32 |
             Code::Xor_rm16_r16 |
-            Code::Xor_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Xor)?,
+            Code::Xor_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Xor, IntLayout::Inherited)?,
+            // SAR (Shift Arithmetic Right)
+            Code::Sar_rm64_imm8 |
+            Code::Sar_rm32_imm8 |
+            Code::Sar_rm16_imm8 |
+            Code::Sar_rm8_imm8 => self.decode_int_op_rm_imm(inst, IntOp::ShiftRight, IntLayout::Signed)?,
+            Code::Sar_rm64_CL |
+            Code::Sar_rm32_CL |
+            Code::Sar_rm16_CL |
+            Code::Sar_rm8_CL => self.decode_int_op_rm_rm(inst, IntOp::ShiftRight, IntLayout::Signed)?,
+            // MOVSS/MOVSD (mov single f32/f64)
+            Code::Movss_xmm_xmmm32 |
+            Code::Movss_xmmm32_xmm => self.decode_mov_simd_rm_rm(inst, false, false)?,
+            Code::Movsd_xmm_xmmm64 |
+            Code::Movsd_xmmm64_xmm => self.decode_mov_simd_rm_rm(inst, false, true)?,
+            // MOVAPS/MOVAPD (mov aligned packed f32/f64)
+            Code::Movaps_xmmm128_xmm |
+            Code::Movaps_xmm_xmmm128 => self.decode_mov_simd_rm_rm(inst, false, true)?,
+            Code::Movapd_xmmm128_xmm |
+            Code::Movapd_xmm_xmmm128 => self.decode_mov_simd_rm_rm(inst, false, true)?,
+            // MOVUPS/MOVUPD (mov aligned packed f32/f64)
+            Code::Movups_xmmm128_xmm |
+            Code::Movups_xmm_xmmm128 => self.decode_mov_simd_rm_rm(inst, false, true)?,
+            Code::Movupd_xmmm128_xmm |
+            Code::Movupd_xmm_xmmm128 => self.decode_mov_simd_rm_rm(inst, false, true)?,
             // XORPS (xor packed f32)
-            
+            Code::Xorps_xmm_xmmm128 => self.decode_xorp_r_rm(inst, false)?,
+            Code::Xorpd_xmm_xmmm128 => self.decode_xorp_r_rm(inst, true)?,
             // TEST
             Code::Test_RAX_imm32 |
             Code::Test_EAX_imm32 |
@@ -1335,6 +1424,10 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Test_rm16_r16 |
             Code::Test_rm8_r8 => self.decode_test_rm_r(inst)?,
             // CMP
+            Code::Cmp_RAX_imm32 |
+            Code::Cmp_EAX_imm32 |
+            Code::Cmp_AX_imm16 |
+            Code::Cmp_AL_imm8 |
             Code::Cmp_rm64_imm8 |
             Code::Cmp_rm32_imm8 |
             Code::Cmp_rm16_imm8 |
@@ -1411,52 +1504,82 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     /// and the given `import` argument is true then the value of the register family 
     /// is preserved in the new local, using a cast assignment.
     #[track_caller]
-    fn decode_register(&mut self, register: Register, ty: Type, import: bool) -> LocalRef {
+    fn decode_register(&mut self, register: Register, ty: DecodeType, import: bool) -> LocalRef {
 
         let full_register = register.full_register();
-
-        // Debug purpose asserts to avoid programming errors.
-        if full_register.is_gpr() {
-            assert!(ty.is_integer() || ty.is_pointer(), "general purpose register can only hold integer type and pointers");
-        }
-
-        let local = *self.register_typed_locals.entry((register, ty))
-            .or_insert_with(|| self.function.new_local(&self.type_system, ty, format!("register: {full_register:?}")));
 
         match self.register_block_locals.entry(full_register) {
             Entry::Occupied(o) => {
 
                 let locals = o.into_mut();
                 let current_local = locals.last;
-                locals.last = local;
+                let current_ty = self.function.local_type(current_local);
+                
+                let new_ty = match ty {
+                    DecodeType::Exact(ty) => ty,
+                    DecodeType::Integer => {
+                        let bytes = register.size();
+                        if !current_ty.is_pointer() {
+                            match current_ty.primitive {
+                                PrimitiveType::Unsigned(_) => ty_unsigned_from_bytes(bytes),
+                                _ => ty_signed_from_bytes(bytes),
+                            }
+                        } else {
+                            ty_signed_from_bytes(bytes)
+                        }
+                    }
+                };
 
-                if import && self.function.local_type(current_local) != ty {
-                    self.push_assign(Place::new_direct(local), Expression::Cast(current_local));
+                if new_ty != current_ty {
+
+                    let new_local = *self.register_typed_locals.entry((register, new_ty))
+                        .or_insert_with(|| self.function.new_local(&self.type_system, new_ty, format!("register: {full_register:?}")));
+
+                    locals.last = new_local;
+
+                    if import {
+                        self.push_assign(Place::new_direct(new_local), Expression::Cast(current_local));
+                    }
+
+                    new_local
+
+                } else {
+                    current_local
                 }
 
             }
             Entry::Vacant(v) => {
+
+                let ty = match ty {
+                    DecodeType::Exact(ty) => ty,
+                    DecodeType::Integer => ty_signed_from_bytes(register.size()),
+                };
+                
+                let local = *self.register_typed_locals.entry((register, ty))
+                    .or_insert_with(|| self.function.new_local(&self.type_system, ty, format!("register: {full_register:?}")));
+
                 v.insert(RegisterBlockLocals { 
                     import: import.then_some(local),  // Only import if requested.
                     last: local,
                 });
+
+                local
+
             }
         }
 
-        local
-
     }
 
     #[track_caller]
     #[inline]
-    fn decode_register_preserve(&mut self, register: Register, ty: Type) -> LocalRef {
-        self.decode_register(register, ty, true)
+    fn decode_register_import(&mut self, register: Register, ty: Type) -> LocalRef {
+        self.decode_register(register, DecodeType::Exact(ty), true)
     }
 
     #[track_caller]
     #[inline]
-    fn decode_register_overwrite(&mut self, register: Register, ty: Type) -> LocalRef {
-        self.decode_register(register, ty, false)
+    fn decode_register_write(&mut self, register: Register, ty: Type) -> LocalRef {
+        self.decode_register(register, DecodeType::Exact(ty), false)
     }
 
     /// Get a local usable to write from the given stack offset.
@@ -1516,23 +1639,6 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 }
 
 
-const TY_VOID: Type = PrimitiveType::Void.plain();
-const TY_PTR_DIFF: Type = PrimitiveType::Signed(64).plain();
-const TY_FLOAT: Type = PrimitiveType::Float.plain();
-const TY_DOUBLE: Type = PrimitiveType::Double.plain();
-
-
-#[inline]
-const fn ty_signed_from_bytes(bytes: usize) -> Type {
-    PrimitiveType::Signed(bytes as u32 * 8).plain()
-}
-
-#[inline]
-const fn ty_unsigned_from_bytes(bytes: usize) -> Type {
-    PrimitiveType::Unsigned(bytes as u32 * 8).plain()
-}
-
-
 /// Internally used in a common function for all integer operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IntOp {
@@ -1541,6 +1647,8 @@ enum IntOp {
     And,
     Or,
     Xor,
+    ShiftRight,
+    ShiftLeft,
 }
 
 impl IntOp {
@@ -1552,9 +1660,20 @@ impl IntOp {
             IntOp::And => Expression::And(BinaryExpression { left, right }),
             IntOp::Or => Expression::Or(BinaryExpression { left, right }),
             IntOp::Xor => Expression::Xor(BinaryExpression { left, right }),
+            IntOp::ShiftRight => Expression::ShiftRight(BinaryExpression { left, right }),
+            IntOp::ShiftLeft => Expression::ShiftLeft(BinaryExpression { left, right }),
         }
     }
 
+}
+
+/// Used to tell if an expression should produce a signed or unsigned integer. A special
+/// `Inherited` can be used to default to the previous value of registers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntLayout {
+    Signed,
+    Unsigned,
+    Inherited,
 }
 
 /// Internal structure used to track possible comparisons.
@@ -1650,4 +1769,44 @@ enum ExportFixKind {
         /// The local variable to import.
         local: LocalRef,
     },
+}
+
+/// Type enumeration used internally to better understand the meaning of required types.
+#[derive(Debug)]
+enum DecodeType {
+    /// The exact type is needed, the returned local will be of that type.
+    Exact(Type),
+    /// Get an integer type of the register size, if the last assigned local has an 
+    /// integer type, the same type of integer (signed/unsigned) is inherited from it
+    /// with an additional cast, if the type is already an integer of the required size,
+    /// nothing is changed on the existing local.
+    /// 
+    /// If the register is not bound yet, a signed integer type is used by default.
+    Integer,
+}
+
+
+const TY_VOID: Type = PrimitiveType::Void.plain();
+const TY_PTR_DIFF: Type = PrimitiveType::Signed(64).plain();
+const TY_FLOAT: Type = PrimitiveType::Float.plain();
+const TY_DOUBLE: Type = PrimitiveType::Double.plain();
+
+#[inline]
+const fn ty_signed_from_bytes(bytes: usize) -> Type {
+    PrimitiveType::Signed(bytes as u32 * 8).plain()
+}
+
+#[inline]
+const fn ty_unsigned_from_bytes(bytes: usize) -> Type {
+    PrimitiveType::Unsigned(bytes as u32 * 8).plain()
+}
+
+#[inline]
+const fn ty_float_vec_from_bytes(bytes: usize) -> Type {
+    PrimitiveType::FloatVec(bytes as u32 / 4).plain()
+}
+
+#[inline]
+const fn ty_double_vec_from_bytes(bytes: usize) -> Type {
+    PrimitiveType::DoubleVec(bytes as u32 / 8).plain()
 }

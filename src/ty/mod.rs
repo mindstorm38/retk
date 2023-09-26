@@ -61,6 +61,8 @@ impl TypeSystem {
             PrimitiveType::Signed(n) => write!(name, "i{n}").unwrap(),
             PrimitiveType::Float => name.write_str("f32").unwrap(),
             PrimitiveType::Double => name.write_str("f64").unwrap(),
+            PrimitiveType::FloatVec(n) => write!(name, "f32x{n}").unwrap(),
+            PrimitiveType::DoubleVec(n) => write!(name, "f64x{n}").unwrap(),
             PrimitiveType::Struct(s) => {
                 let struct_name = &self.struct_defs[s.0 as usize].0;
                 write!(name, "struct {struct_name}").unwrap();
@@ -98,6 +100,8 @@ impl TypeSystem {
             }
             PrimitiveType::Float => Some(Layout { size: 4, align: 4 }),
             PrimitiveType::Double => Some(Layout { size: 8, align: 8 }),
+            PrimitiveType::FloatVec(n) => Some(Layout { size: 4 * n, align: 4 }),
+            PrimitiveType::DoubleVec(n) => Some(Layout { size: 8 * n, align: 8 }),
             PrimitiveType::Struct(s) => {
                 let def = self.struct_defs[s.0 as usize].1.as_ref()?;
                 Some(Layout { size: def.size, align: def.align })
@@ -163,6 +167,10 @@ pub enum PrimitiveType {
     Float,
     /// Double-precision IEEE-754 floating point number.
     Double,
+    /// SIMD float vector of given number of elements.
+    FloatVec(u32),
+    /// SIMD double vector of given number of elements.
+    DoubleVec(u32),
     /// A structure type, referenced by its handle.
     Struct(StructType),
 }
