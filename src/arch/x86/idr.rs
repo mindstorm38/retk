@@ -4,6 +4,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 use iced_x86::{Instruction, Code, Register, ConditionCode};
+use anyhow::{Result as AnyResult, anyhow};
 
 use crate::idr::{LocalRef, Function, Statement, Expression, Place, BinaryExpression, Operand, ComparisonOperator};
 use crate::ty::{TypeSystem, Type, PrimitiveType};
@@ -18,7 +19,9 @@ pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
     let mut type_system = TypeSystem::new(backend.pointer_size, 8);
     let mut functions = HashMap::new();
 
-    for early_function in early_functions.iter_functions() {
+    'func: for early_function in early_functions.iter_functions() {
+
+        print!(" = At {:08X}... ", early_function.begin());
 
         let section = backend.sections.get_code_section_at(early_function.begin()).unwrap();
         let offset = early_function.begin() - section.begin_addr;
@@ -27,11 +30,15 @@ pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
         let mut decoder = IdrDecoder::new(&mut type_system, early_function);
 
         while let Some(inst) = backend.decoder.decode() {
-            decoder.feed(inst);
+            if let Err(e) = decoder.feed(inst) {
+                println!("Error: {e}");
+                continue 'func;
+            }
         }
 
         functions.insert(decoder.early_function.begin(), decoder.function);
-
+        println!("done.");
+        
     }
 
 }
@@ -96,11 +103,11 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     }
     
     /// Finalize the current function, save it and reset the state to go to the next one.
-    fn finalize_function(&mut self) {
+    fn finalize_function(&mut self) -> AnyResult<()> {
 
         // Finalize all basic block and ensure that they are existing.
         for block in self.basic_blocks.values_mut() {
-            let index = block.begin_index.expect("block decoding is missing");
+            let index = block.begin_index.ok_or_else(|| anyhow!("block decoding is missing"))?;
             // If the basic block is valid, relocate all branches to point to it.
             // NOTE: We drain this relocation list because we don't want to keep it 
             // for the next pass, it will be reconstructed as needed.
@@ -222,7 +229,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             self.function.statements.insert(index, stmt);
         }
 
-        // self.debug_function();
+        Ok(())
 
     }
 
@@ -644,65 +651,51 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         let mov_ty = ty_unsigned_from_bytes(mov_stride);
         let mov_ty_ptr = mov_ty.pointer(1);
         
+        // NOTE: RSI/RDI/RCX only if pointer size == 64.
+
         let src_reg = self.decode_register_preserve(Register::RSI, mov_ty_ptr);
         let dst_reg = self.decode_register_preserve(Register::RDI, mov_ty_ptr);
-
-        // let mut rep_data = None;
-
-        // // NOTE: movs only support REP, not REPZ or REPNZ
-        // if inst.has_rep_prefix() {
-            
-        //     // Repeat for the number of iteration given in RCX.
-        //     let count_reg = self.decode_register_preserve(Register::RCX, TY_PTR_DIFF);
-
-        //     let while_index = self.push_statement(Statement::While { 
-        //         cond: Expression::Comparison { 
-        //             left: Operand::Local(count_reg), 
-        //             operator: ComparisonOperator::NotEqual, 
-        //             right: Operand::LiteralUnsigned(0),
-        //         },
-        //         end_index: 0
-        //     });
-
-        //     rep_data = Some((count_reg, while_index));
-
-        // }
-
-        // // A simple copy from src to dst.
-        // self.push_assign(Place::new_indirect(dst_reg, 1), Expression::Deref { 
-        //     pointer: Operand::Local(src_reg), 
-        //     indirection: 1,
-        // });
-
-        // // TODO: Decrement if DF=1
         
-        // self.push_assign(Place::new_direct(src_reg), Expression::Add(BinaryExpression {
-        //     left: Operand::Local(src_reg),
-        //     right: Operand::LiteralUnsigned(1),
-        // }));
+        // NOTE: movs only support REP, not REPZ or REPNZ
+        let len_reg = inst.has_rep_prefix()
+            .then(|| self.decode_register_preserve(Register::RCX, TY_PTR_DIFF));
 
-        // self.push_assign(Place::new_direct(dst_reg), Expression::Add(BinaryExpression {
-        //     left: Operand::Local(dst_reg),
-        //     right: Operand::LiteralUnsigned(1),
-        // }));
+        self.push_statement(Statement::MemCopy { 
+            src: Operand::Local(src_reg),
+            dst: Operand::Local(dst_reg), 
+            len: match len_reg {
+                Some(local) => Operand::Local(local),
+                None => Operand::LiteralUnsigned(1),
+            },
+        });
 
-        // if let Some((count_reg, while_index)) = rep_data {
+        if let Some(len_reg) = len_reg {
+            
+            self.push_assign(Place::new_direct(src_reg), Expression::Add(BinaryExpression { 
+                left: Operand::Local(src_reg),
+                right: Operand::Local(len_reg),
+            }));
 
-        //     let index = self.push_assign(Place::new_direct(count_reg), Expression::Sub(BinaryExpression { 
-        //         left: Operand::Local(count_reg), 
-        //         right: Operand::LiteralUnsigned(1),
-        //     }));
+            self.push_assign(Place::new_direct(dst_reg), Expression::Add(BinaryExpression { 
+                left: Operand::Local(dst_reg),
+                right: Operand::Local(len_reg),
+            }));
 
-        //     if let Statement::While { end_index, .. } = &mut self.function.statements[while_index] {
-        //         *end_index = index + 1;
-        //     } else {
-        //         panic!();
-        //     }
+        } else {
 
-        // }
+            self.push_assign(Place::new_direct(src_reg), Expression::Add(BinaryExpression { 
+                left: Operand::Local(src_reg),
+                right: Operand::LiteralUnsigned(1),
+            }));
 
-        self.finalize_function();
-        panic!()
+            self.push_assign(Place::new_direct(dst_reg), Expression::Add(BinaryExpression { 
+                left: Operand::Local(dst_reg),
+                right: Operand::LiteralUnsigned(1),
+            }));
+
+        }
+
+        self.debug_function();
 
     }
 
@@ -1020,20 +1013,22 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
     }
 
-    fn decode_ret(&mut self, _inst: &Instruction) {
+    fn decode_ret(&mut self, _inst: &Instruction) -> AnyResult<()> {
 
         let ret_place = self.decode_register_preserve(Register::RAX, TY_PTR_DIFF);
         self.push_statement(Statement::Return(ret_place));
 
         // We directly finalize the basic block here because our function ends here.
         self.finalize_basic_block(None);
-        self.finalize_function();
+        self.finalize_function()?;
+
+        Ok(())
 
     }
 
     /// Feed a new instruction to the decoder, if some instruction is returned, the 
     /// feeder must goto to the given instruction and start feed from it.
-    fn feed(&mut self, inst: &Instruction) {
+    fn feed(&mut self, inst: &Instruction) -> AnyResult<()> {
 
         let ip = inst.ip();
         // println!("[{:08X}] {inst}", ip);
@@ -1211,7 +1206,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Retfw |
             Code::Retfq_imm16 |
             Code::Retfd_imm16 |
-            Code::Retfw_imm16 => self.decode_ret(inst),
+            Code::Retfw_imm16 => self.decode_ret(inst)?,
             // NOP
             Code::Nopw |
             Code::Nopd |
@@ -1221,10 +1216,11 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Nop_rm64 |
             Code::Int3 => {},
             _ => {
-                self.debug_function();
-                unimplemented!("unsupported opcode: {inst:?}");
+                return Err(anyhow!("unsupported opcode: {inst:?}"));
             }
         }
+
+        Ok(())
 
     }
 
@@ -1361,6 +1357,7 @@ const fn ty_signed_from_bytes(bytes: usize) -> Type {
 const fn ty_unsigned_from_bytes(bytes: usize) -> Type {
     PrimitiveType::Unsigned(bytes as u32 * 8).plain()
 }
+
 
 /// Internally used in a common function for all integer operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

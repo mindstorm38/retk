@@ -39,6 +39,15 @@ pub enum Statement {
         /// The value to assign to the left value.
         value: Expression,
     },
+    /// Represent a memory copy
+    MemCopy {
+        /// The source pointer of the memory copy.
+        src: Operand,
+        /// The destination pointer of the memory copy.
+        dst: Operand,
+        /// The length of the copy, in bytes.
+        len: Operand,
+    },
     /// A divergence in the basic block graph depending on a boolean condition.
     BranchConditional {
         /// The expression that produces a boolean value to take the correct branch.
@@ -68,9 +77,9 @@ pub struct LocalRef(u32);
 pub struct Place {
     /// The local variable that contains either the local to assign or a pointer if
     /// indirection is used.
-    local: LocalRef,
+    pub local: LocalRef,
     /// The optional indirection of this assignment.
-    indirection: u8,
+    pub indirection: u8,
 }
 
 /// Represent an operand in an expression.
@@ -367,8 +376,48 @@ pub fn write_function(mut f: impl io::Write, function: &Function, type_system: &
                 place, 
                 ref value
             } => {
+
+                // Shorthand binary expression, like +=
+                if place.indirection == 0 {
+
+                    let right = match value {
+                        Expression::Add(b) | 
+                        Expression::Sub(b) |
+                        Expression::Mul(b) |
+                        Expression::Div(b) |
+                        Expression::And(b) |
+                        Expression::Or(b) |
+                        Expression::Xor(b)
+                        if b.left == Operand::Local(place.local) => Some(b.right),
+                        _ => None,
+                    };
+
+                    if let Some(right) = right {
+
+                        let op = match value {
+                            Expression::Add(_) => "+=",
+                            Expression::Sub(_) => "-=",
+                            Expression::Mul(_) => "*=",
+                            Expression::Div(_) => "/=",
+                            Expression::And(_) => "&=",
+                            Expression::Or(_) => "|=",
+                            Expression::Xor(_) => "^=",
+                            _ => unreachable!()
+                        };
+
+                        writeln!(f, "{place} {op} {right}")?;
+                        continue;
+
+                    }
+
+                }
+
                 let ty = function.place_type(place);
                 writeln!(f, "{place} = {}", ContextualExpression { inner: value, type_system, ty })?;
+
+            }
+            Statement::MemCopy { src, dst, len } => {
+                writeln!(f, "memcpy {src} -> {dst} ({len})")?;
             }
             Statement::BranchConditional { 
                 ref value,
