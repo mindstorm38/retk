@@ -4,7 +4,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 use iced_x86::{Instruction, Code, Register, ConditionCode};
-use anyhow::{Result as AnyResult, anyhow};
+use anyhow::{Result as AnyResult, anyhow, bail};
 
 use crate::idr::{LocalRef, Function, Statement, Expression, Place, BinaryExpression, Operand, ComparisonOperator};
 use crate::ty::{TypeSystem, Type, PrimitiveType};
@@ -19,9 +19,11 @@ pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
     let mut type_system = TypeSystem::new(backend.pointer_size, 8);
     let mut functions = HashMap::new();
 
-    'func: for early_function in early_functions.iter_functions() {
+    let functions_count = early_functions.functions_count();
 
-        print!(" = At {:08X}... ", early_function.begin());
+    'func: for (i, early_function) in early_functions.iter_functions().enumerate() {
+
+        print!(" = At {:08X} ({:03}%)... ", early_function.begin(), i as f32 / functions_count as f32 * 100.0);
 
         let section = backend.sections.get_code_section_at(early_function.begin()).unwrap();
         let offset = early_function.begin() - section.begin_addr;
@@ -40,6 +42,8 @@ pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
         println!("done.");
         
     }
+
+    println!(" = Success rate: {}%", functions.len() as f32 / functions_count as f32 * 100.0);
 
 }
 
@@ -115,7 +119,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                 match &mut self.function.statements[branch_index] {
                     Statement::Branch { branch } => *branch = index,
                     Statement::BranchConditional { branch_true, .. } => *branch_true = index,
-                    stmt => panic!("statement cannot be relocated: {stmt:?}"),
+                    stmt => bail!("statement cannot be relocated: {stmt:?}"),
                 }
             }
         }
@@ -291,7 +295,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     /// Decode the memory operand of an instruction that is intended to be a destination
     /// place for an assignment statement. The type of the pointed value is given as a 
     /// hint to this function.
-    fn decode_mem_operand_place(&mut self, inst: &Instruction, ty: Type) -> Place {
+    fn decode_mem_operand_place(&mut self, inst: &Instruction, ty: Type) -> AnyResult<Place> {
 
         let mem_displ = inst.memory_displacement64() as i64;
 
@@ -339,7 +343,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                 }
 
             }
-            Register::None => unreachable!(),
+            Register::None => bail!("decode_mem_operand_place: no base ({inst})"),
             base_reg => {
 
                 let mut reg_local = self.decode_register_preserve(base_reg, ty.pointer(1));
@@ -371,14 +375,14 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             }
         }
 
-        place
+        Ok(place)
 
     }
 
     /// Decode the memory operand of an instruction that is intended to be read as the
     /// source for an expression. The type of the pointed value is given as a hint to
     /// this function.
-    fn decode_mem_operand_read(&mut self, inst: &Instruction, ty: Type) -> LocalRef {
+    fn decode_mem_operand_read(&mut self, inst: &Instruction, ty: Type) -> AnyResult<LocalRef> {
 
         let mem_displ = inst.memory_displacement64() as i64;
 
@@ -442,7 +446,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                 }
 
             }
-            Register::None => unreachable!(),
+            Register::None => bail!("decode_mem_operand_read: no base ({inst})"),
             base_reg => {
 
                 let mut reg_local = self.decode_register_preserve(base_reg, ty.pointer(1));
@@ -478,12 +482,12 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             }
         }
 
-        local
+        Ok(local)
 
     }
 
     /// Decode `lea <r>,<m>`.
-    fn decode_lea_r_m(&mut self, inst: &Instruction) {
+    fn decode_lea_r_m(&mut self, inst: &Instruction) -> AnyResult<()> {
 
         let reg0 = inst.op0_register();
         let mem_displ = inst.memory_displacement64() as i64;
@@ -523,7 +527,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                 }
 
             }
-            Register::None => unreachable!(),
+            Register::None => bail!("decode_lea_r_m: no base ({inst})"),
             base_reg => {
 
                 // NOTE: Using void* by default, but it should usually be present.
@@ -548,6 +552,8 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
             }
         }
+
+        Ok(())
 
     }
     
@@ -580,20 +586,24 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
     }
 
-    fn decode_mov_rm_imm(&mut self, inst: &Instruction) {
+    /// Decode instruction `mov <rm>,<imm>`:
+    /// - https://www.felixcloutier.com/x86/mov
+    /// 
+    /// Move an immediate value into a register or memory.
+    fn decode_mov_rm_imm(&mut self, inst: &Instruction) -> AnyResult<()> {
         let imm = inst.immediate32to64();
         match inst.op0_register() {
             Register::None => {
                 // mov <m>,<imm>
                 let mem_ty = ty_signed_from_bytes(inst.memory_size().size());
-                let mem_place = self.decode_mem_operand_place(inst, mem_ty);
+                let mem_place = self.decode_mem_operand_place(inst, mem_ty)?;
                 self.push_assign(mem_place, Expression::Copy(Operand::LiteralSigned(imm)));
             }
             Register::SP |
             Register::ESP |
             Register::RSP => {
                 // mov sp,<imm>
-                panic!("statically unknown: mov sp,<imm>");
+                bail!("statically unknown: mov sp,<imm> ({inst})");
             }
             reg => {
                 // mov <reg>,<imm>
@@ -602,24 +612,29 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                 self.push_assign(Place::new_direct(reg_local), Expression::Copy(Operand::LiteralSigned(imm)));
             }
         }
+        Ok(())
     }
 
-    fn decode_mov_rm_rm(&mut self, inst: &Instruction) {
+    /// Decode instruction `mov <rm>,<imm>`:
+    /// - https://www.felixcloutier.com/x86/mov
+    /// 
+    /// Move a register/memory into a register/memory (only one can be memory).
+    fn decode_mov_rm_rm(&mut self, inst: &Instruction) -> AnyResult<()> {
 
         let place;
         let operand;
 
         match (inst.op0_register(), inst.op1_register()) {
-            (_, Register::RSP) => panic!("statically unknown: mov <rm>,sp"),
-            (Register::RSP, _) => panic!("statically unknown: mov sp,<rm>"),
+            (_, Register::RSP) => bail!("statically unknown: mov <rm>,sp ({inst})"),
+            (Register::RSP, _) => bail!("statically unknown: mov sp,<rm> ({inst})"),
             (Register::None, reg1) => {
                 let ty = ty_signed_from_bytes(reg1.size());
                 operand = Operand::Local(self.decode_register_preserve(reg1, ty));
-                place = self.decode_mem_operand_place(inst, ty);
+                place = self.decode_mem_operand_place(inst, ty)?;
             }
             (reg0, Register::None) => {
                 let ty = ty_signed_from_bytes(reg0.size());
-                operand = Operand::Local(self.decode_mem_operand_read(inst, ty));
+                operand = Operand::Local(self.decode_mem_operand_read(inst, ty)?);
                 place = Place::new_direct(self.decode_register_overwrite(reg0, ty));
             }
             (reg0, reg1) => {
@@ -630,15 +645,16 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         }
 
         self.push_assign(place, Expression::Copy(operand));
+        Ok(())
 
     }
 
-    fn decode_movzx_r_rm(&mut self, inst: &Instruction) {
-        self.decode_mov_rm_rm(inst); // FIXME: Add specific support for movzx
+    fn decode_movzx_r_rm(&mut self, inst: &Instruction) -> AnyResult<()> {
+        self.decode_mov_rm_rm(inst) // FIXME: Add specific support for movzx
     }
 
-    fn decode_movsx_r_rm(&mut self, inst: &Instruction) {
-        self.decode_mov_rm_rm(inst); // FIXME: Add specific support for movsx
+    fn decode_movsx_r_rm(&mut self, inst: &Instruction) -> AnyResult<()> {
+        self.decode_mov_rm_rm(inst) // FIXME: Add specific support for movsx
     }
 
     /// Decode instruction `movsb/movsw/movsd/movsq`:
@@ -695,7 +711,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
         }
 
-        self.debug_function();
+        // self.debug_function();
 
     }
 
@@ -704,7 +720,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     /// - https://www.felixcloutier.com/x86/movsd
     /// 
     /// Such instructions move single value between scalar registers.
-    fn decode_movs_rm_rm(&mut self, inst: &Instruction, double: bool) {
+    fn decode_movs_rm_rm(&mut self, inst: &Instruction, double: bool) -> AnyResult<()> {
         
         let ty = if double { TY_DOUBLE } else { TY_FLOAT };
         let place;
@@ -713,10 +729,10 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         match (inst.op0_register(), inst.op1_register()) {
             (Register::None, reg1) => {
                 operand = Operand::Local(self.decode_register_preserve(reg1, ty));
-                place = self.decode_mem_operand_place(inst, ty);
+                place = self.decode_mem_operand_place(inst, ty)?;
             }
             (reg0, Register::None) => {
-                operand = Operand::Local(self.decode_mem_operand_read(inst, ty));
+                operand = Operand::Local(self.decode_mem_operand_read(inst, ty)?);
                 place = Place::new_direct(self.decode_register_overwrite(reg0, ty));
             }
             (reg0, reg1) => {
@@ -726,19 +742,21 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         }
 
         self.push_assign(place, Expression::Copy(operand));
+        Ok(())
 
     }
 
     /// Abstraction function to decode every instruction `<op> <rm>,<imm>` where `op` is
     /// an integer binary operation that write the result in the left operand.
-    fn decode_int_op_rm_imm(&mut self, inst: &Instruction, op: IntOp) {
+    fn decode_int_op_rm_imm(&mut self, inst: &Instruction, op: IntOp) -> AnyResult<()> {
+
         let imm = inst.immediate32to64();
         match inst.op0_register() {
             Register::None => {
                 // <op> <rm>,<imm>
                 let mem_ty = ty_signed_from_bytes(inst.memory_size().size());
-                let mem_place = self.decode_mem_operand_place(inst, mem_ty);
-                let mem_local = self.decode_mem_operand_read(inst, mem_ty);
+                let mem_place = self.decode_mem_operand_place(inst, mem_ty)?;
+                let mem_local = self.decode_mem_operand_read(inst, mem_ty)?;
                 self.push_assign(mem_place, 
                     op.to_expr(Operand::Local(mem_local), Operand::LiteralUnsigned(imm as u64)));
             }
@@ -749,7 +767,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                 match op {
                     IntOp::Add => self.add_sp(imm as i32),
                     IntOp::Sub => self.sub_sp(imm as i32),
-                    _ => panic!("statically unknown: {op:?} sp,<imm>")
+                    _ => bail!("statically unknown: <op> sp,<imm> ({inst})")
                 };
             }
             reg => {
@@ -761,28 +779,31 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                     op.to_expr(Operand::Local(reg_read_local), Operand::LiteralUnsigned(imm as u64)));
             }
         }
+        
+        Ok(())
+
     }
 
     /// Abstraction function to decode every instruction `<op> <rm>,<rm>` where `op` is
     /// an integer binary operation that write the result in the left operand.
-    fn decode_int_op_rm_rm(&mut self, inst: &Instruction, op: IntOp) {
+    fn decode_int_op_rm_rm(&mut self, inst: &Instruction, op: IntOp) -> AnyResult<()> {
 
         let place;
         let left;
         let right;
 
         match (inst.op0_register(), inst.op1_register()) {
-            (_, Register::RSP) => panic!("statically unknown: {op:?} <rm>,sp"),
-            (Register::RSP, _) => panic!("statically unknown: {op:?} sp,<rm>"),
+            (_, Register::RSP) => bail!("statically unknown: <op> <rm>,sp ({inst})"),
+            (Register::RSP, _) => bail!("statically unknown: <op> sp,<rm> ({inst})"),
             (Register::None, reg1) => {
                 let ty = ty_signed_from_bytes(reg1.size());
-                place = self.decode_mem_operand_place(inst, ty);
-                left = Operand::Local(self.decode_mem_operand_read(inst, ty));
+                place = self.decode_mem_operand_place(inst, ty)?;
+                left = Operand::Local(self.decode_mem_operand_read(inst, ty)?);
                 right = Operand::Local(self.decode_register_preserve(reg1, ty));
             }
             (reg0, Register::None) => {
                 let ty = ty_signed_from_bytes(reg0.size());
-                right = Operand::Local(self.decode_mem_operand_read(inst, ty));
+                right = Operand::Local(self.decode_mem_operand_read(inst, ty)?);
                 left = Operand::Local(self.decode_register_preserve(reg0, ty));
                 place = Place::new_direct(self.decode_register_overwrite(reg0, ty));
             }
@@ -790,7 +811,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                 let ty = ty_signed_from_bytes(reg0.size());
                 let place = Place::new_direct(self.decode_register_overwrite(reg0, ty));
                 self.push_assign(place, Expression::Copy(Operand::LiteralUnsigned(0)));
-                return;
+                return Ok(());
             }
             (reg0, reg1) => {
                 let ty = ty_signed_from_bytes(reg0.size());
@@ -801,6 +822,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         }
 
         self.push_assign(place, op.to_expr(left, right));
+        Ok(())
 
     }
 
@@ -809,15 +831,15 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     /// 
     /// This instruction make a *bitwise and* between the left and right operand and set
     /// the appropriate flags (SF, ZF, PF), OF and CF are set to zero.
-    fn decode_test_rm_r(&mut self, inst: &Instruction) {
+    fn decode_test_rm_r(&mut self, inst: &Instruction) -> AnyResult<()> {
 
         let reg1 = inst.op1_register();
         let ty = ty_signed_from_bytes(reg1.size());
         let right_local = self.decode_register_preserve(reg1, ty);
 
         let left_local = match inst.op0_register() {
-            Register::None => self.decode_mem_operand_read(inst, ty),
-            reg0 => self.decode_register_preserve(reg0, ty)
+            Register::None => self.decode_mem_operand_read(inst, ty)?,
+            reg0 => self.decode_register_preserve(reg0, ty),
         };
 
         self.last_cmp = Some(Cmp {
@@ -826,6 +848,8 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             kind: CmpKind::Test,
         });
 
+        Ok(())
+
     }
 
     /// Decode the instruction `cmp <rm>,<imm>`:
@@ -833,7 +857,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     /// 
     /// This instruction subtract the right immediate operand from the left one,
     /// and set the appropriate flags according to the result.
-    fn decode_cmp_rm_imm(&mut self, inst: &Instruction) {
+    fn decode_cmp_rm_imm(&mut self, inst: &Instruction) -> AnyResult<()> {
 
         let ty;
         let left_local;
@@ -841,7 +865,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         match inst.op0_register() {
             Register::None => {
                 ty = ty_signed_from_bytes(inst.memory_size().size());
-                left_local = self.decode_mem_operand_read(inst, ty);
+                left_local = self.decode_mem_operand_read(inst, ty)?;
             }
             reg => {
                 ty = ty_signed_from_bytes(reg.size());
@@ -855,6 +879,8 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             kind: CmpKind::Cmp,
         });
 
+        Ok(())
+
     }
 
     /// Decode the instruction `cmp <rm>,<imm>`:
@@ -862,24 +888,23 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     /// 
     /// This instruction subtract the right operand from the left one, 
     /// and set the appropriate flags according to the result.
-    fn decode_cmp_rm_rm(&mut self, inst: &Instruction) {
+    fn decode_cmp_rm_rm(&mut self, inst: &Instruction) -> AnyResult<()> {
 
         let ty = ty_signed_from_bytes(inst.memory_size().size());
-        let mem_local = self.decode_mem_operand_read(inst, ty);
 
         let left = match inst.op0_register() {
-            Register::None => Operand::Local(mem_local),
+            Register::None => Operand::Local(self.decode_mem_operand_read(inst, ty)?),
             Register::SP |
             Register::ESP |
-            Register::RSP => panic!("statically unknown: cmp sp,<rm>"),
+            Register::RSP => bail!("statically unknown: cmp sp,<rm> ({inst})"),
             reg0 => Operand::Local(self.decode_register_preserve(reg0, ty)),
         };
 
         let right = match inst.op1_register() {
-            Register::None => Operand::Local(mem_local),
+            Register::None => Operand::Local(self.decode_mem_operand_read(inst, ty)?),
             Register::SP |
             Register::ESP |
-            Register::RSP => panic!("statically unknown: cmp <rm>,sp"),
+            Register::RSP => bail!("statically unknown: cmp <rm>,sp ({inst})"),
             reg1 => Operand::Local(self.decode_register_preserve(reg1, ty)),
         };
 
@@ -888,6 +913,8 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             right,
             kind: CmpKind::Cmp,
         });
+
+        Ok(())
 
     }
 
@@ -903,10 +930,10 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
     }
 
-    fn decode_call_rm(&mut self, inst: &Instruction) {
+    fn decode_call_rm(&mut self, inst: &Instruction) -> AnyResult<()> {
 
         let pointer_local = match inst.op0_register() {
-            Register::None => self.decode_mem_operand_read(inst, TY_VOID.pointer(1)),
+            Register::None => self.decode_mem_operand_read(inst, TY_VOID.pointer(1))?,
             reg => self.decode_register_preserve(reg, TY_VOID.pointer(1)),
         };
 
@@ -917,12 +944,14 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             arguments: Vec::new(),
         });
 
+        Ok(())
+
     }
 
-    fn decode_jcc(&mut self, inst: &Instruction) {
+    fn decode_jcc(&mut self, inst: &Instruction) -> AnyResult<()> {
 
         let cmp = self.last_cmp.take()
-            .expect("decode_jcc: no previous cmp");
+            .ok_or_else(|| anyhow!("decode_jcc: no previous cmp"))?;
 
         let pointer = inst.near_branch64();
         let cond_expr;
@@ -944,7 +973,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                    ConditionCode::ge => ComparisonOperator::GreaterOrEqual,
                    ConditionCode::l => ComparisonOperator::Less,
                    ConditionCode::le => ComparisonOperator::LessOrEqual,
-                   _ => unimplemented!("decode_jcc: cmp {:?}", inst.condition_code())
+                   _ => bail!("decode_jcc (cmp): unsupported condition {:?}", inst.condition_code())
                 };
 
                 cond_expr = Expression::Comparison {
@@ -964,7 +993,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                     let operator = match inst.condition_code() {
                         ConditionCode::ne => ComparisonOperator::NotEqual,
                         ConditionCode::e => ComparisonOperator::Equal,
-                        _ => unimplemented!("decode_jcc: cmp {:?}", inst.condition_code())
+                        _ => bail!("decode_jcc (test): unsupported condition {:?}", inst.condition_code())
                     };
 
                     cond_expr = Expression::Comparison { 
@@ -974,7 +1003,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                     };
 
                 } else {
-                    todo!()
+                    bail!("decode_jcc (test): unsupported different operands");
                 }
 
             }
@@ -993,13 +1022,15 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         block.false_branch = Some(inst.next_ip());
 
         // We added a branch statement, this implied existence of two basic blocks.
-        let true_block = self.ensure_basic_block(pointer);
+        let true_block = self.ensure_basic_block(pointer)?;
         true_block.branch_indices_to_relocate.push(branch_index);
-        let _false_block = self.ensure_basic_block(inst.next_ip());
+        let _false_block = self.ensure_basic_block(inst.next_ip())?;
+
+        Ok(())
 
     }
 
-    fn decode_jmp(&mut self, inst: &Instruction) {
+    fn decode_jmp(&mut self, inst: &Instruction) -> AnyResult<()> {
 
         let pointer = inst.near_branch64();
         
@@ -1008,8 +1039,10 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         block.true_branch = Some(pointer);
 
         // TODO: For tail-call, the pointed basic block may no exists! Support tail-call.
-        let target_block = self.ensure_basic_block(pointer);
+        let target_block = self.ensure_basic_block(pointer)?;
         target_block.branch_indices_to_relocate.push(branch_index);
+
+        Ok(())
 
     }
 
@@ -1066,7 +1099,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             // LEA
             Code::Lea_r64_m |
             Code::Lea_r32_m |
-            Code::Lea_r16_m => self.decode_lea_r_m(inst),
+            Code::Lea_r16_m => self.decode_lea_r_m(inst)?,
             // MOV
             Code::Mov_r64_imm64 |
             Code::Mov_r32_imm32 |
@@ -1075,7 +1108,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Mov_rm64_imm32 |
             Code::Mov_rm32_imm32 |
             Code::Mov_rm16_imm16 |
-            Code::Mov_rm8_imm8 => self.decode_mov_rm_imm(inst),
+            Code::Mov_rm8_imm8 => self.decode_mov_rm_imm(inst)?,
             Code::Mov_r64_rm64 |
             Code::Mov_r32_rm32 |
             Code::Mov_r16_rm16 |
@@ -1083,14 +1116,14 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Mov_rm64_r64 |
             Code::Mov_rm32_r32 |
             Code::Mov_rm16_r16 |
-            Code::Mov_rm8_r8 => self.decode_mov_rm_rm(inst),
+            Code::Mov_rm8_r8 => self.decode_mov_rm_rm(inst)?,
             // MOVZX (move zero-extended)
             Code::Movzx_r64_rm16 |
             Code::Movzx_r64_rm8 |
             Code::Movzx_r32_rm16 |
             Code::Movzx_r32_rm8 |
             Code::Movzx_r16_rm16 |
-            Code::Movzx_r16_rm8 => self.decode_movzx_r_rm(inst),
+            Code::Movzx_r16_rm8 => self.decode_movzx_r_rm(inst)?,
             // MOVSX (move sign-extended)
             Code::Movsx_r64_rm16 |
             Code::Movsx_r64_rm8 |
@@ -1100,7 +1133,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Movsx_r16_rm8 |
             Code::Movsxd_r64_rm32 |
             Code::Movsxd_r32_rm32 |
-            Code::Movsxd_r16_rm16 => self.decode_movsx_r_rm(inst),
+            Code::Movsxd_r16_rm16 => self.decode_movsx_r_rm(inst)?,
             // MOVS (mov string)
             Code::Movsq_m64_m64 |
             Code::Movsd_m32_m32 |
@@ -1108,9 +1141,9 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Movsb_m8_m8 => self.decode_movs_m_m(inst),
             // MOVSS/MOVSD
             Code::Movss_xmm_xmmm32 |
-            Code::Movss_xmmm32_xmm => self.decode_movs_rm_rm(inst, false),
+            Code::Movss_xmmm32_xmm => self.decode_movs_rm_rm(inst, false)?,
             Code::Movsd_xmm_xmmm64 |
-            Code::Movsd_xmmm64_xmm => self.decode_movs_rm_rm(inst, true),
+            Code::Movsd_xmmm64_xmm => self.decode_movs_rm_rm(inst, true)?,
             // ADD
             Code::Add_rm64_imm8 |
             Code::Add_rm32_imm8 |
@@ -1118,7 +1151,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Add_rm8_imm8 |
             Code::Add_rm64_imm32 |
             Code::Add_rm32_imm32 |
-            Code::Add_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::Add),
+            Code::Add_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::Add)?,
             Code::Add_r64_rm64 |
             Code::Add_r32_rm32 |
             Code::Add_r16_rm16 |
@@ -1126,7 +1159,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Add_rm64_r64 |
             Code::Add_rm32_r32 |
             Code::Add_rm16_r16 |
-            Code::Add_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Add),
+            Code::Add_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Add)?,
             // SUB
             Code::Sub_rm64_imm8 |
             Code::Sub_rm32_imm8 |
@@ -1134,7 +1167,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Sub_rm8_imm8 |
             Code::Sub_rm64_imm32 |
             Code::Sub_rm32_imm32 |
-            Code::Sub_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::Sub),
+            Code::Sub_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::Sub)?,
             Code::Sub_r64_rm64 |
             Code::Sub_r32_rm32 |
             Code::Sub_r16_rm16 |
@@ -1142,7 +1175,23 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Sub_rm64_r64 |
             Code::Sub_rm32_r32 |
             Code::Sub_rm16_r16 |
-            Code::Sub_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Sub),
+            Code::Sub_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Sub)?,
+            // AND
+            Code::And_rm64_imm8 |
+            Code::And_rm32_imm8 |
+            Code::And_rm16_imm8 |
+            Code::And_rm8_imm8 |
+            Code::And_rm64_imm32 |
+            Code::And_rm32_imm32 |
+            Code::And_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::Xor)?,
+            Code::And_r64_rm64 |
+            Code::And_r32_rm32 |
+            Code::And_r16_rm16 |
+            Code::And_r8_rm8 |
+            Code::And_rm64_r64 |
+            Code::And_rm32_r32 |
+            Code::And_rm16_r16 |
+            Code::And_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Xor)?,
             // SUB
             Code::Xor_rm64_imm8 |
             Code::Xor_rm32_imm8 |
@@ -1150,7 +1199,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Xor_rm8_imm8 |
             Code::Xor_rm64_imm32 |
             Code::Xor_rm32_imm32 |
-            Code::Xor_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::Xor),
+            Code::Xor_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::Xor)?,
             Code::Xor_r64_rm64 |
             Code::Xor_r32_rm32 |
             Code::Xor_r16_rm16 |
@@ -1158,19 +1207,19 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Xor_rm64_r64 |
             Code::Xor_rm32_r32 |
             Code::Xor_rm16_r16 |
-            Code::Xor_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Xor),
+            Code::Xor_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Xor)?,
             // TEST
             Code::Test_rm64_r64 |
             Code::Test_rm32_r32 |
             Code::Test_rm16_r16 |
-            Code::Test_rm8_r8 => self.decode_test_rm_r(inst),
+            Code::Test_rm8_r8 => self.decode_test_rm_r(inst)?,
             // TMP
             Code::Cmp_rm64_imm8 |
             Code::Cmp_rm32_imm8 |
             Code::Cmp_rm16_imm8 |
             Code::Cmp_rm64_imm32 |
             Code::Cmp_rm32_imm32 |
-            Code::Cmp_rm16_imm16 => self.decode_cmp_rm_imm(inst),
+            Code::Cmp_rm16_imm16 => self.decode_cmp_rm_imm(inst)?,
             Code::Cmp_rm64_r64 |
             Code::Cmp_rm32_r32 |
             Code::Cmp_rm16_r16 |
@@ -1178,22 +1227,22 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Cmp_r64_rm64 |
             Code::Cmp_r32_rm32 |
             Code::Cmp_r16_rm16 |
-            Code::Cmp_r8_rm8 => self.decode_cmp_rm_rm(inst),
+            Code::Cmp_r8_rm8 => self.decode_cmp_rm_rm(inst)?,
             // CALL
             Code::Call_rel16 |
             Code::Call_rel32_32 |
             Code::Call_rel32_64 => self.decode_call_rel(inst),
             Code::Call_rm64 |
             Code::Call_rm32 |
-            Code::Call_rm16 => self.decode_call_rm(inst),
+            Code::Call_rm16 => self.decode_call_rm(inst)?,
             // Jcc
-            code if code.is_jcc_short_or_near() => self.decode_jcc(inst),
+            code if code.is_jcc_short_or_near() => self.decode_jcc(inst)?,
             // JMP
             Code::Jmp_rel8_64 |
             Code::Jmp_rel8_32 |
             Code::Jmp_rel8_16 |
             Code::Jmp_rel32_64 |
-            Code::Jmp_rel32_32 => self.decode_jmp(inst),
+            Code::Jmp_rel32_32 => self.decode_jmp(inst)?,
             // RET
             Code::Retnq |
             Code::Retnd |
@@ -1216,7 +1265,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Nop_rm64 |
             Code::Int3 => {},
             _ => {
-                return Err(anyhow!("unsupported opcode: {inst:?}"));
+                return Err(anyhow!("unsupported opcode: {inst}"));
             }
         }
 
@@ -1330,9 +1379,11 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     /// Ensure that a basic block is existing at the given ip, for debugging purpose this
     /// function panics if the given ip is not containing within early function.
     #[track_caller]
-    fn ensure_basic_block(&mut self, ip: u64) -> &mut BasicBlock {
-        assert!(self.early_function.contains_block(ip), "incoherent basic block with early function");
-        self.basic_blocks.entry(ip).or_default()
+    fn ensure_basic_block(&mut self, ip: u64) -> AnyResult<&mut BasicBlock> {
+        if !self.early_function.contains_block(ip) {
+            bail!("incoherent basic block with early function: {ip:08X}");
+        }
+        Ok(self.basic_blocks.entry(ip).or_default())
     }
 
     fn debug_function(&self) {
@@ -1364,6 +1415,7 @@ const fn ty_unsigned_from_bytes(bytes: usize) -> Type {
 enum IntOp {
     Add,
     Sub,
+    And,
     Xor,
 }
 
@@ -1373,6 +1425,7 @@ impl IntOp {
         match self {
             IntOp::Add => Expression::Add(BinaryExpression { left, right }),
             IntOp::Sub => Expression::Sub(BinaryExpression { left, right }),
+            IntOp::And => Expression::And(BinaryExpression { left, right }),
             IntOp::Xor => Expression::Xor(BinaryExpression { left, right }),
         }
     }
