@@ -30,7 +30,7 @@ pub struct Local {
 }
 
 /// Represent a statement in a pseudo-code function.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Statement {
     /// Assignment of an expression to a left value.
     Assign {
@@ -68,49 +68,57 @@ pub enum Statement {
 }
 
 /// Reference to a local variable, used in left values and expressions to reference 
-/// the variable.
+/// the variable. 
+/// 
+/// TODO: Maybe use non-zero u32 in order to gain space through niches everywhere?
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LocalRef(u32);
 
-/// Represent a place where a value can be stored, 
+/// Describe type of index used for indirect place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Index {
+    /// The indexing is absolute.
+    Absolute(i32),
+    /// The indexing is given from a local variable's value.
+    Variable(LocalRef),
+}
+
+/// Represent a memory place that can be referenced and dereferenced for pointers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Place {
     /// The local variable that contains either the local to assign or a pointer if
     /// indirection is used.
     pub local: LocalRef,
-    /// The optional indirection of this assignment.
-    pub indirection: u8,
+    /// The optional index to apply to this local, requiring it to be a pointer. The
+    /// index is multiplied by the pointed-type's size to get the real bytes offset.
+    /// 
+    /// *If the given local variable is not a pointer type, the type must at least
+    /// be an integer and will be interpreted as a byte pointer.*
+    pub index: Option<Index>,
 }
 
 /// Represent an operand in an expression.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operand {
+    /// Special constant for zero constant, can be applied to int, floats and vectors.
+    Zero,
     /// A literal unsigned 64-bit integer.
     LiteralUnsigned(u64),
     /// A literal signed 64-bit integer.
     LiteralSigned(i64),
-    /// A literal floating point number.
-    LiteralFloat(f64),
-    /// The value of the operand come from the local.
-    Local(LocalRef),
+    /// The value of the operand come from a memory place.
+    Place(Place),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expression {
     /// Bitwise copy of the operand's value.
     Copy(Operand),
-    /// Load the value pointed by a pointer local.
-    Deref {
-        /// Index of the local that should be a pointer.
-        pointer: Operand,
-        /// Level of indirection of the dereference.
-        indirection: u8,
-    },
-    /// Get a pointer to a local variable.
-    Ref(LocalRef),
+    /// Get a pointer to a memory place.
+    Ref(Place),
     /// Cast a source local of a given type to another to the destination type of
     /// assigned local variable.
-    Cast(LocalRef),
+    Cast(Place),
     /// Call a function from a pointer and an argument list.
     Call {
         /// The function pointer, either static or dynamic from a place.
@@ -136,7 +144,7 @@ pub enum Expression {
 }
 
 /// Base type for binary expressions.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinaryExpression {
     /// Left local on the binary expression.
     pub left: Operand,
@@ -158,11 +166,24 @@ pub enum ComparisonOperator {
 impl Place {
 
     pub const fn new_direct(local: LocalRef) -> Self {
-        Self { local, indirection: 0 }
+        Self { local, index: None }
     }
 
-    pub const fn new_indirect(local: LocalRef, indirection: u8) -> Self {
-        Self { local, indirection }
+    pub const fn new_index_absolute(local: LocalRef, index: i32) -> Self {
+        Self { local, index: Some(Index::Absolute(index)) }
+    }
+
+    pub const fn new_index_variable(local: LocalRef, index: LocalRef) -> Self {
+        Self { local, index: Some(Index::Variable(index)) }
+    }
+
+}
+
+impl Operand {
+
+    /// Shortcut function to create a place operand with a local directly referenced.
+    pub const fn new_local(local: LocalRef) -> Self {
+        Self::Place(Place::new_direct(local))
     }
 
 }
@@ -206,23 +227,32 @@ impl Function {
 
     }
 
-    pub fn place_type(&self, place: Place) -> Type {
-        let ty = self.local_type(place.local);
-        if ty.indirection >= place.indirection {
-            ty.deref(place.indirection)
-        } else {
-            PrimitiveType::Void.plain()
-        }
-    }
-
+    /// Get the type associated to the given local variable.
     pub fn local_type(&self, local: LocalRef) -> Type {
         self.locals[local.0 as usize].ty
     }
 
+    /// Get the type referenced by a memory place.
+    pub fn place_type(&self, place: Place) -> Type {
+        let ty = self.local_type(place.local);
+        if place.index.is_some() {
+            // If there is an index, the type is expected to be a pointer/integer.
+            if ty.is_pointer() {
+                ty.deref(1)
+            } else {
+                PrimitiveType::Void.plain()
+            }
+        } else {
+            ty
+        }
+    }
+
+    /// Get the memory layout associated to the given local variable's type.
     pub fn local_layout(&self, local: LocalRef) -> Layout {
         self.locals[local.0 as usize].layout
     }
 
+    /// Modify the type of an existing local variable.
     pub fn set_local_type(&mut self, local: LocalRef, type_system: &TypeSystem, ty: Type) {
         let local = &mut self.locals[local.0 as usize];
         local.ty = ty;
@@ -253,21 +283,33 @@ impl fmt::Display for LocalRef {
 
 impl fmt::Display for Place {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for _ in 0..self.indirection {
-            f.write_char('*')?;
+        
+        match self.index {
+            Some(Index::Absolute(0)) => f.write_char('*')?,
+            _ => {}
         }
-        write!(f, "{}", self.local)
+
+        write!(f, "{}", self.local)?;
+        
+        match self.index {
+            Some(Index::Absolute(0)) | None => {}
+            Some(Index::Absolute(index)) => write!(f, "[{index}]")?,
+            Some(Index::Variable(local)) => write!(f, "[{local}]")?,
+        }
+
+        Ok(())
+
     }
 }
 
 impl fmt::Display for Operand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
+            Operand::Zero => f.write_str("0"),
             Operand::LiteralUnsigned(int @ 0..=9) => write!(f, "{int}"),
             Operand::LiteralUnsigned(int) => write!(f, "0x{int:X}"),
             Operand::LiteralSigned(int) => write!(f, "{int}"),
-            Operand::LiteralFloat(num) => write!(f, "{num}"),
-            Operand::Local(local) => write!(f, "{local}"),
+            Operand::Place(place) => write!(f, "{place}"),
         }
     }
 }
@@ -298,20 +340,14 @@ impl fmt::Display for Expression {
 
         match *self {
             Expression::Copy(op) => write!(f, "{op}"),
-            Expression::Deref { pointer, indirection } => {
-                for _ in 0..indirection {
-                    f.write_char('*')?;
-                }
-                write!(f, "{pointer}")
-            }
-            Expression::Ref(local) => write!(f, "&{local}"),
+            Expression::Ref(place) => write!(f, "&{place}"),
             Expression::Cast(local) => write!(f, "{local} as _"),
             Expression::Call { pointer, ref arguments } => {
                 match pointer {
+                    Operand::Zero => unimplemented!(),
                     Operand::LiteralUnsigned(int) => write!(f, "fn_{int:08X}")?,
                     Operand::LiteralSigned(int) => write!(f, "fn_{int:08X}")?,
-                    Operand::Local(local) => write!(f, "({local})")?,
-                    Operand::LiteralFloat(_) => unimplemented!(),
+                    Operand::Place(place) => write!(f, "({place})")?,
                 }
                 write!(f, "(args: {})", arguments.len())
             }
@@ -385,43 +421,41 @@ pub fn write_function(mut f: impl io::Write, function: &Function, type_system: &
                 ref value
             } => {
 
-                // Shorthand binary expression, like +=
-                if place.indirection == 0 {
+                let right = match value {
+                    Expression::Add(b) | 
+                    Expression::Sub(b) |
+                    Expression::Mul(b) |
+                    Expression::Div(b) |
+                    Expression::And(b) |
+                    Expression::Or(b) |
+                    Expression::Xor(b) |
+                    Expression::ShiftLeft(b) |
+                    Expression::ShiftRight(b)
+                    if b.left == Operand::Place(place) => Some(b.right),
+                    _ => None,
+                };
 
-                    let right = match value {
-                        Expression::Add(b) | 
-                        Expression::Sub(b) |
-                        Expression::Mul(b) |
-                        Expression::Div(b) |
-                        Expression::And(b) |
-                        Expression::Or(b) |
-                        Expression::Xor(b)
-                        if b.left == Operand::Local(place.local) => Some(b.right),
-                        _ => None,
+                if let Some(right) = right {
+
+                    let op = match value {
+                        Expression::Add(_) => "+=",
+                        Expression::Sub(_) => "-=",
+                        Expression::Mul(_) => "*=",
+                        Expression::Div(_) => "/=",
+                        Expression::And(_) => "&=",
+                        Expression::Or(_) => "|=",
+                        Expression::Xor(_) => "^=",
+                        Expression::ShiftLeft(_) => "<<=",
+                        Expression::ShiftRight(_) => ">>=",
+                        _ => unreachable!()
                     };
 
-                    if let Some(right) = right {
+                    writeln!(f, "{place} {op} {right}")?;
 
-                        let op = match value {
-                            Expression::Add(_) => "+=",
-                            Expression::Sub(_) => "-=",
-                            Expression::Mul(_) => "*=",
-                            Expression::Div(_) => "/=",
-                            Expression::And(_) => "&=",
-                            Expression::Or(_) => "|=",
-                            Expression::Xor(_) => "^=",
-                            _ => unreachable!()
-                        };
-
-                        writeln!(f, "{place} {op} {right}")?;
-                        continue;
-
-                    }
-
+                } else {
+                    let ty = function.place_type(place);
+                    writeln!(f, "{place} = {}", ContextualExpression { inner: value, type_system, ty })?;
                 }
-
-                let ty = function.place_type(place);
-                writeln!(f, "{place} = {}", ContextualExpression { inner: value, type_system, ty })?;
 
             }
             Statement::MemCopy { src, dst, len } => {
