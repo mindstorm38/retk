@@ -365,7 +365,7 @@ pub fn write_function(mut f: impl io::Write, function: &Function, type_system: &
         writeln!(f, "{} {}   \t// {}", type_system.name(local.ty), LocalRef(i as _), local.comment)?;
     }
 
-    const TY_BOOL: Type = PrimitiveType::Unsigned(1).plain();
+    const TY_BOOL: Type = PrimitiveType::UnsignedInt(1).plain();
 
     // Indicate if the next statement is the first of a new basic block.
     let mut basic_block_start = true;

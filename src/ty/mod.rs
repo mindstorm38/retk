@@ -57,8 +57,9 @@ impl TypeSystem {
         let mut name = String::new();
         match ty.primitive {
             PrimitiveType::Void => write!(name, "void").unwrap(),
-            PrimitiveType::Unsigned(n) => write!(name, "u{n}").unwrap(),
-            PrimitiveType::Signed(n) => write!(name, "i{n}").unwrap(),
+            PrimitiveType::WeakInt(n) => write!(name, "i{n}").unwrap(),
+            PrimitiveType::UnsignedInt(n) => write!(name, "u{n}").unwrap(),
+            PrimitiveType::SignedInt(n) => write!(name, "s{n}").unwrap(),
             PrimitiveType::Float => name.write_str("f32").unwrap(),
             PrimitiveType::Double => name.write_str("f64").unwrap(),
             PrimitiveType::FloatVec(n) => write!(name, "f32x{n}").unwrap(),
@@ -93,8 +94,9 @@ impl TypeSystem {
 
         match ty.primitive {
             PrimitiveType::Void => Some(Layout { size: 0, align: 0 }),
-            PrimitiveType::Unsigned(n) |
-            PrimitiveType::Signed(n) => {
+            PrimitiveType::WeakInt(n) |
+            PrimitiveType::UnsignedInt(n) |
+            PrimitiveType::SignedInt(n) => {
                 let bytes = self.bits_to_bytes(n as u64);
                 Some(Layout { size: bytes, align: bytes })
             }
@@ -159,10 +161,14 @@ pub enum PrimitiveType {
     /// An 0-bit type, usually as a pointer. Its layout specifies zero size or alignment,
     /// so it make no sense for it to be instantiated.
     Void,
+    /// An untyped sequence of given bits size. This type is mainly used for type 
+    /// analysis while decoding, if this type remains at the end of the analysis, it can
+    /// be coerced to any other integer type.
+    WeakInt(u32),
     /// An unsigned integer of the given bits size.
-    Unsigned(u32),
+    UnsignedInt(u32),
     /// A signed integer of the given bits size.
-    Signed(u32),
+    SignedInt(u32),
     /// Single-precision IEEE-754 floating point number.
     Float,
     /// Double-precision IEEE-754 floating point number.
@@ -201,6 +207,59 @@ impl PrimitiveType {
     pub const fn pointer(self, indirection: u8) -> Type {
         Type { primitive: self, indirection }
     }
+    
+    /// Return true if this primitive type is void.
+    #[inline]
+    pub const fn is_void(self) -> bool {
+        matches!(self, Self::Void)
+    }
+
+    /// Return true if this primitive type is an integer.
+    #[inline]
+    pub const fn is_int(self) -> bool {
+        matches!(self, Self::WeakInt(_) | Self::UnsignedInt(_) | Self::SignedInt(_))
+    }
+
+    /// Return true if this primitive type is a single/double floating point number.
+    #[inline]
+    pub const fn is_float(self) -> bool {
+        matches!(self, Self::Float | Self::Double)
+    }
+
+    /// Return true if this primitive type is a SIMD vector.
+    #[inline]
+    pub const fn is_vec(self) -> bool {
+        matches!(self, Self::FloatVec(_) | Self::DoubleVec(_))
+    }
+
+    /// If this is a weak integer, returns its bit count.
+    #[inline]
+    pub const fn weak_int_bits(self) -> Option<u32> {
+        match self {
+            Self::WeakInt(n) => Some(n),
+            _ => None
+        }
+    }
+
+    /// If this is an actual integer *(not weak)*, returns its bit count.
+    #[inline]
+    pub const fn actual_int_bits(self) -> Option<u32> {
+        match self {
+            Self::UnsignedInt(n) | Self::SignedInt(n) => Some(n),
+            _ => None
+        }
+    }
+
+    /// If this type is an integer, this function returns 
+    #[inline]
+    pub const fn with_int_bits(self, n: u32) -> Option<Self> {
+        match self {
+            Self::WeakInt(_) => Some(Self::WeakInt(n)),
+            Self::UnsignedInt(_) => Some(Self::UnsignedInt(n)),
+            Self::SignedInt(_) => Some(Self::SignedInt(n)),
+            _ => None
+        }
+    }
 
 }
 
@@ -225,20 +284,14 @@ impl Type {
 
     /// Return true if this type is an integer, signed or not.
     #[inline]
-    pub const fn is_integer(self) -> bool {
-        matches!(self, Type {
-            indirection: 0, 
-            primitive: PrimitiveType::Signed(_) | PrimitiveType::Unsigned(_),
-        })
+    pub const fn is_int(self) -> bool {
+        !self.is_pointer() && self.primitive.is_int()
     }
 
     /// Return true if this type is a floating point decimal number.
     #[inline]
     pub const fn is_float(self) -> bool {
-        matches!(self, Type {
-            indirection: 0, 
-            primitive: PrimitiveType::Float | PrimitiveType::Double,
-        })
+        !self.is_pointer() && self.primitive.is_float()
     }
 
 }
