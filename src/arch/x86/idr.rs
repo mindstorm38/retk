@@ -8,10 +8,14 @@ use anyhow::{Result as AnyResult, anyhow, bail};
 
 use crate::idr::{LocalRef, Function, Statement, Expression, Place, Index, Operand, 
     ComparisonOperator, BinaryOperator};
+use crate::idr::print::{LocalRefDisplay, write_function};
 use crate::ty::{TypeSystem, Type, PrimitiveType};
 
 use super::early::{EarlyFunctions, EarlyFunction};
 use super::Backend;
+
+
+const DEBUG_FUNCTION: u64 = 0x1400277A0;
 
 
 /// Analyze all IDR functions.
@@ -23,8 +27,6 @@ pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
     let functions_count = early_functions.functions_count();
 
     let mut missing_opcodes = HashMap::<_, usize>::new();
-
-    const DEBUG_FUNCTION: u64 = 0x1400277A0;
 
     'func: for (i, early_function) in early_functions.iter_functions().enumerate() {
 
@@ -146,7 +148,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         self.done = true;
 
         // Finalize all basic block and ensure that they are existing.
-        for block in self.basic_blocks.values_mut() {
+        for (&block_ip, block) in &mut self.basic_blocks {
             let index = block.begin_index.ok_or_else(|| anyhow!("block decoding is missing"))?;
             // If the basic block is valid, relocate all branches to point to it.
             // NOTE: We drain this relocation list because we don't want to keep it 
@@ -158,24 +160,110 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                     stmt => bail!("statement cannot be relocated: {stmt:?}"),
                 }
             }
+            // // Collect initial imports.
+            // let imports = block.iter_import_register_locals().collect::<HashSet<_>>();
+            // if !imports.is_empty() {
+            //     basic_block_imports.insert(block_ip, FinalBasicBlock {
+            //         imports,
+            //     });
+            // }
+        }
+
+        // Unique imports for each basic block, in these steps it is possible to have
+        let mut basic_block_imports = HashMap::<u64, FinalBasicBlock>::new();
+        let mut branches_imports = Vec::new();
+
+        for (&block_ip, block) in &self.basic_blocks {
+
+            if let Some(true_branch) = block.true_branch {
+                let true_block = self.basic_blocks.get(&true_branch)
+                    .ok_or_else(|| anyhow!("cannot find true branch {true_branch:08X} from block {block_ip:08X}"))?;
+                branches_imports.extend(true_block.iter_import_register_locals());
+                basic_block_imports.entry(true_branch).or_default().parents.push(block_ip);
+            }
+
+            if let Some(false_branch) = block.false_branch {
+                let false_block = self.basic_blocks.get(&false_branch)
+                    .ok_or_else(|| anyhow!("cannot find false branch {false_branch:08X} from block {block_ip:08X}"))?;
+                branches_imports.extend(false_block.iter_import_register_locals());
+                basic_block_imports.entry(false_branch).or_default().parents.push(block_ip);
+            }
+
+            if !branches_imports.is_empty() {
+                basic_block_imports.entry(block_ip).or_default().exports
+                    .extend(branches_imports.drain(..).map(|t| (t, false)));
+            }
+
         }
 
         // Here we want to fix every basic block's exported variable for its branches.
-        let mut export_fixes = HashSet::new();
-        let mut branches_imports = Vec::new();
+        let mut parent_new_exports = Vec::new();
         let mut new_statements = Vec::new();
 
         let mut i = 0;
-
-        // This loop should converge.
+        
         loop {
 
             i += 1;
             if i > 100 {
                 bail!("block finalization is not converging");
             }
+            
+            // Start by propagating all imports.
+            for (&block_ip, block) in &self.basic_blocks {
+                
+                // If the block has some imported locals.
+                if let Some(final_block) = basic_block_imports.get_mut(&block_ip) {
+                    for (&(reg, export_local), done) in &mut final_block.exports {
+                        if !std::mem::replace(done, true) {
+                            if let Some(locals) = block.register_locals.get(&reg) {
+                                // If the block contains this local, we know that we can 
+                                // insert cast statement from last value to imported one.
+                                // NOTE: Do not add a cast if the last local is already 
+                                // the good local...
+                                if locals.last != export_local {
+                                    // We need to a cast assignment expression just before the branch.
+                                    let branch_index = block.branch_index.unwrap();
+                                    new_statements.push((branch_index, Statement::Assign { 
+                                        place: Place::new_direct(export_local), 
+                                        value: Expression::Cast(Place::new_direct(locals.last)),
+                                    }));
+                                }
+                            } else {
+                                // This register family is unknown to this basic block, we
+                                // need to propagate the export to the parents.
+                                for &parent_block_ip in &final_block.parents {
+                                    parent_new_exports.push((parent_block_ip, reg, export_local));
+                                }
+                            }
+                        }
+                    }
+                }
+
+            }
+
+            // Converged toward no new exports to add to parents.
+            if parent_new_exports.is_empty() {
+                break;
+            }
+
+            // Add required export locals only to parents not done with it yet.
+            for (block_ip, reg, export_local) in parent_new_exports.drain(..) {
+                basic_block_imports.entry(block_ip).or_default().exports
+                    .entry((reg, export_local)).or_insert(false);
+            }
+
+        }
+
+        /*// This loop should converge.
+        let mut export_fixes = HashSet::new();
+        loop {
 
             for (&block_ip, block) in &self.basic_blocks {
+                
+                if self.early_function.begin() == DEBUG_FUNCTION {
+                    println!("== Basic block {block_ip} = {block:?}");
+                }
 
                 if let Some(true_branch) = block.true_branch {
                     let true_block = self.basic_blocks.get(&true_branch)
@@ -188,9 +276,13 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                         .ok_or_else(|| anyhow!("cannot find false branch {false_branch:08X} from block {block_ip:08X}"))?;
                     branches_imports.extend(false_block.iter_import_register_locals());
                 }
+
+                if self.early_function.begin() == DEBUG_FUNCTION {
+                    println!("   branches_imports = {branches_imports:?}");
+                }
                 
-                // For each imported local/register in the branch block, check if we have this
-                // register.
+                // For each imported local/register in the branch block, check if we have 
+                // this register.
                 for (register, import_local) in branches_imports.drain(..) {
                     if let Some(self_locals) = block.register_locals.get(&register) {
                         if self_locals.last == import_local {
@@ -217,6 +309,24 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                         });
                     }
                 }
+
+            }
+
+            if self.early_function.begin() == DEBUG_FUNCTION {
+                println!("   export_fixes = {export_fixes:?}");
+            }
+
+            i += 1;
+            if i > 10 {
+
+                let export_fixes_str = export_fixes.iter()
+                    .map(|fix| format!("{:08X}/{:?} {}, ", fix.block_ip, fix.register, match fix.kind {
+                        ExportFixKind::Cast { from, to } => format!("cast {} -> {}", LocalRefDisplay(from), LocalRefDisplay(to)),
+                        ExportFixKind::Import { local } => format!("import {}", LocalRefDisplay(local)),
+                    }))
+                    .collect::<String>();
+
+                bail!("block finalization is not converging: export fixes = [{export_fixes_str}]");
 
             }
 
@@ -247,7 +357,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                 
             }
 
-        }
+        }*/
 
         // Our statements need to be order in order to use binary search on them.
         new_statements.sort_unstable_by_key(|&(index, _)| index);
@@ -1621,7 +1731,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     }
 
     fn debug_function(&self) {
-        crate::idr::print::write_function(std::io::stdout().lock(), &self.function, &self.type_system).unwrap();
+        write_function(std::io::stdout().lock(), &self.function, &self.type_system).unwrap();
     }
 
 }
@@ -1732,6 +1842,17 @@ impl BasicBlock {
         })
     }
 
+}
+
+/// A structure used when finalizing basic blocks imports and exports register locals.
+#[derive(Debug, Default)]
+struct FinalBasicBlock {
+    /// The list of unique exports, note that multiple types of the same register can be
+    /// exported at the same type. For each register/local the boolean indicate if true
+    /// that the export has been computed and no longer need consideration.
+    exports: HashMap<(Register, LocalRef), bool>,
+    /// Instruction pointers of parent basic blocks that branch to this one.
+    parents: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

@@ -50,7 +50,7 @@ fn comparison_operator_sym(op: ComparisonOperator) -> &'static str {
 }
 
 /// Internal display support for local variable reference.
-struct LocalRefDisplay(LocalRef);
+pub struct LocalRefDisplay(pub LocalRef);
 impl fmt::Display for LocalRefDisplay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         const BASE: u32 = 26;
@@ -99,6 +99,9 @@ impl fmt::Display for PlaceDisplay<'_> {
                 Index::Absolute(n) if n % layout_size == 0 => {
                     write!(f, "{}[{}]", LocalRefDisplay(local), n / layout_size)
                 }
+                Index::Absolute(n) => {
+                    write!(f, "*({} + {n})", LocalRefDisplay(local))
+                }
                 Index::Variable { index, stride } if stride as i32 == layout_size => {
                     write!(f, "{}[{}]", LocalRefDisplay(local), LocalRefDisplay(index))
                 }
@@ -108,7 +111,6 @@ impl fmt::Display for PlaceDisplay<'_> {
                 Index::Variable { index, stride } => {
                     write!(f, "*({} + {} * {stride})", LocalRefDisplay(local), LocalRefDisplay(index))
                 }
-                _ => todo!()
             }
 
         } else {
@@ -221,7 +223,7 @@ pub fn write_function(mut f: impl io::Write, function: &Function, type_system: &
 
     for (i, local) in function.locals.iter().enumerate() {
         writeln!(f, "{:12} // {}",
-            format_args!("{} {}", type_system.name(local.ty), LocalRefDisplay(LocalRef(i as _))),
+            format!("{} {}", type_system.name(local.ty), LocalRefDisplay(LocalRef(i as _))),
             local.comment)?;
     }
 
