@@ -23,7 +23,7 @@ pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
 
     let mut missing_opcodes = HashMap::<_, usize>::new();
 
-    'func: for (i, early_function) in early_functions.iter_functions().enumerate().take(10) {
+    'func: for (i, early_function) in early_functions.iter_functions().enumerate() {
 
         print!(" = At {:08X} ({:03}%)... ", early_function.begin(), i as f32 / functions_count as f32 * 100.0);
 
@@ -48,7 +48,7 @@ pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
             }
         }
 
-        decoder.debug_function();
+        // decoder.debug_function();
 
         functions.insert(decoder.early_function.begin(), decoder.function);
         println!("done.");
@@ -308,7 +308,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                 let index_stride = index_stride / ty_layout.size;
 
                 if index_stride == 0 {
-                    // TODO: Support this in the future.
+                    // TODO: Support unaligned stride in the future.
                     bail!("decode_mem_operand: type size ({}) != index stride ({}) ({inst})", ty_layout.size, index_stride);
                 } else if index_stride == 1 {
                     index_local = Some(index_reg_local);
@@ -1043,7 +1043,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     fn feed(&mut self, inst: &Instruction) -> AnyResult<()> {
 
         let ip = inst.ip();
-        println!("[{:08X}] {inst}", ip);
+        // println!("[{:08X}] {inst}", ip);
 
         if self.early_function.contains_block(ip) {
             if let Some(stmt) = self.function.statements.last() {
