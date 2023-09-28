@@ -3,7 +3,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
-use iced_x86::{Instruction, Code, Register, ConditionCode};
+use iced_x86::{Instruction, Code, Register, ConditionCode, OpKind};
 use anyhow::{Result as AnyResult, anyhow, bail};
 
 use crate::idr::{LocalRef, Function, Statement, Expression, Place, BinaryExpression, Operand, ComparisonOperator, Index};
@@ -106,6 +106,7 @@ struct IdrDecoder<'e, 't> {
     /// Information about the last comparison. 
     /// **This is reset between passes.**
     last_cmp: Option<Cmp>,
+    done: bool,
 }
 
 impl<'e, 't> IdrDecoder<'e, 't> {
@@ -123,11 +124,14 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             basic_blocks: HashMap::new(),
             basic_block_ip: 0, // Will be initialized at first instruction.
             last_cmp: None,
+            done: false,
         }
     }
     
     /// Finalize the current function, save it and reset the state to go to the next one.
     fn finalize_function(&mut self) -> AnyResult<()> {
+
+        self.done = true;
 
         // Finalize all basic block and ensure that they are existing.
         for block in self.basic_blocks.values_mut() {
@@ -149,17 +153,27 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         let mut branches_imports = Vec::new();
         let mut new_statements = Vec::new();
 
-        for _ in 0..100 {
+        let mut i = 0;
+
+        // This loop should converge.
+        loop {
+
+            i += 1;
+            if i > 100 {
+                bail!("block finalization is not converging");
+            }
 
             for (&block_ip, block) in &self.basic_blocks {
 
                 if let Some(true_branch) = block.true_branch {
-                    let true_block = self.basic_blocks.get(&true_branch).unwrap();
+                    let true_block = self.basic_blocks.get(&true_branch)
+                        .ok_or_else(|| anyhow!("cannot find true branch {true_branch:08X} from block {block_ip:08X}"))?;
                     branches_imports.extend(true_block.iter_import_register_locals());
                 }
 
                 if let Some(false_branch) = block.false_branch {
-                    let false_block = self.basic_blocks.get(&false_branch).unwrap();
+                    let false_block = self.basic_blocks.get(&false_branch)
+                        .ok_or_else(|| anyhow!("cannot find false branch {false_branch:08X} from block {block_ip:08X}"))?;
                     branches_imports.extend(false_block.iter_import_register_locals());
                 }
                 
@@ -703,6 +717,28 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
     }
 
+    fn decode_int_op_r_rm_imm(&mut self, inst: &Instruction, op: IntOp, layout: IntLayout) -> AnyResult<()> {
+
+        let dst_reg = inst.op0_register();
+        let dst_ty = layout.to_type(dst_reg.size());
+        let dst_place = Place::new_direct(self.decode_register_import(dst_reg, dst_ty));
+
+        let src_place = match inst.op1_register() {
+            Register::None => self.decode_mem_operand(inst, dst_ty)?,
+            reg1 => Place::new_direct(self.decode_register_import(reg1, dst_ty)),
+        };
+
+        let imm = match inst.op2_kind() {
+            OpKind::Immediate8to64 | OpKind::Immediate8to32 | OpKind::Immediate8to16 => inst.immediate8to64(),
+            OpKind::Immediate32 | OpKind::Immediate32to64 => inst.immediate32to64(),
+            kind => bail!("decode_int_op_r_rm_imm: imm kind {kind:?}: ({inst})")
+        };
+
+        self.push_assign(dst_place, op.to_expr(Operand::Place(src_place), Operand::LiteralSigned(imm)));
+        Ok(())
+
+    }
+
     /// Decode instruction `movss/movsd/movaps/movapd <rm>,<rm>`: 
     /// - https://www.felixcloutier.com/x86/movss
     /// - https://www.felixcloutier.com/x86/movsd
@@ -903,7 +939,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
         self.push_assign(Place::new_direct(ret_local), Expression::Call { 
             pointer: Operand::LiteralUnsigned(pointer), 
-            arguments: Vec::new()
+            arguments: Vec::new(),
         });
 
     }
@@ -1012,16 +1048,34 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     fn decode_jmp(&mut self, inst: &Instruction) -> AnyResult<()> {
 
         let pointer = inst.near_branch64();
-        
-        let branch_index = self.push_statement(Statement::Branch { branch: 0 });
-        let block = self.basic_blocks.get_mut(&self.basic_block_ip).unwrap();
-        block.true_branch = Some(pointer);
 
-        // TODO: For tail-call, the pointed basic block may no exists! Support tail-call.
-        let target_block = self.ensure_basic_block(pointer)?;
-        target_block.branch_indices_to_relocate.push(branch_index);
+        if self.early_function.contains_block(pointer) {
 
-        Ok(())
+            let branch_index = self.push_statement(Statement::Branch { branch: 0 });
+            let block = self.basic_blocks.get_mut(&self.basic_block_ip).unwrap();
+            block.true_branch = Some(pointer);
+
+            let target_block = self.ensure_basic_block_unchecked(pointer);
+            target_block.branch_indices_to_relocate.push(branch_index);
+            Ok(())
+
+        } else {
+
+            // If the block is not present in our early function, this means this is a 
+            // tail-call, we call and directly return with the value of this function.
+
+            let ret_local = self.decode_register_write(Register::RAX, TY_QWORD);
+
+            self.push_assign(Place::new_direct(ret_local), Expression::Call { 
+                pointer: Operand::LiteralUnsigned(pointer), 
+                arguments: Vec::new(),
+            });
+
+            // Forward to decode ret in order to add the return statement and finalize
+            // the basic block and function.
+            self.decode_ret(inst)
+
+        }
 
     }
 
@@ -1041,6 +1095,10 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     /// Feed a new instruction to the decoder, if some instruction is returned, the 
     /// feeder must goto to the given instruction and start feed from it.
     fn feed(&mut self, inst: &Instruction) -> AnyResult<()> {
+
+        if self.done {
+            bail!("function decoding is done, cannot accept new instruction");
+        }
 
         let ip = inst.ip();
         // println!("[{:08X}] {inst}", ip);
@@ -1232,7 +1290,11 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Xor_rm32_r32 |
             Code::Xor_rm16_r16 |
             Code::Xor_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Xor, IntLayout::Weak)?,
-            // SAR (Shift Arithmetic Right)
+            // SAR (shift arithmetic right)
+            Code::Sar_rm64_1 |
+            Code::Sar_rm32_1 |
+            Code::Sar_rm16_1 |
+            Code::Sar_rm8_1 => self.decode_int_op_rm_literal(inst, IntOp::ShiftRight, IntLayout::Signed, 1)?,
             Code::Sar_rm64_imm8 |
             Code::Sar_rm32_imm8 |
             Code::Sar_rm16_imm8 |
@@ -1241,6 +1303,46 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Sar_rm32_CL |
             Code::Sar_rm16_CL |
             Code::Sar_rm8_CL => self.decode_int_op_rm_rm(inst, IntOp::ShiftRight, IntLayout::Signed)?,
+            // SAR (shift arithmetic right)
+            Code::Shr_rm64_1 |
+            Code::Shr_rm32_1 |
+            Code::Shr_rm16_1 |
+            Code::Shr_rm8_1 => self.decode_int_op_rm_literal(inst, IntOp::ShiftRight, IntLayout::Unsigned, 1)?,
+            Code::Shr_rm64_imm8 |
+            Code::Shr_rm32_imm8 |
+            Code::Shr_rm16_imm8 |
+            Code::Shr_rm8_imm8 => self.decode_int_op_rm_imm(inst, IntOp::ShiftRight, IntLayout::Unsigned)?,
+            Code::Shr_rm64_CL |
+            Code::Shr_rm32_CL |
+            Code::Shr_rm16_CL |
+            Code::Shr_rm8_CL => self.decode_int_op_rm_rm(inst, IntOp::ShiftRight, IntLayout::Unsigned)?,
+            // SHL (shift left)
+            Code::Shl_rm64_1 |
+            Code::Shl_rm32_1 |
+            Code::Shl_rm16_1 |
+            Code::Shl_rm8_1 => self.decode_int_op_rm_literal(inst, IntOp::ShiftLeft, IntLayout::Weak, 1)?,
+            Code::Shl_rm64_imm8 |
+            Code::Shl_rm32_imm8 |
+            Code::Shl_rm16_imm8 |
+            Code::Shl_rm8_imm8 => self.decode_int_op_rm_imm(inst, IntOp::ShiftLeft, IntLayout::Weak)?,
+            Code::Shl_rm64_CL |
+            Code::Shl_rm32_CL |
+            Code::Shl_rm16_CL |
+            Code::Shl_rm8_CL => self.decode_int_op_rm_rm(inst, IntOp::ShiftLeft, IntLayout::Weak)?,
+            // IMUL
+            // Code::Imul_rm64 |
+            // Code::Imul_rm32 |
+            // Code::Imul_rm16 |
+            // Code::Imul_rm8 => 
+            Code::Imul_r64_rm64 |
+            Code::Imul_r32_rm32 |
+            Code::Imul_r16_rm16 => self.decode_int_op_rm_rm(inst, IntOp::Mul, IntLayout::Signed)?,
+            Code::Imul_r64_rm64_imm32 |
+            Code::Imul_r32_rm32_imm32 |
+            Code::Imul_r16_rm16_imm16 |
+            Code::Imul_r64_rm64_imm8 |
+            Code::Imul_r32_rm32_imm8 |
+            Code::Imul_r16_rm16_imm8 => self.decode_int_op_r_rm_imm(inst, IntOp::Mul, IntLayout::Signed)?,
             // MOVSS/MOVSD (mov single f32/f64)
             Code::Movss_xmm_xmmm32 |
             Code::Movss_xmmm32_xmm => self.decode_mov_simd_rm_rm(inst, false, false)?,
@@ -1487,7 +1589,11 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         if !self.early_function.contains_block(ip) {
             bail!("incoherent basic block with early function: {ip:08X}");
         }
-        Ok(self.basic_blocks.entry(ip).or_default())
+        Ok(self.ensure_basic_block_unchecked(ip))
+    }
+
+    fn ensure_basic_block_unchecked(&mut self, ip: u64) -> &mut BasicBlock {
+        self.basic_blocks.entry(ip).or_default()
     }
 
     fn debug_function(&self) {
@@ -1502,6 +1608,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 enum IntOp {
     Add,
     Sub,
+    Mul,
     And,
     Or,
     Xor,
@@ -1515,6 +1622,7 @@ impl IntOp {
         match self {
             IntOp::Add => Expression::Add(BinaryExpression { left, right }),
             IntOp::Sub => Expression::Sub(BinaryExpression { left, right }),
+            IntOp::Mul => Expression::Mul(BinaryExpression { left, right }),
             IntOp::And => Expression::And(BinaryExpression { left, right }),
             IntOp::Or => Expression::Or(BinaryExpression { left, right }),
             IntOp::Xor => Expression::Xor(BinaryExpression { left, right }),
