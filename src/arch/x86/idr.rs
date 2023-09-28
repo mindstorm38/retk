@@ -6,7 +6,8 @@ use std::collections::{HashMap, HashSet};
 use iced_x86::{Instruction, Code, Register, ConditionCode, OpKind};
 use anyhow::{Result as AnyResult, anyhow, bail};
 
-use crate::idr::{LocalRef, Function, Statement, Expression, Place, BinaryExpression, Operand, ComparisonOperator, Index};
+use crate::idr::{LocalRef, Function, Statement, Expression, Place, Index, Operand, 
+    ComparisonOperator, BinaryOperator};
 use crate::ty::{TypeSystem, Type, PrimitiveType};
 
 use super::early::{EarlyFunctions, EarlyFunction};
@@ -23,6 +24,8 @@ pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
 
     let mut missing_opcodes = HashMap::<_, usize>::new();
 
+    const DEBUG_FUNCTION: u64 = 0x1400277A0;
+
     'func: for (i, early_function) in early_functions.iter_functions().enumerate() {
 
         print!(" = At {:08X} ({:03}%)... ", early_function.begin(), i as f32 / functions_count as f32 * 100.0);
@@ -34,6 +37,11 @@ pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
         let mut decoder = IdrDecoder::new(&mut type_system, early_function);
 
         while let Some(inst) = backend.decoder.decode() {
+
+            if decoder.early_function.begin() == DEBUG_FUNCTION {
+                println!("[{:08X}] {inst}", inst.ip());
+            }
+
             if let Err(e) = decoder.feed(inst) {
 
                 if let Some(inst) = e.downcast_ref::<Instruction>() {
@@ -46,12 +54,15 @@ pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
                 continue 'func;
 
             }
+
         }
 
-        // decoder.debug_function();
+        if decoder.early_function.begin() == DEBUG_FUNCTION {
+            decoder.debug_function();
+        }
 
         functions.insert(decoder.early_function.begin(), decoder.function);
-        println!("done.");
+        println!("Done.");
         
     }
 
@@ -103,9 +114,10 @@ struct IdrDecoder<'e, 't> {
     basic_blocks: HashMap<u64, BasicBlock>,
     /// Instruction pointer of the current basic block being decoded.
     basic_block_ip: u64,
-    /// Information about the last comparison. 
-    /// **This is reset between passes.**
-    last_cmp: Option<Cmp>,
+    /// Information about how flags were last modified.
+    /// **This is reset between basic blocks.**
+    flags: Flags,
+    /// True when the decoding should be done.
     done: bool,
 }
 
@@ -123,7 +135,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             temp_block_locals: HashMap::new(),
             basic_blocks: HashMap::new(),
             basic_block_ip: 0, // Will be initialized at first instruction.
-            last_cmp: None,
+            flags: Flags::Undefined,
             done: false,
         }
     }
@@ -291,7 +303,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         block.register_locals = std::mem::take(&mut self.register_block_locals);
 
         // Don't track comparisons across basic blocks.
-        self.last_cmp = None;
+        self.flags = Flags::Undefined;
 
         // Free basic block temporary locals.
         for locals in self.temp_block_locals.values_mut() {
@@ -319,20 +331,21 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                 let index_reg_local = self.decode_register_import(index_reg, TY_PTR_DIFF);
 
                 // Calculate the real stride based on type's size.
-                let index_stride = index_stride / ty_layout.size;
+                let index_factor = index_stride / ty_layout.size;
 
-                if index_stride == 0 {
+                if index_factor == 0 {
                     // TODO: Support unaligned stride in the future.
                     bail!("decode_mem_operand: type size ({}) != index stride ({}) ({inst})", ty_layout.size, index_stride);
-                } else if index_stride == 1 {
+                } else if index_factor == 1 {
                     index_local = Some(index_reg_local);
                 } else {
 
                     let temp_local = self.alloc_temp_local(TY_PTR_DIFF);
-                    self.push_assign(Place::new_direct(temp_local), Expression::Mul(BinaryExpression {
-                        left: Operand::new_local(index_reg_local),
-                        right: Operand::LiteralUnsigned(index_stride as u64),
-                    }));
+                    self.push_assign(Place::new_direct(temp_local), Expression::Binary { 
+                        left: Operand::new_local(index_reg_local), 
+                        right: Operand::LiteralUnsigned(index_factor as u64), 
+                        operator: BinaryOperator::Mul,
+                    });
 
                     index_local = Some(temp_local);
 
@@ -389,10 +402,11 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                     (0, Some(index_local)) => Place::new_index_variable(base_reg_local, index_local),
                     (_, Some(index_local)) => {
                         let temp_local = self.alloc_temp_local(ty.pointer(1));
-                        self.push_assign(Place::new_direct(temp_local), Expression::Add(BinaryExpression { 
+                        self.push_assign(Place::new_direct(temp_local), Expression::Binary { 
                             left: Operand::Place(Place::new_direct(base_reg_local)), 
                             right: Operand::LiteralSigned(displ as i32 as i64),
-                        }));
+                            operator: BinaryOperator::Add,
+                        });
                         Place::new_index_variable(temp_local, index_local)
                     }
                     (_, None) => Place::new_index_absolute(base_reg_local, displ as i32),
@@ -403,6 +417,14 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
         Ok(place)
 
+    }
+
+    fn decode_signed_imm(&mut self, inst: &Instruction) -> AnyResult<i64> {
+        Ok(match inst.op2_kind() {
+            OpKind::Immediate8to64 | OpKind::Immediate8to32 | OpKind::Immediate8to16 => inst.immediate8to64(),
+            OpKind::Immediate32 | OpKind::Immediate32to64 => inst.immediate32to64(),
+            kind => bail!("decode_signed_imm: imm kind {kind:?}: ({inst})")
+        })
     }
 
     /// Decode `lea <r>,<m>`.
@@ -577,27 +599,31 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
         if let Some(len_reg) = len_reg {
             
-            self.push_assign(Place::new_direct(src_reg), Expression::Add(BinaryExpression { 
+            self.push_assign(Place::new_direct(src_reg), Expression::Binary { 
                 left: Operand::new_local(src_reg),
                 right: Operand::new_local(len_reg),
-            }));
+                operator: BinaryOperator::Add,
+            });
 
-            self.push_assign(Place::new_direct(dst_reg), Expression::Add(BinaryExpression { 
+            self.push_assign(Place::new_direct(dst_reg), Expression::Binary { 
                 left: Operand::new_local(dst_reg),
                 right: Operand::new_local(len_reg),
-            }));
+                operator: BinaryOperator::Add,
+            });
 
         } else {
 
-            self.push_assign(Place::new_direct(src_reg), Expression::Add(BinaryExpression { 
+            self.push_assign(Place::new_direct(src_reg), Expression::Binary { 
                 left: Operand::new_local(src_reg),
                 right: Operand::LiteralUnsigned(1),
-            }));
+                operator: BinaryOperator::Add,
+            });
 
-            self.push_assign(Place::new_direct(dst_reg), Expression::Add(BinaryExpression { 
+            self.push_assign(Place::new_direct(dst_reg), Expression::Binary { 
                 left: Operand::new_local(dst_reg),
                 right: Operand::LiteralUnsigned(1),
-            }));
+                operator: BinaryOperator::Add,
+            });
 
         }
 
@@ -610,7 +636,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     /// - https://www.felixcloutier.com/x86/dec
     /// 
     /// Increment or decrement a memory or register by 1.
-    fn decode_int_op_rm_literal(&mut self, inst: &Instruction, op: IntOp, layout: IntLayout, literal: i64) -> AnyResult<()> {
+    fn decode_int_op_rm_literal(&mut self, inst: &Instruction, op: BinaryOperator, layout: IntLayout, literal: i64) -> AnyResult<()> {
         
         let place;
         match inst.op0_register() {
@@ -624,10 +650,11 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Register::RSP => {
                 // inc/dec sp
                 match op {
-                    IntOp::Add => self.add_sp(1),
-                    IntOp::Sub => self.sub_sp(1),
+                    BinaryOperator::Add => self.add_sp(1),
+                    BinaryOperator::Sub => self.sub_sp(1),
                     _ => bail!("decode_int_op_rm_literal: illegal op {op:?}"),
                 }
+                self.flags = Flags::Undefined; // TODO: Support this.
                 return Ok(());
             }
             reg => {
@@ -636,14 +663,20 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             }
         }
 
-        self.push_assign(place, op.to_expr(Operand::Place(place), Operand::LiteralSigned(literal)));
+        self.flags = Flags::Undefined; // TODO: Support this.
+        self.push_assign(place, Expression::Binary { 
+            left: Operand::Place(place), 
+            right: Operand::LiteralSigned(literal), 
+            operator: op,
+        });
+
         Ok(())
 
     }
 
     /// Abstraction function to decode every instruction `<op> <rm>,<imm>` where `op` is
     /// an integer binary operation that write the result in the left operand.
-    fn decode_int_op_rm_imm(&mut self, inst: &Instruction, op: IntOp, layout: IntLayout) -> AnyResult<()> {
+    fn decode_int_op_rm_imm(&mut self, inst: &Instruction, op: BinaryOperator, layout: IntLayout) -> AnyResult<()> {
 
         let imm = inst.immediate32to64();
         let place;
@@ -658,10 +691,11 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Register::RSP => {
                 // <op> sp,<imm>
                 match op {
-                    IntOp::Add => self.add_sp(imm as i32),
-                    IntOp::Sub => self.sub_sp(imm as i32),
+                    BinaryOperator::Add => self.add_sp(imm as i32),
+                    BinaryOperator::Sub => self.sub_sp(imm as i32),
                     _ => bail!("statically unknown: <op> sp,<imm> ({inst})")
                 };
+                self.flags = Flags::Undefined; // TODO: Support this.
                 return Ok(());
             }
             reg => {
@@ -671,14 +705,20 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             }
         }
 
-        self.push_assign(place, op.to_expr(Operand::Place(place), Operand::LiteralUnsigned(imm as u64)));
+        self.flags = Flags::Undefined; // TODO: Support this.
+        self.push_assign(place, Expression::Binary { 
+            left: Operand::Place(place), 
+            right: Operand::LiteralUnsigned(imm as u64), 
+            operator: op,
+        });
+
         Ok(())
 
     }
 
     /// Abstraction function to decode every instruction `<op> <rm>,<rm>` where `op` is
     /// an integer binary operation that write the result in the left operand.
-    fn decode_int_op_rm_rm(&mut self, inst: &Instruction, op: IntOp, layout: IntLayout) -> AnyResult<()> {
+    fn decode_int_op_rm_rm(&mut self, inst: &Instruction, op: BinaryOperator, layout: IntLayout) -> AnyResult<()> {
 
         let left_place;
         let right_place;
@@ -698,11 +738,12 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                 left_place = Place::new_direct(reg_local);
                 right_place = self.decode_mem_operand(inst, reg_ty)?;
             }
-            (reg0, reg1) if op == IntOp::Xor && reg0 == reg1 => {
+            (reg0, reg1) if op == BinaryOperator::Xor && reg0 == reg1 => {
                 let reg_ty = layout.to_type(reg0.size());
                 let reg_local = self.decode_register_write(reg0, reg_ty);
                 let place = Place::new_direct(reg_local);
                 self.push_assign(place, Expression::Copy(Operand::LiteralUnsigned(0)));
+                self.flags = Flags::Undefined; // TODO: Support this.
                 return Ok(());
             }
             (reg0, reg1) => {
@@ -712,12 +753,18 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             }
         }
 
-        self.push_assign(left_place, op.to_expr(Operand::Place(left_place), Operand::Place(right_place)));
+        self.flags = Flags::Undefined; // TODO: Support this.
+        self.push_assign(left_place, Expression::Binary { 
+            left: Operand::Place(left_place), 
+            right: Operand::Place(right_place), 
+            operator: op,
+        });
+
         Ok(())
 
     }
 
-    fn decode_int_op_r_rm_imm(&mut self, inst: &Instruction, op: IntOp, layout: IntLayout) -> AnyResult<()> {
+    fn decode_int_op_r_rm_imm(&mut self, inst: &Instruction, op: BinaryOperator, layout: IntLayout) -> AnyResult<()> {
 
         let dst_reg = inst.op0_register();
         let dst_ty = layout.to_type(dst_reg.size());
@@ -728,13 +775,15 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             reg1 => Place::new_direct(self.decode_register_import(reg1, dst_ty)),
         };
 
-        let imm = match inst.op2_kind() {
-            OpKind::Immediate8to64 | OpKind::Immediate8to32 | OpKind::Immediate8to16 => inst.immediate8to64(),
-            OpKind::Immediate32 | OpKind::Immediate32to64 => inst.immediate32to64(),
-            kind => bail!("decode_int_op_r_rm_imm: imm kind {kind:?}: ({inst})")
-        };
+        let imm = self.decode_signed_imm(inst)?;
 
-        self.push_assign(dst_place, op.to_expr(Operand::Place(src_place), Operand::LiteralSigned(imm)));
+        self.flags = Flags::Undefined; // TODO: Support this.
+        self.push_assign(dst_place, Expression::Binary { 
+            left: Operand::Place(src_place), 
+            right: Operand::LiteralSigned(imm), 
+            operator: op,
+        });
+
         Ok(())
 
     }
@@ -828,11 +877,10 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             reg0 => Place::new_direct(self.decode_register_import(reg0, ty)),
         };
 
-        self.last_cmp = Some(Cmp {
-            left: Operand::Place(left_place),
+        self.flags = Flags::Test { 
+            left: left_place, 
             right: Operand::Place(right_place),
-            kind: CmpKind::Test,
-        });
+        };
 
         Ok(())
 
@@ -857,11 +905,10 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             }
         };
 
-        self.last_cmp = Some(Cmp {
-            left: Operand::Place(left_place),
+        self.flags = Flags::Test { 
+            left: left_place, 
             right: Operand::LiteralSigned(imm),
-            kind: CmpKind::Test,
-        });
+        };
 
         Ok(())
 
@@ -887,11 +934,10 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             }
         };
 
-        self.last_cmp = Some(Cmp {
-            left: Operand::Place(left_place),
-            right: Operand::LiteralUnsigned(inst.immediate32to64() as u64),
-            kind: CmpKind::Cmp,
-        });
+        self.flags = Flags::Cmp { 
+            left: left_place, 
+            right: Operand::LiteralUnsigned(inst.immediate32() as u64),
+        };
 
         Ok(())
 
@@ -907,11 +953,11 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         let ty = ty_weak_int_from_bytes(inst.memory_size().size());
 
         let left = match inst.op0_register() {
-            Register::None => Operand::Place(self.decode_mem_operand(inst, ty)?),
+            Register::None => self.decode_mem_operand(inst, ty)?,
             Register::SP |
             Register::ESP |
             Register::RSP => bail!("statically unknown: cmp sp,<rm> ({inst})"),
-            reg0 => Operand::new_local(self.decode_register_import(reg0, ty)),
+            reg0 => Place::new_direct(self.decode_register_import(reg0, ty)),
         };
 
         let right = match inst.op1_register() {
@@ -922,13 +968,55 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             reg1 => Operand::new_local(self.decode_register_import(reg1, ty)),
         };
 
-        self.last_cmp = Some(Cmp {
-            left,
-            right,
-            kind: CmpKind::Cmp,
-        });
-
+        self.flags = Flags::Cmp { left, right };
         Ok(())
+
+    }
+
+    /// Decode the conditional expression from an conditional instruction. This depends
+    /// on the last instruction's flags.
+    fn decode_cond_expr(&mut self, inst: &Instruction) -> AnyResult<Expression> {
+
+        Ok(match self.flags {
+            Flags::Undefined => bail!("decode_cond_expr: undefined flags"),
+            Flags::Cmp { left, right } => {
+
+                let operator = match inst.condition_code() {
+                    ConditionCode::ne => ComparisonOperator::NotEqual,
+                    ConditionCode::e => ComparisonOperator::Equal,
+                    // Unsigned...
+                    ConditionCode::a => ComparisonOperator::Greater,
+                    ConditionCode::ae => ComparisonOperator::GreaterOrEqual,
+                    ConditionCode::b => ComparisonOperator::Less,
+                    ConditionCode::be => ComparisonOperator::LessOrEqual,
+                    // Signed...
+                    ConditionCode::g => ComparisonOperator::Greater,
+                    ConditionCode::ge => ComparisonOperator::GreaterOrEqual,
+                    ConditionCode::l => ComparisonOperator::Less,
+                    ConditionCode::le => ComparisonOperator::LessOrEqual,
+                    _ => bail!("decode_cond_expr (cmp): unsupported condition ({inst})")
+                };
+
+                Expression::Comparison { left: Operand::Place(left), operator, right }
+
+            }
+            Flags::Test { left, right: Operand::Place(right) } if left == right => {
+
+                // If both operands of the test is the same local, the "bitwise and" will
+                // result to "equal" if the register is zero, and "not equal" is not zero.
+                let operator = match inst.condition_code() {
+                    ConditionCode::ne => ComparisonOperator::NotEqual,
+                    ConditionCode::e => ComparisonOperator::Equal,
+                    _ => bail!("decode_cond_expr (test same): unsupported condition ({inst})")
+                };
+
+                Expression::Comparison { left: Operand::Place(left), operator, right: Operand::LiteralUnsigned(0) }
+
+            }
+            Flags::Test { left, right } => {
+                Expression::Binary { left: Operand::Place(left), right, operator: BinaryOperator::And }
+            }
+        })
 
     }
 
@@ -965,65 +1053,9 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
     fn decode_jcc(&mut self, inst: &Instruction) -> AnyResult<()> {
 
-        let cmp = self.last_cmp.take()
-            .ok_or_else(|| anyhow!("decode_jcc: no previous cmp ({inst})"))?;
-
         let pointer = inst.near_branch64();
-        let cond_expr;
-
-        match cmp.kind {
-            // Comparison performs a subtraction.
-            CmpKind::Cmp => {
-                
-                let operator = match inst.condition_code() {
-                   ConditionCode::ne => ComparisonOperator::NotEqual,
-                   ConditionCode::e => ComparisonOperator::Equal,
-                   // Unsigned...
-                   ConditionCode::a => ComparisonOperator::Greater,
-                   ConditionCode::ae => ComparisonOperator::GreaterOrEqual,
-                   ConditionCode::b => ComparisonOperator::Less,
-                   ConditionCode::be => ComparisonOperator::LessOrEqual,
-                   // Signed...
-                   ConditionCode::g => ComparisonOperator::Greater,
-                   ConditionCode::ge => ComparisonOperator::GreaterOrEqual,
-                   ConditionCode::l => ComparisonOperator::Less,
-                   ConditionCode::le => ComparisonOperator::LessOrEqual,
-                   _ => bail!("decode_jcc (cmp): unsupported condition ({inst})")
-                };
-
-                cond_expr = Expression::Comparison {
-                    left: cmp.left,
-                    operator,
-                    right: cmp.right,
-                };
-
-            }
-            // Test performs a bitwise and.
-            CmpKind::Test => {
-
-                // If both operands of the test is the same local, the "bitwise and" will
-                // result to "equal" if the register is zero, and "not equal" is not zero.
-                if cmp.left == cmp.right {
-
-                    let operator = match inst.condition_code() {
-                        ConditionCode::ne => ComparisonOperator::NotEqual,
-                        ConditionCode::e => ComparisonOperator::Equal,
-                        _ => bail!("decode_jcc (test): unsupported condition ({inst})")
-                    };
-
-                    cond_expr = Expression::Comparison { 
-                        left: cmp.left, 
-                        operator,
-                        right: Operand::LiteralUnsigned(0)
-                    };
-
-                } else {
-                    bail!("decode_jcc (test): unsupported different operands ({inst})");
-                }
-
-            }
-        }
-
+        let cond_expr = self.decode_cond_expr(inst)?;
+        
         let branch_index = self.push_statement_with(|index| {
             Statement::BranchConditional { 
                 value: cond_expr, 
@@ -1123,6 +1155,10 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             // Set the new basic block ip being decoded.
             self.basic_block_ip = ip;
         }
+        
+        if inst.has_lock_prefix() {
+            bail!("lock prefix is not yet supported ({inst})");
+        }
 
         match inst.code() {
             // PUSH
@@ -1182,14 +1218,14 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Inc_rm32 |
             Code::Inc_rm64 |
             Code::Inc_r16 |
-            Code::Inc_r32 => self.decode_int_op_rm_literal(inst, IntOp::Add, IntLayout::Weak, 1)?,
+            Code::Inc_r32 => self.decode_int_op_rm_literal(inst, BinaryOperator::Add, IntLayout::Weak, 1)?,
             // DEC
             Code::Dec_rm8 |
             Code::Dec_rm16 |
             Code::Dec_rm32 |
             Code::Dec_rm64 |
             Code::Dec_r16 |
-            Code::Dec_r32 => self.decode_int_op_rm_literal(inst, IntOp::Sub, IntLayout::Weak, 1)?,
+            Code::Dec_r32 => self.decode_int_op_rm_literal(inst, BinaryOperator::Sub, IntLayout::Weak, 1)?,
             // ADD
             Code::Add_RAX_imm32 |
             Code::Add_EAX_imm32 |
@@ -1201,7 +1237,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Add_rm8_imm8 |
             Code::Add_rm64_imm32 |
             Code::Add_rm32_imm32 |
-            Code::Add_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::Add, IntLayout::Weak)?,
+            Code::Add_rm16_imm16  => self.decode_int_op_rm_imm(inst, BinaryOperator::Add, IntLayout::Weak)?,
             Code::Add_r64_rm64 |
             Code::Add_r32_rm32 |
             Code::Add_r16_rm16 |
@@ -1209,7 +1245,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Add_rm64_r64 |
             Code::Add_rm32_r32 |
             Code::Add_rm16_r16 |
-            Code::Add_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Add, IntLayout::Weak)?,
+            Code::Add_rm8_r8 => self.decode_int_op_rm_rm(inst, BinaryOperator::Add, IntLayout::Weak)?,
             // SUB
             Code::Sub_RAX_imm32 |
             Code::Sub_EAX_imm32 |
@@ -1221,7 +1257,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Sub_rm8_imm8 |
             Code::Sub_rm64_imm32 |
             Code::Sub_rm32_imm32 |
-            Code::Sub_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::Sub, IntLayout::Weak)?,
+            Code::Sub_rm16_imm16  => self.decode_int_op_rm_imm(inst, BinaryOperator::Sub, IntLayout::Weak)?,
             Code::Sub_r64_rm64 |
             Code::Sub_r32_rm32 |
             Code::Sub_r16_rm16 |
@@ -1229,7 +1265,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Sub_rm64_r64 |
             Code::Sub_rm32_r32 |
             Code::Sub_rm16_r16 |
-            Code::Sub_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Sub, IntLayout::Weak)?,
+            Code::Sub_rm8_r8 => self.decode_int_op_rm_rm(inst, BinaryOperator::Sub, IntLayout::Weak)?,
             // AND
             Code::And_RAX_imm32 |
             Code::And_EAX_imm32 |
@@ -1241,7 +1277,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::And_rm8_imm8 |
             Code::And_rm64_imm32 |
             Code::And_rm32_imm32 |
-            Code::And_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::And, IntLayout::Weak)?,
+            Code::And_rm16_imm16  => self.decode_int_op_rm_imm(inst, BinaryOperator::And, IntLayout::Weak)?,
             Code::And_r64_rm64 |
             Code::And_r32_rm32 |
             Code::And_r16_rm16 |
@@ -1249,7 +1285,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::And_rm64_r64 |
             Code::And_rm32_r32 |
             Code::And_rm16_r16 |
-            Code::And_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::And, IntLayout::Weak)?,
+            Code::And_rm8_r8 => self.decode_int_op_rm_rm(inst, BinaryOperator::And, IntLayout::Weak)?,
             // OR
             Code::Or_RAX_imm32 |
             Code::Or_EAX_imm32 |
@@ -1261,7 +1297,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Or_rm8_imm8 |
             Code::Or_rm64_imm32 |
             Code::Or_rm32_imm32 |
-            Code::Or_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::Or, IntLayout::Weak)?,
+            Code::Or_rm16_imm16  => self.decode_int_op_rm_imm(inst, BinaryOperator::Or, IntLayout::Weak)?,
             Code::Or_r64_rm64 |
             Code::Or_r32_rm32 |
             Code::Or_r16_rm16 |
@@ -1269,7 +1305,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Or_rm64_r64 |
             Code::Or_rm32_r32 |
             Code::Or_rm16_r16 |
-            Code::Or_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Or, IntLayout::Weak)?,
+            Code::Or_rm8_r8 => self.decode_int_op_rm_rm(inst, BinaryOperator::Or, IntLayout::Weak)?,
             // XOR
             Code::Xor_RAX_imm32 |
             Code::Xor_EAX_imm32 |
@@ -1281,7 +1317,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Xor_rm8_imm8 |
             Code::Xor_rm64_imm32 |
             Code::Xor_rm32_imm32 |
-            Code::Xor_rm16_imm16  => self.decode_int_op_rm_imm(inst, IntOp::Xor, IntLayout::Weak)?,
+            Code::Xor_rm16_imm16  => self.decode_int_op_rm_imm(inst, BinaryOperator::Xor, IntLayout::Weak)?,
             Code::Xor_r64_rm64 |
             Code::Xor_r32_rm32 |
             Code::Xor_r16_rm16 |
@@ -1289,46 +1325,46 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Xor_rm64_r64 |
             Code::Xor_rm32_r32 |
             Code::Xor_rm16_r16 |
-            Code::Xor_rm8_r8 => self.decode_int_op_rm_rm(inst, IntOp::Xor, IntLayout::Weak)?,
+            Code::Xor_rm8_r8 => self.decode_int_op_rm_rm(inst, BinaryOperator::Xor, IntLayout::Weak)?,
             // SAR (shift arithmetic right)
             Code::Sar_rm64_1 |
             Code::Sar_rm32_1 |
             Code::Sar_rm16_1 |
-            Code::Sar_rm8_1 => self.decode_int_op_rm_literal(inst, IntOp::ShiftRight, IntLayout::Signed, 1)?,
+            Code::Sar_rm8_1 => self.decode_int_op_rm_literal(inst, BinaryOperator::ShiftRight, IntLayout::Signed, 1)?,
             Code::Sar_rm64_imm8 |
             Code::Sar_rm32_imm8 |
             Code::Sar_rm16_imm8 |
-            Code::Sar_rm8_imm8 => self.decode_int_op_rm_imm(inst, IntOp::ShiftRight, IntLayout::Signed)?,
+            Code::Sar_rm8_imm8 => self.decode_int_op_rm_imm(inst, BinaryOperator::ShiftRight, IntLayout::Signed)?,
             Code::Sar_rm64_CL |
             Code::Sar_rm32_CL |
             Code::Sar_rm16_CL |
-            Code::Sar_rm8_CL => self.decode_int_op_rm_rm(inst, IntOp::ShiftRight, IntLayout::Signed)?,
+            Code::Sar_rm8_CL => self.decode_int_op_rm_rm(inst, BinaryOperator::ShiftRight, IntLayout::Signed)?,
             // SAR (shift arithmetic right)
             Code::Shr_rm64_1 |
             Code::Shr_rm32_1 |
             Code::Shr_rm16_1 |
-            Code::Shr_rm8_1 => self.decode_int_op_rm_literal(inst, IntOp::ShiftRight, IntLayout::Unsigned, 1)?,
+            Code::Shr_rm8_1 => self.decode_int_op_rm_literal(inst, BinaryOperator::ShiftRight, IntLayout::Unsigned, 1)?,
             Code::Shr_rm64_imm8 |
             Code::Shr_rm32_imm8 |
             Code::Shr_rm16_imm8 |
-            Code::Shr_rm8_imm8 => self.decode_int_op_rm_imm(inst, IntOp::ShiftRight, IntLayout::Unsigned)?,
+            Code::Shr_rm8_imm8 => self.decode_int_op_rm_imm(inst, BinaryOperator::ShiftRight, IntLayout::Unsigned)?,
             Code::Shr_rm64_CL |
             Code::Shr_rm32_CL |
             Code::Shr_rm16_CL |
-            Code::Shr_rm8_CL => self.decode_int_op_rm_rm(inst, IntOp::ShiftRight, IntLayout::Unsigned)?,
+            Code::Shr_rm8_CL => self.decode_int_op_rm_rm(inst, BinaryOperator::ShiftRight, IntLayout::Unsigned)?,
             // SHL (shift left)
             Code::Shl_rm64_1 |
             Code::Shl_rm32_1 |
             Code::Shl_rm16_1 |
-            Code::Shl_rm8_1 => self.decode_int_op_rm_literal(inst, IntOp::ShiftLeft, IntLayout::Weak, 1)?,
+            Code::Shl_rm8_1 => self.decode_int_op_rm_literal(inst, BinaryOperator::ShiftLeft, IntLayout::Weak, 1)?,
             Code::Shl_rm64_imm8 |
             Code::Shl_rm32_imm8 |
             Code::Shl_rm16_imm8 |
-            Code::Shl_rm8_imm8 => self.decode_int_op_rm_imm(inst, IntOp::ShiftLeft, IntLayout::Weak)?,
+            Code::Shl_rm8_imm8 => self.decode_int_op_rm_imm(inst, BinaryOperator::ShiftLeft, IntLayout::Weak)?,
             Code::Shl_rm64_CL |
             Code::Shl_rm32_CL |
             Code::Shl_rm16_CL |
-            Code::Shl_rm8_CL => self.decode_int_op_rm_rm(inst, IntOp::ShiftLeft, IntLayout::Weak)?,
+            Code::Shl_rm8_CL => self.decode_int_op_rm_rm(inst, BinaryOperator::ShiftLeft, IntLayout::Weak)?,
             // IMUL
             // Code::Imul_rm64 |
             // Code::Imul_rm32 |
@@ -1336,13 +1372,13 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             // Code::Imul_rm8 => 
             Code::Imul_r64_rm64 |
             Code::Imul_r32_rm32 |
-            Code::Imul_r16_rm16 => self.decode_int_op_rm_rm(inst, IntOp::Mul, IntLayout::Signed)?,
+            Code::Imul_r16_rm16 => self.decode_int_op_rm_rm(inst, BinaryOperator::Mul, IntLayout::Signed)?,
             Code::Imul_r64_rm64_imm32 |
             Code::Imul_r32_rm32_imm32 |
             Code::Imul_r16_rm16_imm16 |
             Code::Imul_r64_rm64_imm8 |
             Code::Imul_r32_rm32_imm8 |
-            Code::Imul_r16_rm16_imm8 => self.decode_int_op_r_rm_imm(inst, IntOp::Mul, IntLayout::Signed)?,
+            Code::Imul_r16_rm16_imm8 => self.decode_int_op_r_rm_imm(inst, BinaryOperator::Mul, IntLayout::Signed)?,
             // MOVSS/MOVSD (mov single f32/f64)
             Code::Movss_xmm_xmmm32 |
             Code::Movss_xmmm32_xmm => self.decode_mov_simd_rm_rm(inst, false, false)?,
@@ -1602,37 +1638,6 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
 }
 
-
-/// Internally used in a common function for all integer operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IntOp {
-    Add,
-    Sub,
-    Mul,
-    And,
-    Or,
-    Xor,
-    ShiftRight,
-    ShiftLeft,
-}
-
-impl IntOp {
-
-    fn to_expr(self, left: Operand, right: Operand) -> Expression {
-        match self {
-            IntOp::Add => Expression::Add(BinaryExpression { left, right }),
-            IntOp::Sub => Expression::Sub(BinaryExpression { left, right }),
-            IntOp::Mul => Expression::Mul(BinaryExpression { left, right }),
-            IntOp::And => Expression::And(BinaryExpression { left, right }),
-            IntOp::Or => Expression::Or(BinaryExpression { left, right }),
-            IntOp::Xor => Expression::Xor(BinaryExpression { left, right }),
-            IntOp::ShiftRight => Expression::ShiftRight(BinaryExpression { left, right }),
-            IntOp::ShiftLeft => Expression::ShiftLeft(BinaryExpression { left, right }),
-        }
-    }
-
-}
-
 /// Used to tell if an expression should produce a signed or unsigned integer. A special
 /// `Inherited` can be used to default to the previous value of registers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1653,22 +1658,6 @@ impl IntLayout {
         }
     }
 
-}
-
-/// Internal structure used to track possible comparisons.
-#[derive(Debug, Clone)]
-struct Cmp {
-    left: Operand,
-    right: Operand,
-    kind: CmpKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CmpKind {
-    /// Subtraction of right from left.
-    Cmp,
-    /// Bitwise right and left.
-    Test,
 }
 
 /// Saves for each register family, their optional imported local and the last local
@@ -1692,6 +1681,27 @@ struct TempBlockLocals {
     /// Index of the next local to allocate, if that equals the length of the locals,
     /// then a new local will be created.
     cursor: usize,
+}
+
+/// Internal structure used to keep track of flags and how they were previously 
+/// calculated.
+#[derive(Debug, PartialEq, Eq)]
+enum Flags {
+    /// The last instruction have produces undefined flags, we can't use such state for
+    /// resolving conditional instructions.
+    Undefined,
+    /// The flags were last set by a comparison, basically a subtraction of right from
+    /// left, this sets all CF, OF, SF, ZF, AF, PF flags.
+    Cmp {
+        left: Place,
+        right: Operand,
+    },
+    /// The flags were last set by a test, basically a bitwise and of left and right,
+    /// this sets SF, ZF and PF flags.
+    Test {
+        left: Place,
+        right: Operand,
+    }
 }
 
 /// Information about a basic block.

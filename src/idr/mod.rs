@@ -126,30 +126,36 @@ pub enum Expression {
         /// List of arguments to pass to the function.
         arguments: Vec<Operand>,
     },
-    /// Perform a binary comparison that produces a boolean value (theoretically 1-bit).
+    /// Perform a binary comparison that produces a boolean value.
     Comparison {
         left: Operand,
-        operator: ComparisonOperator,
         right: Operand,
+        operator: ComparisonOperator,
     },
-    Add(BinaryExpression),
-    Sub(BinaryExpression),
-    Mul(BinaryExpression),
-    Div(BinaryExpression),
-    And(BinaryExpression),
-    Or(BinaryExpression),
-    Xor(BinaryExpression),
-    ShiftLeft(BinaryExpression),
-    ShiftRight(BinaryExpression),
+    /// A binary expression with two operands and a binary operator.
+    Binary {
+        left: Operand,
+        right: Operand,
+        operator: BinaryOperator,
+    },
+    /// One's complement of an integer.
+    Not(Operand),
+    /// Two's complement of an integer.
+    Neg(Operand),
 }
 
-/// Base type for binary expressions.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BinaryExpression {
-    /// Left local on the binary expression.
-    pub left: Operand,
-    /// Right local of the binary expression.
-    pub right: Operand,
+/// Kind of binary expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryOperator {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    And,
+    Or,
+    Xor,
+    ShiftLeft,
+    ShiftRight,
 }
 
 /// Kind of comparison.
@@ -329,15 +335,6 @@ impl fmt::Display for ComparisonOperator {
 
 impl fmt::Display for Expression {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-
-        fn write_binary(
-            f: &mut fmt::Formatter<'_>, 
-            expr: &BinaryExpression, 
-            op: &'static str
-        ) -> fmt::Result {
-            write!(f, "{} {op} {}", expr.left, expr.right)
-        }
-
         match *self {
             Expression::Copy(op) => write!(f, "{op}"),
             Expression::Ref(place) => write!(f, "&{place}"),
@@ -353,22 +350,31 @@ impl fmt::Display for Expression {
             }
             Expression::Comparison { 
                 left, 
+                right,
                 operator, 
-                right
             } => {
                 write!(f, "{left} {operator} {right}")
             }
-            Expression::Add(ref b) => write_binary(f, b, "+"),
-            Expression::Sub(ref b) => write_binary(f, b, "-"),
-            Expression::Mul(ref b) => write_binary(f, b, "*"),
-            Expression::Div(ref b) => write_binary(f, b, "/"),
-            Expression::And(ref b) => write_binary(f, b, "&"),
-            Expression::Or(ref b) => write_binary(f, b, "|"),
-            Expression::Xor(ref b) => write_binary(f, b, "^"),
-            Expression::ShiftLeft(ref b) => write_binary(f, b, "<<"),
-            Expression::ShiftRight(ref b) => write_binary(f, b, ">>"),
+            Expression::Binary {
+                left, 
+                right, 
+                operator
+            } => {
+                write!(f, "{left} {} {right}", match operator {
+                    BinaryOperator::Add => "+",
+                    BinaryOperator::Sub => "-",
+                    BinaryOperator::Mul => "*",
+                    BinaryOperator::Div => "/",
+                    BinaryOperator::And => "&",
+                    BinaryOperator::Or => "|",
+                    BinaryOperator::Xor => "^",
+                    BinaryOperator::ShiftLeft => "<<",
+                    BinaryOperator::ShiftRight => ">>",
+                })
+            }
+            Expression::Not(value) => write!(f, "!{value}"),
+            Expression::Neg(value) => write!(f, "-{value}"),
         }
-
     }
 }
 
@@ -416,47 +422,32 @@ pub fn write_function(mut f: impl io::Write, function: &Function, type_system: &
         write!(f, "{i:03} | ")?;
 
         match *stmt {
+            Statement::Assign {
+                place, 
+                value: Expression::Binary {
+                    left: Operand::Place(left),
+                    right,
+                    operator,
+                },
+            } if place == left => {
+                writeln!(f, "{place} {} {right}", match operator {
+                    BinaryOperator::Add => "+=",
+                    BinaryOperator::Sub => "-=",
+                    BinaryOperator::Mul => "*=",
+                    BinaryOperator::Div => "/=",
+                    BinaryOperator::And => "&=",
+                    BinaryOperator::Or => "|=",
+                    BinaryOperator::Xor => "^=",
+                    BinaryOperator::ShiftLeft => "<<=",
+                    BinaryOperator::ShiftRight => ">>=",
+                })?;
+            }
             Statement::Assign { 
                 place, 
                 ref value
             } => {
-
-                let right = match value {
-                    Expression::Add(b) | 
-                    Expression::Sub(b) |
-                    Expression::Mul(b) |
-                    Expression::Div(b) |
-                    Expression::And(b) |
-                    Expression::Or(b) |
-                    Expression::Xor(b) |
-                    Expression::ShiftLeft(b) |
-                    Expression::ShiftRight(b)
-                    if b.left == Operand::Place(place) => Some(b.right),
-                    _ => None,
-                };
-
-                if let Some(right) = right {
-
-                    let op = match value {
-                        Expression::Add(_) => "+=",
-                        Expression::Sub(_) => "-=",
-                        Expression::Mul(_) => "*=",
-                        Expression::Div(_) => "/=",
-                        Expression::And(_) => "&=",
-                        Expression::Or(_) => "|=",
-                        Expression::Xor(_) => "^=",
-                        Expression::ShiftLeft(_) => "<<=",
-                        Expression::ShiftRight(_) => ">>=",
-                        _ => unreachable!()
-                    };
-
-                    writeln!(f, "{place} {op} {right}")?;
-
-                } else {
-                    let ty = function.place_type(place);
-                    writeln!(f, "{place} = {}", ContextualExpression { inner: value, type_system, ty })?;
-                }
-
+                let ty = function.place_type(place);
+                writeln!(f, "{place} = {}", ContextualExpression { inner: value, type_system, ty })?;
             }
             Statement::MemCopy { src, dst, len } => {
                 writeln!(f, "memcpy {src} -> {dst} ({len})")?;
