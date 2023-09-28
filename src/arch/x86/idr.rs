@@ -319,39 +319,11 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         // The displacement is actually 64-bit only for EIP/RIP relative address, 
         // otherwise it can just be casted to 32-bit integer.
         let mem_displ = inst.memory_displacement64();
-        // Get the type layout, to adjust displacement and index.
-        let ty_layout = self.type_system.layout(ty).unwrap();
 
         let index_scale = inst.memory_index_scale() as u8;
         let index_local = match inst.memory_index() {
             Register::None => None,
             index_reg => Some(self.decode_register_import(index_reg, TY_PTR_DIFF)),
-
-                // // Calculate the real stride based on type's size.
-                // let index_factor = index_stride / ty_layout.size;
-
-                // if index_factor == 0 {
-                //     // The type doesn't fit in a stride, this can generate unaligned 
-                //     // memory accesses, so we need special handling.
-
-                //     // TODO: Support unaligned stride in the future.
-                //     bail!("decode_mem_operand: type size ({}) != index stride ({}) ({inst})", ty_layout.size, index_stride);
-
-                // } else if index_factor == 1 {
-                //     index_local = Some(index_reg_local);
-                // } else {
-
-                //     let temp_local = self.alloc_temp_local(TY_PTR_DIFF);
-                //     self.push_assign(Place::new_direct(temp_local), Expression::Binary { 
-                //         left: Operand::new_local(index_reg_local), 
-                //         right: Operand::LiteralUnsigned(index_factor as u64), 
-                //         operator: BinaryOperator::Mul,
-                //     });
-
-                //     index_local = Some(temp_local);
-
-                // }
-
         };
 
         let place;
