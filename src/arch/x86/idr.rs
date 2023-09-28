@@ -28,7 +28,7 @@ pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
 
     'func: for (i, early_function) in early_functions.iter_functions().enumerate() {
 
-        print!(" = At {:08X} ({:03}%)... ", early_function.begin(), i as f32 / functions_count as f32 * 100.0);
+        print!(" = At {:08X} ({:03.0}%)... ", early_function.begin(), i as f32 / functions_count as f32 * 100.0);
 
         let section = backend.sections.get_code_section_at(early_function.begin()).unwrap();
         let offset = early_function.begin() - section.begin_addr;
@@ -322,37 +322,37 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         // Get the type layout, to adjust displacement and index.
         let ty_layout = self.type_system.layout(ty).unwrap();
 
-        let mut index_local = None;
-        match inst.memory_index() {
-            Register::None => {}
-            index_reg => {
+        let index_scale = inst.memory_index_scale() as u8;
+        let index_local = match inst.memory_index() {
+            Register::None => None,
+            index_reg => Some(self.decode_register_import(index_reg, TY_PTR_DIFF)),
 
-                let index_stride = inst.memory_index_scale();
-                let index_reg_local = self.decode_register_import(index_reg, TY_PTR_DIFF);
+                // // Calculate the real stride based on type's size.
+                // let index_factor = index_stride / ty_layout.size;
 
-                // Calculate the real stride based on type's size.
-                let index_factor = index_stride / ty_layout.size;
+                // if index_factor == 0 {
+                //     // The type doesn't fit in a stride, this can generate unaligned 
+                //     // memory accesses, so we need special handling.
 
-                if index_factor == 0 {
-                    // TODO: Support unaligned stride in the future.
-                    bail!("decode_mem_operand: type size ({}) != index stride ({}) ({inst})", ty_layout.size, index_stride);
-                } else if index_factor == 1 {
-                    index_local = Some(index_reg_local);
-                } else {
+                //     // TODO: Support unaligned stride in the future.
+                //     bail!("decode_mem_operand: type size ({}) != index stride ({}) ({inst})", ty_layout.size, index_stride);
 
-                    let temp_local = self.alloc_temp_local(TY_PTR_DIFF);
-                    self.push_assign(Place::new_direct(temp_local), Expression::Binary { 
-                        left: Operand::new_local(index_reg_local), 
-                        right: Operand::LiteralUnsigned(index_factor as u64), 
-                        operator: BinaryOperator::Mul,
-                    });
+                // } else if index_factor == 1 {
+                //     index_local = Some(index_reg_local);
+                // } else {
 
-                    index_local = Some(temp_local);
+                //     let temp_local = self.alloc_temp_local(TY_PTR_DIFF);
+                //     self.push_assign(Place::new_direct(temp_local), Expression::Binary { 
+                //         left: Operand::new_local(index_reg_local), 
+                //         right: Operand::LiteralUnsigned(index_factor as u64), 
+                //         operator: BinaryOperator::Mul,
+                //     });
 
-                }
+                //     index_local = Some(temp_local);
 
-            }
-        }
+                // }
+
+        };
 
         let place;
         match inst.memory_base() {
@@ -363,7 +363,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                 self.push_assign(Place::new_direct(addr_local), Expression::Copy(Operand::LiteralUnsigned(mem_displ)));
             
                 if let Some(index_local) = index_local {
-                    place = Place::new_index_variable(addr_local, index_local);
+                    place = Place::new_index_variable(addr_local, index_local, index_scale);
                 } else {
                     place = Place::new_index_absolute(addr_local, 0);
                 }
@@ -389,27 +389,18 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                 
                 let base_reg_local = self.decode_register_import(base_reg, ty.pointer(1));
 
-                let displ;
-                if mem_displ == 0 {
-                    displ = 0;
-                } else if mem_displ as u32 % ty_layout.size == 0 {
-                    displ = mem_displ as u32 / ty_layout.size;
-                } else {
-                    bail!("decode_mem_operand: displacement is not a multiple of type size ({inst})");
-                }
-
-                place = match (displ, index_local) {
-                    (0, Some(index_local)) => Place::new_index_variable(base_reg_local, index_local),
+                place = match (mem_displ, index_local) {
+                    (0, Some(index_local)) => Place::new_index_variable(base_reg_local, index_local, index_scale),
                     (_, Some(index_local)) => {
                         let temp_local = self.alloc_temp_local(ty.pointer(1));
                         self.push_assign(Place::new_direct(temp_local), Expression::Binary { 
                             left: Operand::Place(Place::new_direct(base_reg_local)), 
-                            right: Operand::LiteralSigned(displ as i32 as i64),
+                            right: Operand::LiteralSigned(mem_displ as i32 as i64),
                             operator: BinaryOperator::Add,
                         });
-                        Place::new_index_variable(temp_local, index_local)
+                        Place::new_index_variable(temp_local, index_local, index_scale)
                     }
-                    (_, None) => Place::new_index_absolute(base_reg_local, displ as i32),
+                    (_, None) => Place::new_index_absolute(base_reg_local, mem_displ as i32),
                 };
 
             }
@@ -705,12 +696,13 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             }
         }
 
-        self.flags = Flags::Undefined; // TODO: Support this.
-        self.push_assign(place, Expression::Binary { 
+        let index = self.push_assign(place, Expression::Binary { 
             left: Operand::Place(place), 
             right: Operand::LiteralUnsigned(imm as u64), 
             operator: op,
         });
+
+        self.flags = Flags::Binary { operator: op, index };
 
         Ok(())
 
@@ -1010,11 +1002,35 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                     _ => bail!("decode_cond_expr (test same): unsupported condition ({inst})")
                 };
 
-                Expression::Comparison { left: Operand::Place(left), operator, right: Operand::LiteralUnsigned(0) }
+                Expression::Comparison { left: Operand::Place(left), right: Operand::LiteralUnsigned(0), operator }
 
             }
             Flags::Test { left, right } => {
                 Expression::Binary { left: Operand::Place(left), right, operator: BinaryOperator::And }
+            }
+            Flags::Binary { operator, index } => {
+
+                match operator {
+                    BinaryOperator::And |
+                    BinaryOperator::Or |
+                    BinaryOperator::Xor => {
+
+                        let Statement::Assign { place, .. } = self.function.statements[index] else {
+                            bail!("decode_cond_expr (binary bool): target index {index} is not an assignment");
+                        };
+
+                        let operator = match inst.condition_code() {
+                            ConditionCode::ne => ComparisonOperator::NotEqual,
+                            ConditionCode::e => ComparisonOperator::Equal,
+                            _ => bail!("decode_cond_expr (binary bool): unsupported condition ({inst})")
+                        };
+
+                        Expression::Comparison { left: Operand::Place(place), right: Operand::LiteralUnsigned(0), operator }
+
+                    }
+                    _ => bail!("decode_cond_expr (binary): unsupported operator {operator:?} ({inst})")
+                }
+
             }
         })
 
@@ -1633,7 +1649,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     }
 
     fn debug_function(&self) {
-        crate::idr::write_function(std::io::stdout().lock(), &self.function, &self.type_system).unwrap();
+        crate::idr::print::write_function(std::io::stdout().lock(), &self.function, &self.type_system).unwrap();
     }
 
 }
@@ -1701,6 +1717,15 @@ enum Flags {
     Test {
         left: Place,
         right: Operand,
+    },
+    /// The flag was previously set by a binary operator, flags are set depending on
+    /// the operator. For example, boolean operators (and, or, xor) will set SF/ZF/PF
+    /// and therefore we can just read the resulting value and do comparison on it.
+    /// But for integer operators, it will often be required to just replace the 
+    /// binary operation in-place with a expression that also gives us flags infos.
+    Binary {
+        operator: BinaryOperator,
+        index: usize,
     }
 }
 
