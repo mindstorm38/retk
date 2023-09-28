@@ -1,14 +1,13 @@
 //! IDR decoder from machine code.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use iced_x86::{Instruction, Code, Register, ConditionCode, OpKind};
 use anyhow::{Result as AnyResult, anyhow, bail};
 
 use crate::idr::{LocalRef, Function, Statement, Expression, Place, Index, Operand, 
     ComparisonOperator, BinaryOperator};
-use crate::idr::print::{LocalRefDisplay, write_function};
 use crate::ty::{TypeSystem, Type, PrimitiveType};
 
 use super::early::{EarlyFunctions, EarlyFunction};
@@ -254,110 +253,6 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             }
 
         }
-
-        /*// This loop should converge.
-        let mut export_fixes = HashSet::new();
-        loop {
-
-            for (&block_ip, block) in &self.basic_blocks {
-                
-                if self.early_function.begin() == DEBUG_FUNCTION {
-                    println!("== Basic block {block_ip} = {block:?}");
-                }
-
-                if let Some(true_branch) = block.true_branch {
-                    let true_block = self.basic_blocks.get(&true_branch)
-                        .ok_or_else(|| anyhow!("cannot find true branch {true_branch:08X} from block {block_ip:08X}"))?;
-                    branches_imports.extend(true_block.iter_import_register_locals());
-                }
-
-                if let Some(false_branch) = block.false_branch {
-                    let false_block = self.basic_blocks.get(&false_branch)
-                        .ok_or_else(|| anyhow!("cannot find false branch {false_branch:08X} from block {block_ip:08X}"))?;
-                    branches_imports.extend(false_block.iter_import_register_locals());
-                }
-
-                if self.early_function.begin() == DEBUG_FUNCTION {
-                    println!("   branches_imports = {branches_imports:?}");
-                }
-                
-                // For each imported local/register in the branch block, check if we have 
-                // this register.
-                for (register, import_local) in branches_imports.drain(..) {
-                    if let Some(self_locals) = block.register_locals.get(&register) {
-                        if self_locals.last == import_local {
-                            // Nothing to do, we already export this variable.
-                        } else {
-                            // We already used the register, but it's of the wrong type.
-                            export_fixes.insert(ExportFix {
-                                block_ip,
-                                register,
-                                kind: ExportFixKind::Cast { 
-                                    from: self_locals.last,
-                                    to: import_local,
-                                }
-                            });
-                        }
-                    } else {
-                        // We don't know the register yet.
-                        export_fixes.insert(ExportFix {
-                            block_ip,
-                            register,
-                            kind: ExportFixKind::Import { 
-                                local: import_local,
-                            }
-                        });
-                    }
-                }
-
-            }
-
-            if self.early_function.begin() == DEBUG_FUNCTION {
-                println!("   export_fixes = {export_fixes:?}");
-            }
-
-            i += 1;
-            if i > 10 {
-
-                let export_fixes_str = export_fixes.iter()
-                    .map(|fix| format!("{:08X}/{:?} {}, ", fix.block_ip, fix.register, match fix.kind {
-                        ExportFixKind::Cast { from, to } => format!("cast {} -> {}", LocalRefDisplay(from), LocalRefDisplay(to)),
-                        ExportFixKind::Import { local } => format!("import {}", LocalRefDisplay(local)),
-                    }))
-                    .collect::<String>();
-
-                bail!("block finalization is not converging: export fixes = [{export_fixes_str}]");
-
-            }
-
-            // We converged toward no fixes, break loop to apply fixes if any.
-            if export_fixes.is_empty() { break; }
-
-            for export_fix in export_fixes.drain() {
-                let block = self.basic_blocks.get_mut(&export_fix.block_ip).unwrap();
-                match export_fix.kind {
-                    ExportFixKind::Cast { from, to } => {
-                        // We need to a cast assignment expression just before the branch.
-                        let branch_index = block.branch_index.unwrap();
-                        new_statements.push((branch_index, Statement::Assign { 
-                            place: Place::new_direct(to), 
-                            value: Expression::Cast(Place::new_direct(from)),
-                        }));
-                        // This register is already existing, we just update last local.
-                        block.register_locals.get_mut(&export_fix.register).unwrap().last = to;
-                    }
-                    ExportFixKind::Import { local } => {
-                        // This register local was missing, add it as import-only.
-                        block.register_locals.insert(export_fix.register, RegisterBlockLocals { 
-                            import: Some(local), 
-                            last: local,
-                        });
-                    }
-                };
-                
-            }
-
-        }*/
 
         // Our statements need to be order in order to use binary search on them.
         new_statements.sort_unstable_by_key(|&(index, _)| index);
@@ -1731,7 +1626,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     }
 
     fn debug_function(&self) {
-        write_function(std::io::stdout().lock(), &self.function, &self.type_system).unwrap();
+        crate::idr::print::write_function(std::io::stdout().lock(), &self.function, &self.type_system).unwrap();
     }
 
 }
@@ -1853,29 +1748,6 @@ struct FinalBasicBlock {
     exports: HashMap<(Register, LocalRef), bool>,
     /// Instruction pointers of parent basic blocks that branch to this one.
     parents: Vec<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ExportFix {
-    /// The block instruction pointer we want to fix.
-    block_ip: u64,
-    /// The register family of the local variable to export.
-    register: Register,
-    kind: ExportFixKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum ExportFixKind {
-    /// The export can be fixed by casting from one variable to another.
-    Cast {
-        from: LocalRef,
-        to: LocalRef,
-    },
-    /// The export can be fixed by importing the variable from outside.
-    Import {
-        /// The local variable to import.
-        local: LocalRef,
-    },
 }
 
 
