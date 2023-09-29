@@ -14,7 +14,7 @@ use super::early::{EarlyFunctions, EarlyFunction};
 use super::Backend;
 
 
-const DEBUG_FUNCTION: u64 = 0x14020580C;
+const DEBUG_FUNCTION: u64 = 0x140207E00;
 // const DEBUG_FUNCTION: u64 = 0x14024E4A0; // show an example of stack local f64* -> i8*
 
 
@@ -326,6 +326,10 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     /// The given type is interpreted as the type pointed by the memory operand.
     fn decode_mem_operand(&mut self, inst: &Instruction, ty: Type) -> AnyResult<Place> {
 
+        if !matches!(inst.memory_segment(), Register::DS | Register::SS) {
+            bail!("decode_mem_operand: unsupported segment for memory operand ({inst})");
+        }
+
         // The displacement is actually 64-bit only for EIP/RIP relative address, 
         // otherwise it can just be casted to 32-bit integer.
         let mem_displ = inst.memory_displacement64();
@@ -380,7 +384,14 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                 }
                 
             }
-            Register::None => bail!("decode_mem_operand: no base ({inst})"),
+            Register::None => {
+
+                // Note base regsiter is commonly used by lea for easy offsets 
+                // calculation (lea r8,[rax*4]).
+
+                bail!("decode_mem_operand: no base");
+
+            }
             base_reg => {
                 
                 let base_reg_local = self.decode_register_import(base_reg, ty.pointer(1));
@@ -417,17 +428,63 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     /// Decode `lea <r>,<m>`.
     fn decode_lea_r_m(&mut self, inst: &Instruction) -> AnyResult<()> {
 
-        let mem_place = self.decode_mem_operand(inst, TY_BYTE)?;
+        if !matches!(inst.memory_segment(), Register::DS | Register::SS) {
+            bail!("decode_mem_operand: unsupported segment for memory operand ({inst})");
+        }
 
         let reg = inst.op0_register();
         let reg_place = Place::new_direct(self.decode_register_write(reg, TY_BYTE.pointer(1)));
 
-        // We simplify this case, we can just assign the value to the register.
-        if let Some(Index::Absolute(0)) = mem_place.index {
-            let simplified_place = Place::new_direct(mem_place.local);
-            self.push_assign(reg_place, Expression::Copy(Operand::Place(simplified_place)));
+        // Special case when no base register is used (lea r8,[rax*4]). We can inline the
+        // offset calculation instead of decoding the operand.
+        if let Register::None = inst.memory_base() {
+
+            let mem_displ = inst.memory_displacement32();
+            let index_scale = inst.memory_index_scale() as u8;
+            let index_local = match inst.memory_index() {
+                Register::None => None,
+                index_reg => Some(self.decode_register_import(index_reg, TY_PTR_DIFF)),
+            };
+
+            let expr = match (mem_displ, index_local, index_scale) {
+                (0, Some(index_local), 0) => Expression::Copy(Operand::new_local(index_local)),
+                (0, Some(index_local), _) => Expression::Binary { 
+                    left: Operand::new_local(index_local), 
+                    right: Operand::LiteralUnsigned(index_scale as _), 
+                    operator: BinaryOperator::Mul,
+                },
+                (_, Some(index_local), 0) => Expression::Binary { 
+                    left: Operand::new_local(index_local), 
+                    right: Operand::LiteralUnsigned(mem_displ as _), 
+                    operator: BinaryOperator::Add,
+                },
+                (_, Some(index_local), _) => {
+                    self.push_assign(reg_place, Expression::Binary { 
+                        left: Operand::new_local(index_local), 
+                        right: Operand::LiteralUnsigned(index_scale as _), 
+                        operator: BinaryOperator::Mul,
+                    });
+                    Expression::Binary { 
+                        left: Operand::Place(reg_place), 
+                        right: Operand::LiteralUnsigned(mem_displ as _), 
+                        operator: BinaryOperator::Add,
+                    }
+                }
+                _ => bail!("decode_lea_r_m (no base): incoherent memory operand")
+            };
+
         } else {
-            self.push_assign(reg_place, Expression::Ref(mem_place));
+
+            let mem_place = self.decode_mem_operand(inst, TY_BYTE)?;
+
+            // We simplify this case, we can just assign the value to the register.
+            if let Some(Index::Absolute(0)) = mem_place.index {
+                let simplified_place = Place::new_direct(mem_place.local);
+                self.push_assign(reg_place, Expression::Copy(Operand::Place(simplified_place)));
+            } else {
+                self.push_assign(reg_place, Expression::Ref(mem_place));
+            }
+
         }
 
         Ok(())
@@ -774,6 +831,36 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         self.flags = Flags::Binary { operator: op, index };
 
         Ok(())
+
+    }
+
+    /// Decode instruction `cbw/cwde/cdqe <r/m>`: 
+    /// - https://www.felixcloutier.com/x86/cbw:cwde:cdqe
+    fn decode_sign_extend_rax(&mut self, src_reg: Register) -> AnyResult<()> {
+
+        let dst_reg = match src_reg {
+            Register::AL => Register::AX,
+            Register::AX => Register::EAX,
+            Register::EAX => Register::RAX,
+            _ => unimplemented!()
+        };
+
+        let src_ty = IntLayout::Signed.to_type(src_reg.size());
+        let src_local = self.decode_register_import(src_reg, src_ty);
+
+        let dst_ty = IntLayout::Signed.to_type(dst_reg.size());
+        let dst_local = self.decode_register_write(dst_reg, dst_ty);
+
+        self.push_assign(Place::new_direct(dst_local), Expression::Cast(Place::new_direct(src_local)));
+        Ok(())
+
+    }
+
+    /// Decode instruction `idiv <r/m>`: 
+    /// - https://www.felixcloutier.com/x86/idiv
+    fn decode_idiv(&mut self, inst: &Instruction) -> AnyResult<()> {
+
+        bail!("decode_idiv: todo");
 
     }
 
@@ -1413,6 +1500,19 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Shl_rm32_CL |
             Code::Shl_rm16_CL |
             Code::Shl_rm8_CL => self.decode_int_op_rm_rm(inst, BinaryOperator::ShiftLeft, IntLayout::Weak)?,
+            // CBW/CWDE/CDQE
+            Code::Cbw => self.decode_sign_extend_rax(Register::AL)?,
+            Code::Cwde => self.decode_sign_extend_rax(Register::AX)?,
+            Code::Cdqe => self.decode_sign_extend_rax(Register::EAX)?,
+            // CWD/CDQ/CQO
+            Code::Cwd => todo!(),
+            Code::Cdq => todo!(),
+            Code::Cqo => todo!(),
+            // IDIV
+            Code::Idiv_rm64 |
+            Code::Idiv_rm32 |
+            Code::Idiv_rm16 |
+            Code::Idiv_rm8 => self.decode_idiv(inst)?,
             // IMUL
             // Code::Imul_rm64 |
             // Code::Imul_rm32 |
