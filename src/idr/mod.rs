@@ -107,8 +107,9 @@ pub enum Expression {
     Copy(Operand),
     /// Get a pointer to a memory place.
     Ref(Place),
-    /// Cast a source local of a given type to another to the destination type of
-    /// assigned local variable.
+    /// An explicit cast from source local of a given type to another to the destination
+    /// type of assigned local variable. Such a cast is required to be able to change a
+    /// value's type.
     Cast(Place),
     /// Call a function from a pointer and an argument list.
     Call {

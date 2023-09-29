@@ -14,7 +14,8 @@ use super::early::{EarlyFunctions, EarlyFunction};
 use super::Backend;
 
 
-const DEBUG_FUNCTION: u64 = 0x140035120;
+const DEBUG_FUNCTION: u64 = 0x14020580C;
+// const DEBUG_FUNCTION: u64 = 0x14024E4A0; // show an example of stack local f64* -> i8*
 
 
 /// Analyze all IDR functions.
@@ -354,14 +355,28 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Register::ESP |
             Register::RSP => {
 
-                // Compute real stack offset from currently known stack pointer.
-                let offset = self.stack_pointer + mem_displ as i32;
-                let stack_local = self.ensure_stack_local(offset, ty);
-                place = Place::new_direct(stack_local);
-                
                 if index_local.is_some() {
                     // TODO: Support this.
                     bail!("decode_mem_operand: unsupported index with sp-relative ({inst})");
+                }
+
+                // Compute real stack offset from currently known stack pointer.
+                let offset = self.stack_pointer + mem_displ as i32;
+                let stack_local = self.decode_stack_local(offset, ty);
+                // We check the effective stack local's type.
+                let stack_ty = self.function.local_type(stack_local);
+                if stack_ty != ty {
+
+                    // Wrong type so we create a pointer and then cast this pointer.
+                    let temp_local_0 = self.alloc_temp_local(stack_ty.pointer(1));
+                    self.push_assign(Place::new_direct(temp_local_0), Expression::Ref(Place::new_direct(stack_local)));
+                    let temp_local_1 = self.alloc_temp_local(ty.pointer(1));
+                    self.push_assign(Place::new_direct(temp_local_1), Expression::Cast(Place::new_direct(temp_local_0)));
+
+                    place = Place::new_direct(temp_local_1);
+
+                } else {
+                    place = Place::new_direct(stack_local);
                 }
                 
             }
@@ -423,11 +438,11 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     fn decode_push_r(&mut self, inst: &Instruction) {
 
         let reg = inst.op0_register();
-        let reg_ty = ty_unsigned_int_from_bytes(reg.size());
+        let reg_ty = ty_weak_int_from_bytes(reg.size());
 
         self.sub_sp(reg.size() as i32);
 
-        let stack_local = self.ensure_stack_local(self.stack_pointer, reg_ty);
+        let stack_local = self.decode_stack_local(self.stack_pointer, reg_ty);
         let reg_local = self.decode_register_import(reg, reg_ty);
 
         self.push_assign(Place::new_direct(stack_local), Expression::Copy(Operand::new_local(reg_local)));
@@ -438,9 +453,9 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     fn decode_pop_r(&mut self, inst: &Instruction) {
 
         let reg = inst.op0_register();
-        let reg_ty = ty_unsigned_int_from_bytes(reg.size());
+        let reg_ty = ty_weak_int_from_bytes(reg.size());
         
-        let stack_local = self.ensure_stack_local(self.stack_pointer, reg_ty);
+        let stack_local = self.decode_stack_local(self.stack_pointer, reg_ty);
         let reg_local = self.decode_register_write(reg, reg_ty);
         
         self.push_assign(Place::new_direct(reg_local), Expression::Copy(Operand::new_local(stack_local)));
@@ -633,12 +648,13 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             }
         }
 
-        self.flags = Flags::Undefined; // TODO: Support this.
-        self.push_assign(place, Expression::Binary { 
+        let index = self.push_assign(place, Expression::Binary { 
             left: Operand::Place(place), 
             right: Operand::LiteralSigned(literal), 
             operator: op,
         });
+
+        self.flags = Flags::Binary { operator: op, index };
 
         Ok(())
 
@@ -724,12 +740,13 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             }
         }
 
-        self.flags = Flags::Undefined; // TODO: Support this.
-        self.push_assign(left_place, Expression::Binary { 
+        let index = self.push_assign(left_place, Expression::Binary { 
             left: Operand::Place(left_place), 
             right: Operand::Place(right_place), 
             operator: op,
         });
+
+        self.flags = Flags::Binary { operator: op, index };
 
         Ok(())
 
@@ -748,12 +765,13 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
         let imm = self.decode_signed_imm(inst)?;
 
-        self.flags = Flags::Undefined; // TODO: Support this.
-        self.push_assign(dst_place, Expression::Binary { 
+        let index = self.push_assign(dst_place, Expression::Binary { 
             left: Operand::Place(src_place), 
             right: Operand::LiteralSigned(imm), 
             operator: op,
         });
+
+        self.flags = Flags::Binary { operator: op, index };
 
         Ok(())
 
@@ -831,6 +849,32 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
     }
 
+    /// Decode instruction `test <rm>,<imm>`:
+    /// - https://www.felixcloutier.com/x86/test
+    /// 
+    /// Read above.
+    fn decode_test_rm_imm(&mut self, inst: &Instruction) -> AnyResult<()> {
+
+        let left_place = match inst.op0_register() {
+            Register::None => {
+                let ty = ty_weak_int_from_bytes(inst.memory_size().size());
+                self.decode_mem_operand(inst, ty)?
+            }
+            reg => {
+                let ty = ty_weak_int_from_bytes(reg.size());
+                Place::new_direct(self.decode_register_import(reg, ty))
+            }
+        };
+
+        self.flags = Flags::Test { 
+            left: left_place, 
+            right: Operand::LiteralSigned(inst.immediate32to64()),
+        };
+
+        Ok(())
+
+    }
+
     /// Decode instruction `test <rm>,<r>`:
     /// - https://www.felixcloutier.com/x86/test
     /// 
@@ -851,34 +895,6 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         self.flags = Flags::Test { 
             left: left_place, 
             right: Operand::Place(right_place),
-        };
-
-        Ok(())
-
-    }
-
-    /// Decode instruction `test <rm>,<imm>`:
-    /// - https://www.felixcloutier.com/x86/test
-    /// 
-    /// Read above.
-    fn decode_test_rm_imm(&mut self, inst: &Instruction) -> AnyResult<()> {
-
-        let imm = inst.immediate32to64();
-
-        let left_place = match inst.op0_register() {
-            Register::None => {
-                let ty = ty_weak_int_from_bytes(inst.memory_size().size());
-                self.decode_mem_operand(inst, ty)?
-            }
-            reg => {
-                let ty = ty_weak_int_from_bytes(reg.size());
-                Place::new_direct(self.decode_register_import(reg, ty))
-            }
-        };
-
-        self.flags = Flags::Test { 
-            left: left_place, 
-            right: Operand::LiteralSigned(imm),
         };
 
         Ok(())
@@ -907,7 +923,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
         self.flags = Flags::Cmp { 
             left: left_place, 
-            right: Operand::LiteralUnsigned(inst.immediate32() as u64),
+            right: Operand::LiteralSigned(inst.immediate32to64()),
         };
 
         Ok(())
@@ -948,53 +964,65 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     /// on the last instruction's flags.
     fn decode_cond_expr(&mut self, inst: &Instruction) -> AnyResult<Expression> {
 
+        // Get the associated IDR comparison operator with the required signedness.
+        let (operator, layout) = match inst.condition_code() {
+            ConditionCode::ne => (ComparisonOperator::NotEqual, IntLayout::Weak),
+            ConditionCode::e => (ComparisonOperator::Equal, IntLayout::Weak),
+            // Unsigned...
+            ConditionCode::a => (ComparisonOperator::Greater, IntLayout::Unsigned),
+            ConditionCode::ae => (ComparisonOperator::GreaterOrEqual, IntLayout::Unsigned),
+            ConditionCode::b => (ComparisonOperator::Less, IntLayout::Unsigned),
+            ConditionCode::be => (ComparisonOperator::LessOrEqual, IntLayout::Unsigned),
+            // Signed...
+            ConditionCode::g => (ComparisonOperator::Greater, IntLayout::Signed),
+            ConditionCode::ge => (ComparisonOperator::GreaterOrEqual, IntLayout::Signed),
+            ConditionCode::l => (ComparisonOperator::Less, IntLayout::Signed),
+            ConditionCode::le => (ComparisonOperator::LessOrEqual, IntLayout::Signed),
+            _ => bail!("decode_cond_expr (cmp): unsupported condition ({inst})")
+        };
+
+        // TODO:
+        // Handle this weird comparison of a double's first byte:
+        // [14024E4BB] movsd qword ptr [rsp+60h],xmm0
+        // [14024E4C1] cmp byte ptr [rsp+60h],0
+        // [14024E4C6] jne short 000000014024E545h
+
         Ok(match self.flags {
             Flags::Undefined => bail!("decode_cond_expr: undefined flags"),
-            Flags::Cmp { left, right } => {
+            Flags::Cmp { mut left, mut right } => {
 
-                let operator = match inst.condition_code() {
-                    ConditionCode::ne => ComparisonOperator::NotEqual,
-                    ConditionCode::e => ComparisonOperator::Equal,
-                    // Unsigned...
-                    ConditionCode::a => ComparisonOperator::Greater,
-                    ConditionCode::ae => ComparisonOperator::GreaterOrEqual,
-                    ConditionCode::b => ComparisonOperator::Less,
-                    ConditionCode::be => ComparisonOperator::LessOrEqual,
-                    // Signed...
-                    ConditionCode::g => ComparisonOperator::Greater,
-                    ConditionCode::ge => ComparisonOperator::GreaterOrEqual,
-                    ConditionCode::l => ComparisonOperator::Less,
-                    ConditionCode::le => ComparisonOperator::LessOrEqual,
-                    _ => bail!("decode_cond_expr (cmp): unsupported condition ({inst})")
-                };
-
-                // FIXME: Support signed/unsigned operators.
+                // We believe here that our operand are of an integer type, because cmp
+                // instruction force use such types.
+                left = self.ensure_place_int_layout(left, layout);
+                if let Operand::Place(right) = &mut right {
+                    *right = self.ensure_place_int_layout(*right, layout);
+                }
 
                 Expression::Comparison { left: Operand::Place(left), operator, right }
 
             }
             // If both operands of the test is the same local, the "bitwise and" will
             // result in comparing the register to 
-            Flags::Test { left, right: Operand::Place(right) } if left == right => {
-
-                // Note that a test will always set CF/OF = 0
-                let operator = match inst.condition_code() {
-                    // The following condition codes produces "!= 0"
-                    ConditionCode::ne |
-                    ConditionCode::a => ComparisonOperator::NotEqual,
-                    // The following condition codes produces "== 0"
-                    ConditionCode::e |
-                    ConditionCode::be => ComparisonOperator::Equal,
-                    _ => bail!("decode_cond_expr (test same): unsupported condition ({inst})")
-                };
-
+            Flags::Test { mut left, right: Operand::Place(right) } if left == right => {
+                left = self.ensure_place_int_layout(left, layout);
                 Expression::Comparison { left: Operand::Place(left), right: Operand::LiteralUnsigned(0), operator }
-
             }
-            // Simple test just use the binary "and" operator.
+            // Simple test just use the binary "and" operator, don't care of signedness.
             Flags::Test { left, right } => {
-                // FIXME: Actually depends on the condition code.
-                Expression::Binary { left: Operand::Place(left), right, operator: BinaryOperator::And }
+                
+                let result_local = self.alloc_temp_local(TY_BYTE);
+                self.push_assign(Place::new_direct(result_local), Expression::Binary { 
+                    left: Operand::Place(left), 
+                    right, 
+                    operator: BinaryOperator::And,
+                });
+
+                Expression::Comparison { 
+                    left: Operand::new_local(result_local), 
+                    right: Operand::LiteralUnsigned(0),
+                    operator
+                }
+
             }
             // How to handle binary operators actually depends on the condition code used,
             // because zero/non zero condition can simply apply on the operation's result,
@@ -1002,14 +1030,12 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             // with an expression that also produces a boolean with that flag.
             Flags::Binary { operator: _, index } => {
 
-                let operator = match inst.condition_code() {
-                    ConditionCode::ne => ComparisonOperator::NotEqual,
-                    ConditionCode::e => ComparisonOperator::Equal,
-                    _ => bail!("decode_cond_expr (binary bool): unsupported condition ({inst})")
-                };
+                if !matches!(operator, ComparisonOperator::Equal | ComparisonOperator::NotEqual) {
+                    bail!("decode_cond_expr (binary): unsupported condition ({inst})")
+                }
 
                 let Statement::Assign { place, .. } = self.function.statements[index] else {
-                    bail!("decode_cond_expr (binary bool): target index {index} is not an assignment");
+                    bail!("decode_cond_expr (binary): target index {index} is not an assignment");
                 };
 
                 Expression::Comparison { left: Operand::Place(place), right: Operand::LiteralUnsigned(0), operator }
@@ -1065,7 +1091,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                 Statement::BranchConditional { 
                     value: cond_expr, 
                     branch_true: 0, // Will be modified if upon basic block creation.
-                    branch_false: index + 1, // False jcc go to the next instruction.
+                    branch_false: index + 1, // False jcc go to the next statement.
                 }
             });
     
@@ -1525,35 +1551,16 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
                 let locals = o.into_mut();
                 let last_local = locals.last;
-                let mut last_ty = self.function.local_type(last_local);
+                let last_ty = self.function.local_type(last_local);
 
                 // We want to check for the following cases (only if import mode):
-                // - last_ty = weak(last_n), ty = actual(n):
-                //   - n == last_n: update last_ty to actual(n)
-                //   - n != last_n: 
-                //     - update last_ty to actual(last_n)
-                //     - new local of actual(n)
                 // - last_ty = actual(last_n), ty = weak(n):
                 //   - n == last_n: force ty to last_ty
                 //   - n != last_n: force ty to actual(n)
                 
                 // If the required indirection and the last one corresponds.
                 if import && last_ty.indirection == ty.indirection {
-                    if let Some(last_n) = last_ty.primitive.weak_int_bits() {
-                        if let Some(n) = ty.primitive.actual_int_bits() {
-                            // Prepare the new type (its an actual integer).
-                            let mut new_ty = ty;
-                            // But if last type has not the right bit count, we need to
-                            // modify new type bits to correspond to its old bit count.
-                            if n != last_n {
-                                // Modify current type to just have 
-                                new_ty.primitive = new_ty.primitive.with_int_bits(last_n).unwrap();
-                            }
-                            // Actually modify the local type.
-                            self.function.set_local_type(last_local, &self.type_system, new_ty);
-                            last_ty = new_ty;
-                        }
-                    } else if let Some(last_n) = last_ty.primitive.actual_int_bits() {
+                    if let Some(last_n) = last_ty.primitive.actual_int_bits() {
                         if let Some(n) = ty.primitive.weak_int_bits() {
                             let mut new_ty = last_ty;
                             if n == last_n {
@@ -1611,8 +1618,10 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         self.decode_register(register, ty, false)
     }
 
-    /// Get a local usable to write from the given stack offset.
-    fn ensure_stack_local(&mut self, offset: i32, ty: Type) -> LocalRef {
+    /// Get a local usable to write from the given stack offset. The given type is only
+    /// associated at local's creation, so **the returned is not guaranteed to be of 
+    /// that type**.
+    fn decode_stack_local(&mut self, offset: i32, ty: Type) -> LocalRef {
         *self.stack_locals.entry(offset)
             .or_insert_with(|| self.function.new_local(&self.type_system, ty, format!("stack: {offset}")))
     }
@@ -1631,6 +1640,26 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             });
         locals.cursor += 1;
         new_local
+    }
+
+    /// A special function that take a place and ensures that a place as a correct integer
+    /// layout, if not a temporary variable is created containing the place's value but
+    /// casted to the right integer type.
+    fn ensure_place_int_layout(&mut self, place: Place, layout: IntLayout) -> Place {
+        let ty = self.function.place_type(place);
+        match (ty.primitive, layout) {
+            (PrimitiveType::WeakInt(_), IntLayout::Weak) => place,
+            (PrimitiveType::UnsignedInt(_), IntLayout::Unsigned | IntLayout::Weak) => place,
+            (PrimitiveType::SignedInt(_), IntLayout::Signed | IntLayout::Weak) => place,
+            (PrimitiveType::WeakInt(n), _) |
+            (PrimitiveType::UnsignedInt(n), _) |
+            (PrimitiveType::SignedInt(n), _) => {
+                let temp_local = self.alloc_temp_local(layout.to_type_from_bits(n));
+                self.push_assign(Place::new_direct(temp_local), Expression::Cast(place));
+                Place::new_direct(temp_local)
+            }
+            _ => panic!("ensure_place_int_layout: given place has non-integer type ({ty:?})"),
+        }
     }
 
     /// Push a new statement with a producer closure that take the future statement's
@@ -1667,24 +1696,35 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
 }
 
-/// Used to tell if an expression should produce a signed or unsigned integer. A special
-/// `Inherited` can be used to default to the previous value of registers.
+/// Used to tell if an expression should produce a signed or unsigned integer. This
+/// correspond to the `WeakInt`, `UnsignedInt` and `SignedInt` primitive types. It's
+/// used to tell an operator to work on unsigned or signed integer, or weak if 
+/// unspecified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IntLayout {
+    /// The integer type that will be used is weak and can be coerced to a 
+    /// unsigned/signed one at any time.
     Weak,
+    /// The integer type is required to be unsigned.
     Unsigned,
+    /// The integer type is required to be signed.
     Signed,
 }
 
 impl IntLayout {
 
+    /// Convert this abstract int layout to an actual type given a bits count.
+    fn to_type_from_bits(self, bits: u32) -> Type {
+        match self {
+            IntLayout::Weak => PrimitiveType::WeakInt(bits).plain(),
+            IntLayout::Unsigned => PrimitiveType::UnsignedInt(bits).plain(),
+            IntLayout::Signed => PrimitiveType::SignedInt(bits).plain(),
+        }
+    }
+
     /// Convert this abstract int layout to an actual type given a bytes count.
     fn to_type(self, bytes: usize) -> Type {
-        match self {
-            IntLayout::Weak => ty_weak_int_from_bytes(bytes),
-            IntLayout::Unsigned => ty_unsigned_int_from_bytes(bytes),
-            IntLayout::Signed => ty_signed_int_from_bytes(bytes),
-        }
+        self.to_type_from_bits(bytes as u32 * 8)
     }
 
 }
@@ -1714,7 +1754,6 @@ struct TempBlockLocals {
 
 /// Internal structure used to keep track of flags and how they were previously 
 /// calculated.
-#[derive(Debug, PartialEq, Eq)]
 enum Flags {
     /// The last instruction have produces undefined flags, we can't use such state for
     /// resolving conditional instructions.
@@ -1788,7 +1827,6 @@ struct FinalBasicBlock {
 
 
 const TY_VOID: Type = PrimitiveType::Void.plain();
-const TY_FUNC_PTR: Type = TY_VOID.pointer(1);
 const TY_BYTE: Type = PrimitiveType::WeakInt(8).plain();
 const TY_QWORD: Type = PrimitiveType::WeakInt(64).plain();
 const TY_PTR_DIFF: Type = PrimitiveType::SignedInt(64).plain();
@@ -1801,16 +1839,6 @@ const fn ty_weak_int_from_bytes(bytes: usize) -> Type {
 }
 
 #[inline]
-const fn ty_signed_int_from_bytes(bytes: usize) -> Type {
-    PrimitiveType::SignedInt(bytes as u32 * 8).plain()
-}
-
-#[inline]
-const fn ty_unsigned_int_from_bytes(bytes: usize) -> Type {
-    PrimitiveType::UnsignedInt(bytes as u32 * 8).plain()
-}
-
-#[inline]
 const fn ty_float_vec_from_bytes(bytes: usize) -> Type {
     PrimitiveType::FloatVec(bytes as u32 / 4).plain()
 }
@@ -1818,25 +1846,4 @@ const fn ty_float_vec_from_bytes(bytes: usize) -> Type {
 #[inline]
 const fn ty_double_vec_from_bytes(bytes: usize) -> Type {
     PrimitiveType::DoubleVec(bytes as u32 / 8).plain()
-}
-
-/// Convert an x86 condition code into an IDR comparison operator and the integer layout
-/// required for it. For example "equal/not equal" require no particular signed/unsigned
-/// so the layout is weak, but a "above" require unsigned layout and "greater" require
-/// signed layout.
-const fn comparison_operator_from_code(code: ConditionCode) -> (ComparisonOperator, IntLayout) {
-    match code {
-        ConditionCode::ne => (ComparisonOperator::NotEqual, IntLayout::Weak),
-        ConditionCode::e => (ComparisonOperator::Equal, IntLayout::Weak),
-        // Unsigned...
-        ConditionCode::a => ComparisonOperator::Greater,
-        ConditionCode::ae => ComparisonOperator::GreaterOrEqual,
-        ConditionCode::b => ComparisonOperator::Less,
-        ConditionCode::be => ComparisonOperator::LessOrEqual,
-        // Signed...
-        ConditionCode::g => ComparisonOperator::Greater,
-        ConditionCode::ge => ComparisonOperator::GreaterOrEqual,
-        ConditionCode::l => ComparisonOperator::Less,
-        ConditionCode::le => ComparisonOperator::LessOrEqual,
-    }
 }
