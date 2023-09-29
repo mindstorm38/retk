@@ -14,7 +14,7 @@ use super::early::{EarlyFunctions, EarlyFunction};
 use super::Backend;
 
 
-const DEBUG_FUNCTION: u64 = 0x140029C20;
+const DEBUG_FUNCTION: u64 = 0x140035120;
 
 
 /// Analyze all IDR functions.
@@ -968,47 +968,51 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                     _ => bail!("decode_cond_expr (cmp): unsupported condition ({inst})")
                 };
 
+                // FIXME: Support signed/unsigned operators.
+
                 Expression::Comparison { left: Operand::Place(left), operator, right }
 
             }
+            // If both operands of the test is the same local, the "bitwise and" will
+            // result in comparing the register to 
             Flags::Test { left, right: Operand::Place(right) } if left == right => {
 
-                // If both operands of the test is the same local, the "bitwise and" will
-                // result to "equal" if the register is zero, and "not equal" is not zero.
+                // Note that a test will always set CF/OF = 0
                 let operator = match inst.condition_code() {
-                    ConditionCode::ne => ComparisonOperator::NotEqual,
-                    ConditionCode::e => ComparisonOperator::Equal,
+                    // The following condition codes produces "!= 0"
+                    ConditionCode::ne |
+                    ConditionCode::a => ComparisonOperator::NotEqual,
+                    // The following condition codes produces "== 0"
+                    ConditionCode::e |
+                    ConditionCode::be => ComparisonOperator::Equal,
                     _ => bail!("decode_cond_expr (test same): unsupported condition ({inst})")
                 };
 
                 Expression::Comparison { left: Operand::Place(left), right: Operand::LiteralUnsigned(0), operator }
 
             }
+            // Simple test just use the binary "and" operator.
             Flags::Test { left, right } => {
+                // FIXME: Actually depends on the condition code.
                 Expression::Binary { left: Operand::Place(left), right, operator: BinaryOperator::And }
             }
-            Flags::Binary { operator, index } => {
+            // How to handle binary operators actually depends on the condition code used,
+            // because zero/non zero condition can simply apply on the operation's result,
+            // but other flags such as overflow requires to modify the existing expression
+            // with an expression that also produces a boolean with that flag.
+            Flags::Binary { operator: _, index } => {
 
-                match operator {
-                    BinaryOperator::And |
-                    BinaryOperator::Or |
-                    BinaryOperator::Xor => {
+                let operator = match inst.condition_code() {
+                    ConditionCode::ne => ComparisonOperator::NotEqual,
+                    ConditionCode::e => ComparisonOperator::Equal,
+                    _ => bail!("decode_cond_expr (binary bool): unsupported condition ({inst})")
+                };
 
-                        let Statement::Assign { place, .. } = self.function.statements[index] else {
-                            bail!("decode_cond_expr (binary bool): target index {index} is not an assignment");
-                        };
+                let Statement::Assign { place, .. } = self.function.statements[index] else {
+                    bail!("decode_cond_expr (binary bool): target index {index} is not an assignment");
+                };
 
-                        let operator = match inst.condition_code() {
-                            ConditionCode::ne => ComparisonOperator::NotEqual,
-                            ConditionCode::e => ComparisonOperator::Equal,
-                            _ => bail!("decode_cond_expr (binary bool): unsupported condition ({inst})")
-                        };
-
-                        Expression::Comparison { left: Operand::Place(place), right: Operand::LiteralUnsigned(0), operator }
-
-                    }
-                    _ => bail!("decode_cond_expr (binary): unsupported operator {operator:?} ({inst})")
-                }
+                Expression::Comparison { left: Operand::Place(place), right: Operand::LiteralUnsigned(0), operator }
 
             }
         })
@@ -1020,6 +1024,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         let pointer = inst.memory_displacement64();
         let ret_local = self.decode_register_write(Register::RAX, TY_QWORD);
 
+        self.flags = Flags::Undefined;
         self.push_assign(Place::new_direct(ret_local), Expression::Call { 
             pointer: Operand::LiteralUnsigned(pointer), 
             arguments: Vec::new(),
@@ -1037,6 +1042,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         let ret_local = self.decode_register_write(Register::RAX, TY_QWORD);
         let ret_place = Place::new_direct(ret_local);
 
+        self.flags = Flags::Undefined;
         self.push_assign(ret_place, Expression::Call {
             pointer: Operand::Place(pointer_place),
             arguments: Vec::new(),
@@ -1116,7 +1122,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
     }
 
-    fn decode_jmp_rm(&mut self, inst: &Instruction) -> AnyResult<()> {
+    fn decode_jmp_rm(&mut self, _inst: &Instruction) -> AnyResult<()> {
 
         // TODO: In the future, it would be great to try to understand if this kind of
         // jump is reading a switch table or not.
@@ -1126,25 +1132,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         //   [140029C90] add rax,rcx
         //   [140029C93] jmp rax
 
-        bail!("decode_jmp_rm: unsupported for now, read code comment")
-
-
-
-        // let pointer_place;
-        // match inst.op0_register() {
-        //     Register::None => pointer_place = self.decode_mem_operand(inst, TY_FUNC_PTR)?,
-        //     reg => pointer_place = Place::new_direct(self.decode_register_import(reg, TY_FUNC_PTR)),
-        // }
-
-        // let ret_local = self.decode_register_write(Register::RAX, TY_QWORD);
-
-        // // Jump from register/memory can be interpreted as tail-calls.
-        // self.push_assign(Place::new_direct(ret_local), Expression::Call { 
-        //     pointer: Operand::Place(pointer_place), 
-        //     arguments: Vec::new(),
-        // });
-
-        // self.decode_ret(inst)
+        bail!("decode_jmp_rm: unsupported for now, read code comment");
 
     }
 
@@ -1152,7 +1140,6 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
         let ret_place = self.decode_register_import(Register::RAX, TY_QWORD);
         self.push_statement(Statement::Return(ret_place));
-
         Ok(())
 
     }
@@ -1831,4 +1818,25 @@ const fn ty_float_vec_from_bytes(bytes: usize) -> Type {
 #[inline]
 const fn ty_double_vec_from_bytes(bytes: usize) -> Type {
     PrimitiveType::DoubleVec(bytes as u32 / 8).plain()
+}
+
+/// Convert an x86 condition code into an IDR comparison operator and the integer layout
+/// required for it. For example "equal/not equal" require no particular signed/unsigned
+/// so the layout is weak, but a "above" require unsigned layout and "greater" require
+/// signed layout.
+const fn comparison_operator_from_code(code: ConditionCode) -> (ComparisonOperator, IntLayout) {
+    match code {
+        ConditionCode::ne => (ComparisonOperator::NotEqual, IntLayout::Weak),
+        ConditionCode::e => (ComparisonOperator::Equal, IntLayout::Weak),
+        // Unsigned...
+        ConditionCode::a => ComparisonOperator::Greater,
+        ConditionCode::ae => ComparisonOperator::GreaterOrEqual,
+        ConditionCode::b => ComparisonOperator::Less,
+        ConditionCode::be => ComparisonOperator::LessOrEqual,
+        // Signed...
+        ConditionCode::g => ComparisonOperator::Greater,
+        ConditionCode::ge => ComparisonOperator::GreaterOrEqual,
+        ConditionCode::l => ComparisonOperator::Less,
+        ConditionCode::le => ComparisonOperator::LessOrEqual,
+    }
 }
