@@ -17,12 +17,13 @@ pub fn analyze_early_functions(backend: &mut Backend) -> EarlyFunctions {
         backend.decoder.goto_range_at(section.pos, section.begin_addr, section.end_addr);
         
         let mut function_start = None;
+        let mut maybe_tail_call = None;
 
         while let Some(inst) = backend.decoder.decode() {
 
             // Do not start the function while nop instruction.
             if function_start.is_none() {
-                match inst.code() {
+                match inst.code() { 
                     Code::Nopw |
                     Code::Nopd |
                     Code::Nopq |
@@ -45,6 +46,7 @@ pub fn analyze_early_functions(backend: &mut Backend) -> EarlyFunctions {
                 code if code.is_jcc_short_or_near() => {
                     ret.basic_blocks.insert(inst.near_branch64());
                     ret.basic_blocks.insert(inst.next_ip());
+                    maybe_tail_call = None;
                 }
                 // JMP
                 Code::Jmp_rel8_64 |
@@ -54,20 +56,21 @@ pub fn analyze_early_functions(backend: &mut Backend) -> EarlyFunctions {
                 Code::Jmp_rel32_32 => {
 
                     let true_branch = inst.near_branch64();
-                    let false_branch = inst.next_ip();
+                    maybe_tail_call = None;
 
                     if true_branch < function_start.unwrap() {
                         // Branching before the function's start means a tail-call.
                         function_end = true;
-                    } else if !ret.basic_blocks.contains(&false_branch) {
-                        // If the next instruction is not a known basic block, we suggest 
-                        // that this is the last instruction of the function, and 
-                        // therefore this jmp is a tail-call.
-                        function_end = true;
                     } else {
+                        // Branching elsewhere can be a real branch so we register it.
                         ret.basic_blocks.insert(true_branch);
+                        // But if the branch goes beyond the current instruction, note
+                        // that it can be a tail-call.
+                        if true_branch > inst.ip() {
+                            maybe_tail_call = Some(true_branch);
+                        }
                     }
-
+                    
                 }
                 // RET
                 Code::Retnq |
@@ -83,8 +86,26 @@ pub fn analyze_early_functions(backend: &mut Backend) -> EarlyFunctions {
                 Code::Retfd_imm16 |
                 Code::Retfw_imm16 => {
                     function_end = true;
+                    maybe_tail_call = None;
                 }
-                _ => {}
+                Code::Nopw |
+                Code::Nopd |
+                Code::Nopq |
+                Code::Nop_rm16 |
+                Code::Nop_rm32 |
+                Code::Nop_rm64 |
+                Code::Int3 => {
+                    // If last instruction maybe a tail call and this is a nop, valid.
+                    if let Some(tail_call_ip) = maybe_tail_call.take() {
+                        // Remove the basic block that was created by the tail call.
+                        ret.basic_blocks.remove(&tail_call_ip);
+                        ret.functions.push((function_start.take().unwrap(), inst.ip()));
+                    }
+                }
+                _ => {
+                    // Other instruction cannot be tail-calls.
+                    maybe_tail_call = None;
+                }
             }
 
             if function_end {

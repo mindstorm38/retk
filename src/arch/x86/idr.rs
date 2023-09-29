@@ -14,7 +14,8 @@ use super::early::{EarlyFunctions, EarlyFunction};
 use super::Backend;
 
 
-const DEBUG_FUNCTION: u64 = 0x1400277A0;
+// const DEBUG_FUNCTION: u64 = 0x140205378;
+// const DEBUG_FUNCTION: u64 = 0x140205402;
 
 
 /// Analyze all IDR functions.
@@ -27,7 +28,7 @@ pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
 
     let mut missing_opcodes = HashMap::<_, usize>::new();
 
-    'func: for (i, early_function) in early_functions.iter_functions().enumerate() {
+    for (i, early_function) in early_functions.iter_functions().enumerate() {
 
         print!(" = At {:08X} ({:03.0}%)... ", early_function.begin(), i as f32 / functions_count as f32 * 100.0);
 
@@ -36,6 +37,7 @@ pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
         backend.decoder.goto_range_at(section.pos + offset as usize, early_function.begin(), early_function.end());
 
         let mut decoder = IdrDecoder::new(&mut type_system, early_function);
+        let mut error = false;
 
         while let Some(inst) = backend.decoder.decode() {
 
@@ -43,27 +45,37 @@ pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
                 println!("[{:08X}] {inst}", inst.ip());
             }
 
-            if let Err(e) = decoder.feed(inst) {
+            if !error {
+                if let Err(e) = decoder.feed(inst) {
 
-                if let Some(inst) = e.downcast_ref::<Instruction>() {
-                    *missing_opcodes.entry(inst.code()).or_default() += 1;
-                    println!("Error: {inst} ({:?})", inst.code());
-                } else {
-                    println!("Error: {e}");
+                    if let Some(inst) = e.downcast_ref::<Instruction>() {
+                        *missing_opcodes.entry(inst.code()).or_default() += 1;
+                        println!("Error: {inst} ({:?})", inst.code());
+                    } else {
+                        println!("Error: {e}");
+                    }
+
+                    error = true;
+
                 }
-
-                continue 'func;
-
             }
 
+        }
+
+        if error {
+            continue;
         }
 
         if decoder.early_function.begin() == DEBUG_FUNCTION {
             decoder.debug_function();
         }
 
-        functions.insert(decoder.early_function.begin(), decoder.function);
-        println!("Done.");
+        if decoder.done {
+            functions.insert(decoder.early_function.begin(), decoder.function);
+            println!("Done.");
+        } else {
+            println!("Not Done.");
+        }
         
     }
 
@@ -1484,7 +1496,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     /// and the given `import` argument is true then the value of the register family 
     /// is preserved in the new local, using a cast assignment.
     #[track_caller]
-    fn decode_register(&mut self, register: Register, ty: Type, import: bool) -> LocalRef {
+    fn decode_register(&mut self, register: Register, mut ty: Type, import: bool) -> LocalRef {
 
         let full_register = register.full_register();
 
@@ -1496,14 +1508,14 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                 let mut last_ty = self.function.local_type(last_local);
 
                 // We want to check for the following cases (only if import mode):
-                // - last_ty = weak(last_n), ty = weak(n):
-                //   - n == last_n: nothing to do
-                //   - n != last_n: new local with cast
                 // - last_ty = weak(last_n), ty = actual(n):
                 //   - n == last_n: update last_ty to actual(n)
                 //   - n != last_n: 
                 //     - update last_ty to actual(last_n)
                 //     - new local of actual(n)
+                // - last_ty = actual(last_n), ty = weak(n):
+                //   - n == last_n: force ty to last_ty
+                //   - n != last_n: force ty to actual(n)
                 
                 // If the required indirection and the last one corresponds.
                 if import && last_ty.indirection == ty.indirection {
@@ -1520,6 +1532,14 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                             // Actually modify the local type.
                             self.function.set_local_type(last_local, &self.type_system, new_ty);
                             last_ty = new_ty;
+                        }
+                    } else if let Some(last_n) = last_ty.primitive.actual_int_bits() {
+                        if let Some(n) = ty.primitive.weak_int_bits() {
+                            let mut new_ty = last_ty;
+                            if n == last_n {
+                                new_ty.primitive = new_ty.primitive.with_int_bits(n).unwrap();
+                            }
+                            ty = new_ty
                         }
                     }
                 }
