@@ -14,7 +14,7 @@ use super::early::{EarlyFunctions, EarlyFunction};
 use super::Backend;
 
 
-const DEBUG_FUNCTION: u64 = 0x140027680;
+const DEBUG_FUNCTION: u64 = 0x14021B160;
 
 
 /// Analyze all IDR functions.
@@ -31,16 +31,17 @@ pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
 
         print!(" = At {:08X} ({:03.0}%)... ", early_function.begin(), i as f32 / functions_count as f32 * 100.0);
 
-        let section = backend.sections.get_code_section_at(early_function.begin()).unwrap();
-        let offset = early_function.begin() - section.begin_addr;
-        backend.decoder.goto_range_at(section.pos + offset as usize, early_function.begin(), early_function.end());
+        let begin = early_function.begin();
+        let section = backend.sections.get_code_section_at(begin).unwrap();
+        let offset = begin - section.begin_addr;
+        backend.decoder.goto_range_at(section.pos + offset as usize, begin, early_function.end());
 
         let mut decoder = IdrDecoder::new(&mut type_system, early_function);
         let mut error = false;
 
         while let Some(inst) = backend.decoder.decode() {
 
-            if decoder.early_function.begin() == DEBUG_FUNCTION {
+            if begin == DEBUG_FUNCTION {
                 println!("[{:08X}] {inst}", inst.ip());
             }
 
@@ -65,16 +66,15 @@ pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
             continue;
         }
 
-        if decoder.early_function.begin() == DEBUG_FUNCTION {
-            decoder.debug_function();
+        println!("Done.");
+
+        let function = decoder.finalize_function().unwrap();
+
+        if begin == DEBUG_FUNCTION {
+            function.debug_function(&type_system);
         }
 
-        if decoder.done {
-            functions.insert(decoder.early_function.begin(), decoder.function);
-            println!("Done.");
-        } else {
-            println!("Not Done.");
-        }
+        functions.insert(begin, function);
         
     }
 
@@ -125,12 +125,10 @@ struct IdrDecoder<'e, 't> {
     /// to also be present in the early function's basic blocks.
     basic_blocks: HashMap<u64, BasicBlock>,
     /// Instruction pointer of the current basic block being decoded.
-    basic_block_ip: u64,
+    basic_block_ip: Option<u64>,
     /// Information about how flags were last modified.
     /// **This is reset between basic blocks.**
     flags: Flags,
-    /// True when the decoding should be done.
-    done: bool,
 }
 
 impl<'e, 't> IdrDecoder<'e, 't> {
@@ -146,19 +144,16 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             register_block_locals: HashMap::new(),
             temp_block_locals: HashMap::new(),
             basic_blocks: HashMap::new(),
-            basic_block_ip: 0, // Will be initialized at first instruction.
+            basic_block_ip: None, // Will be initialized at first instruction.
             flags: Flags::Undefined,
-            done: false,
         }
     }
     
     /// Finalize the current function, save it and reset the state to go to the next one.
-    fn finalize_function(&mut self) -> AnyResult<()> {
-
-        self.done = true;
+    fn finalize_function(mut self) -> AnyResult<Function> {
 
         // Finalize all basic block and ensure that they are existing.
-        for (&block_ip, block) in &mut self.basic_blocks {
+        for block in self.basic_blocks.values_mut() {
             let index = block.begin_index.ok_or_else(|| anyhow!("block decoding is missing"))?;
             // If the basic block is valid, relocate all branches to point to it.
             // NOTE: We drain this relocation list because we don't want to keep it 
@@ -170,13 +165,6 @@ impl<'e, 't> IdrDecoder<'e, 't> {
                     stmt => bail!("statement cannot be relocated: {stmt:?}"),
                 }
             }
-            // // Collect initial imports.
-            // let imports = block.iter_import_register_locals().collect::<HashSet<_>>();
-            // if !imports.is_empty() {
-            //     basic_block_imports.insert(block_ip, FinalBasicBlock {
-            //         imports,
-            //     });
-            // }
         }
 
         // Unique imports for each basic block, in these steps it is possible to have
@@ -295,7 +283,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             self.function.statements.insert(index, stmt);
         }
 
-        Ok(())
+        Ok(self.function)
 
     }
 
@@ -307,7 +295,12 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     /// branch statement has been artificially added to form a new basic block.
     fn finalize_basic_block(&mut self, add_true_branch: Option<u64>) {
 
-        let block = self.basic_blocks.get_mut(&self.basic_block_ip).unwrap();        
+        // Take the block ip so no double call to this function is possible.
+        let Some(block_ip) = self.basic_block_ip.take() else {
+            return;
+        };
+
+        let block = self.basic_blocks.get_mut(&block_ip).unwrap();        
         block.branch_index = Some(self.function.statements.len() - 1);
         
         if let Some(true_branch) = add_true_branch {
@@ -605,8 +598,6 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             });
 
         }
-
-        // self.debug_function();
 
     }
 
@@ -1059,25 +1050,33 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
         let pointer = inst.near_branch64();
         let cond_expr = self.decode_cond_expr(inst)?;
-        
-        let branch_index = self.push_statement_with(|index| {
-            Statement::BranchConditional { 
-                value: cond_expr, 
-                branch_true: 0, // Will be modified if upon basic block creation.
-                branch_false: index + 1, // False jcc go to the next instruction.
-            }
-        });
 
-        let block = self.basic_blocks.get_mut(&self.basic_block_ip).unwrap();
-        block.true_branch = Some(pointer);
-        block.false_branch = Some(inst.next_ip());
+        // If the function doesn't contain the pointed basic block, we guess that it's
+        // a conditional tail-call
+        if self.early_function.contains_block(pointer) {
 
-        // We added a branch statement, this implied existence of two basic blocks.
-        let true_block = self.ensure_basic_block(pointer)?;
-        true_block.branch_indices_to_relocate.push(branch_index);
-        let _false_block = self.ensure_basic_block(inst.next_ip())?;
+            let branch_index = self.push_statement_with(|index| {
+                Statement::BranchConditional { 
+                    value: cond_expr, 
+                    branch_true: 0, // Will be modified if upon basic block creation.
+                    branch_false: index + 1, // False jcc go to the next instruction.
+                }
+            });
+    
+            // Unwrap should be safe because basic block is checked when instruction is fed.
+            let block_ip = self.basic_block_ip.unwrap();
+            let block = self.basic_blocks.get_mut(&block_ip).unwrap();
+            block.true_branch = Some(pointer);
+            block.false_branch = Some(inst.next_ip());
 
-        Ok(())
+            let true_block = self.ensure_basic_block_unchecked(pointer);
+            true_block.branch_indices_to_relocate.push(branch_index);
+            let _false_block = self.ensure_basic_block(inst.next_ip())?;
+            Ok(())
+
+        } else {
+            bail!("decode_jcc: conditional tail-call not yet supported ({inst})");
+        }
 
     }
 
@@ -1088,7 +1087,9 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         if self.early_function.contains_block(pointer) {
 
             let branch_index = self.push_statement(Statement::Branch { branch: 0 });
-            let block = self.basic_blocks.get_mut(&self.basic_block_ip).unwrap();
+
+            let block_ip = self.basic_block_ip.unwrap();
+            let block = self.basic_blocks.get_mut(&block_ip).unwrap();
             block.true_branch = Some(pointer);
 
             let target_block = self.ensure_basic_block_unchecked(pointer);
@@ -1120,24 +1121,20 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         let ret_place = self.decode_register_import(Register::RAX, TY_QWORD);
         self.push_statement(Statement::Return(ret_place));
 
-        // We directly finalize the basic block here because our function ends here.
-        self.finalize_basic_block(None);
-        self.finalize_function()?;
-
         Ok(())
 
     }
 
     /// Feed a new instruction to the decoder, if some instruction is returned, the 
     /// feeder must goto to the given instruction and start feed from it.
+    /// 
+    /// **You must ensure** that the first instruction fed into the decoder is also the
+    /// start of the first basic block of the decoded function. When feeding is done
+    /// you should call the [`finalize_function`] method to compute all missing data
+    /// and return the finalized IDR function.
     fn feed(&mut self, inst: &Instruction) -> AnyResult<()> {
 
-        if self.done {
-            bail!("function decoding is done, cannot accept new instruction");
-        }
-
         let ip = inst.ip();
-        // println!("[{:08X}] {inst}", ip);
 
         if self.early_function.contains_block(ip) {
             if let Some(stmt) = self.function.statements.last() {
@@ -1157,7 +1154,9 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             let block = self.basic_blocks.entry(ip).or_default();
             block.begin_index = Some(self.function.statements.len());
             // Set the new basic block ip being decoded.
-            self.basic_block_ip = ip;
+            self.basic_block_ip = Some(ip);
+        } else if self.basic_block_ip.is_none() {
+            bail!("missing basic block for instruction at {ip:08X}");
         }
         
         if inst.has_lock_prefix() {
@@ -1642,10 +1641,6 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
     fn ensure_basic_block_unchecked(&mut self, ip: u64) -> &mut BasicBlock {
         self.basic_blocks.entry(ip).or_default()
-    }
-
-    fn debug_function(&self) {
-        crate::idr::print::write_function(std::io::stdout().lock(), &self.function, &self.type_system).unwrap();
     }
 
 }

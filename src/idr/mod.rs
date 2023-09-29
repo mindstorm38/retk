@@ -274,4 +274,8 @@ impl Function {
         local.update_layout(type_system);
     }
 
+    pub fn debug_function(&self, type_system: &TypeSystem) {
+        print::write_function(std::io::stdout().lock(), self, &type_system).unwrap();
+    }
+
 }
