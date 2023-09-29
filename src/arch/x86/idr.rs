@@ -14,7 +14,7 @@ use super::early::{EarlyFunctions, EarlyFunction};
 use super::Backend;
 
 
-const DEBUG_FUNCTION: u64 = 0x14021B160;
+const DEBUG_FUNCTION: u64 = 0x140029C20;
 
 
 /// Analyze all IDR functions.
@@ -79,7 +79,7 @@ pub fn analyze_idr(backend: &mut Backend, early_functions: &EarlyFunctions) {
     }
 
     let mut missing_opcodes = missing_opcodes.into_iter().collect::<Vec<_>>();
-    missing_opcodes.sort_unstable_by_key(|&(code, _)| code.mnemonic());
+    missing_opcodes.sort_unstable_by_key(|&(_code, count)| count);
 
     println!(" = Missing opcodes ({}):", missing_opcodes.len());
     for (opcode, count) in missing_opcodes {
@@ -1080,7 +1080,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
     }
 
-    fn decode_jmp(&mut self, inst: &Instruction) -> AnyResult<()> {
+    fn decode_jmp_rel(&mut self, inst: &Instruction) -> AnyResult<()> {
 
         let pointer = inst.near_branch64();
 
@@ -1113,6 +1113,38 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             self.decode_ret(inst)
 
         }
+
+    }
+
+    fn decode_jmp_rm(&mut self, inst: &Instruction) -> AnyResult<()> {
+
+        // TODO: In the future, it would be great to try to understand if this kind of
+        // jump is reading a switch table or not.
+        // Here is an example of switch table jump:
+        //   [140029C82] lea rcx,[140000000h]
+        //   [140029C89] mov eax,[rcx+rax*4+29CF4h]
+        //   [140029C90] add rax,rcx
+        //   [140029C93] jmp rax
+
+        bail!("decode_jmp_rm: unsupported for now, read code comment")
+
+
+
+        // let pointer_place;
+        // match inst.op0_register() {
+        //     Register::None => pointer_place = self.decode_mem_operand(inst, TY_FUNC_PTR)?,
+        //     reg => pointer_place = Place::new_direct(self.decode_register_import(reg, TY_FUNC_PTR)),
+        // }
+
+        // let ret_local = self.decode_register_write(Register::RAX, TY_QWORD);
+
+        // // Jump from register/memory can be interpreted as tail-calls.
+        // self.push_assign(Place::new_direct(ret_local), Expression::Call { 
+        //     pointer: Operand::Place(pointer_place), 
+        //     arguments: Vec::new(),
+        // });
+
+        // self.decode_ret(inst)
 
     }
 
@@ -1448,7 +1480,10 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             Code::Jmp_rel8_32 |
             Code::Jmp_rel8_16 |
             Code::Jmp_rel32_64 |
-            Code::Jmp_rel32_32 => self.decode_jmp(inst)?,
+            Code::Jmp_rel32_32 => self.decode_jmp_rel(inst)?,
+            Code::Jmp_rm64 |
+            Code::Jmp_rm32 |
+            Code::Jmp_rm16 => self.decode_jmp_rm(inst)?,
             // RET
             Code::Retnq |
             Code::Retnd |
@@ -1766,6 +1801,7 @@ struct FinalBasicBlock {
 
 
 const TY_VOID: Type = PrimitiveType::Void.plain();
+const TY_FUNC_PTR: Type = TY_VOID.pointer(1);
 const TY_BYTE: Type = PrimitiveType::WeakInt(8).plain();
 const TY_QWORD: Type = PrimitiveType::WeakInt(64).plain();
 const TY_PTR_DIFF: Type = PrimitiveType::SignedInt(64).plain();

@@ -65,6 +65,11 @@ pub fn analyze_early_functions(backend: &mut Backend) -> EarlyFunctions {
                     ret.basic_blocks.insert(inst.near_branch64());
                     ret.basic_blocks.insert(inst.next_ip());
                 }
+                Code::Jmp_rm64 |
+                Code::Jmp_rm32 |
+                Code::Jmp_rm16 => {
+                    ret.basic_blocks.insert(inst.next_ip());
+                }
                 _ => {}
             }
 
