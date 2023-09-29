@@ -10,84 +10,38 @@ use super::Backend;
 /// Analyze all functions and their basic blocks from the given x86 backend.
 pub fn analyze_early_functions(backend: &mut Backend) -> EarlyFunctions {
 
+    let mut called_basic_blocks = HashSet::new();
+
+    for section in &backend.sections.code {
+        backend.decoder.goto_range_at(section.pos, section.begin_addr, section.end_addr);
+        while let Some(inst) = backend.decoder.decode() {
+            match inst.code() {
+                Code::Call_rel16 |
+                Code::Call_rel32_32 |
+                Code::Call_rel32_64 => {
+                    called_basic_blocks.insert(inst.memory_displacement64());
+                }
+                _ => {}
+            }
+        }
+    }
+
     let mut ret = EarlyFunctions::default();
 
     for section in &backend.sections.code {
 
         backend.decoder.goto_range_at(section.pos, section.begin_addr, section.end_addr);
-        
+
         let mut function_start = None;
-        let mut maybe_tail_call = None;
 
         while let Some(inst) = backend.decoder.decode() {
 
-            // Do not start the function while nop instruction.
-            if function_start.is_none() {
-                match inst.code() { 
-                    Code::Nopw |
-                    Code::Nopd |
-                    Code::Nopq |
-                    Code::Nop_rm16 |
-                    Code::Nop_rm32 |
-                    Code::Nop_rm64 |
-                    Code::Int3 => continue,
-                    _ => {
-                        function_start = Some(inst.ip());
-                        // There is at least one basic block at function's entry.
-                        ret.basic_blocks.insert(inst.ip());
-                    }
-                }
-            }
+            // println!("[{:08X}] {inst}", inst.ip());
 
-            let mut function_end = false;
+            let mut is_nop = false;
 
             match inst.code() {
-                // Jcc
-                code if code.is_jcc_short_or_near() => {
-                    ret.basic_blocks.insert(inst.near_branch64());
-                    ret.basic_blocks.insert(inst.next_ip());
-                    maybe_tail_call = None;
-                }
-                // JMP
-                Code::Jmp_rel8_64 |
-                Code::Jmp_rel8_32 |
-                Code::Jmp_rel8_16 |
-                Code::Jmp_rel32_64 |
-                Code::Jmp_rel32_32 => {
-
-                    let true_branch = inst.near_branch64();
-                    maybe_tail_call = None;
-
-                    if true_branch < function_start.unwrap() {
-                        // Branching before the function's start means a tail-call.
-                        function_end = true;
-                    } else {
-                        // Branching elsewhere can be a real branch so we register it.
-                        ret.basic_blocks.insert(true_branch);
-                        // But if the branch goes beyond the current instruction, note
-                        // that it can be a tail-call.
-                        if true_branch > inst.ip() {
-                            maybe_tail_call = Some(true_branch);
-                        }
-                    }
-                    
-                }
-                // RET
-                Code::Retnq |
-                Code::Retnd |
-                Code::Retnw |
-                Code::Retnq_imm16 |
-                Code::Retnd_imm16 |
-                Code::Retnw_imm16 |
-                Code::Retfq |
-                Code::Retfd |
-                Code::Retfw |
-                Code::Retfq_imm16 |
-                Code::Retfd_imm16 |
-                Code::Retfw_imm16 => {
-                    function_end = true;
-                    maybe_tail_call = None;
-                }
+                // NOP
                 Code::Nopw |
                 Code::Nopd |
                 Code::Nopq |
@@ -95,24 +49,55 @@ pub fn analyze_early_functions(backend: &mut Backend) -> EarlyFunctions {
                 Code::Nop_rm32 |
                 Code::Nop_rm64 |
                 Code::Int3 => {
-                    // If last instruction maybe a tail call and this is a nop, valid.
-                    if let Some(tail_call_ip) = maybe_tail_call.take() {
-                        // Remove the basic block that was created by the tail call.
-                        ret.basic_blocks.remove(&tail_call_ip);
-                        ret.functions.push((function_start.take().unwrap(), inst.ip()));
-                    }
+                    is_nop = true;
                 }
-                _ => {
-                    // Other instruction cannot be tail-calls.
-                    maybe_tail_call = None;
+                // Jcc
+                code if code.is_jcc_short_or_near() => {
+                    ret.basic_blocks.insert(inst.near_branch64());
+                    ret.basic_blocks.insert(inst.next_ip());
                 }
+                // JMP
+                Code::Jmp_rel8_64 |
+                Code::Jmp_rel8_32 |
+                Code::Jmp_rel8_16 |
+                Code::Jmp_rel32_64 |
+                Code::Jmp_rel32_32 => {
+                    ret.basic_blocks.insert(inst.near_branch64());
+                    ret.basic_blocks.insert(inst.next_ip());
+                }
+                _ => {}
             }
 
-            if function_end {
-                ret.functions.push((function_start.take().unwrap(), inst.next_ip()));
+            if !is_nop && function_start.is_none() {
+                // If the instruction is not a no-op we can start function if relevant.
+                // Also add a basic block at the function's start.
+                ret.basic_blocks.insert(inst.ip());
+                function_start = Some(inst.ip());
+            } else {
+
+                let end_ip;
+                if is_nop {
+                    // If current instruction is a no-op then we can directly end this
+                    // function here (exclusive end).
+                    end_ip = inst.ip();
+                } else if called_basic_blocks.contains(&inst.next_ip()) {
+                    // If the current instruction is not a no-op but a new function is
+                    // starting on the next instruction, function ends on the next one.
+                    end_ip = inst.next_ip();
+                } else {
+                    continue;
+                }
+
+                // If this is a no-op and we have a function start, finish the function.
+                // If the next ip is a called basic block, we also terminate the function.
+                if let Some(function_start) = function_start.take() {
+                    ret.functions.push((function_start, end_ip));
+                }
+
             }
 
         }
+
     }
 
     ret
@@ -127,6 +112,7 @@ pub fn analyze_early_functions(backend: &mut Backend) -> EarlyFunctions {
 pub struct EarlyFunctions {
     /// Mapping of all basic blocks.
     basic_blocks: HashSet<u64>,
+    /// Listing of function with their first (inclusive) and last (exclusive) instruction.
     functions: Vec<(u64, u64)>,
 }
 

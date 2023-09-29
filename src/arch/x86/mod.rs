@@ -35,7 +35,7 @@ impl<'data> Backend<'data> {
         let early_functions = early::analyze_early_functions(&mut *self);
         println!(" = Basic blocks count: {}", early_functions.basic_blocks_count());
         println!(" = Functions count: {}", early_functions.functions_count());
-
+        
         println!("== Analyzing intermediate decompilation representation...");
         idr::analyze_idr(&mut *self, &early_functions);
         println!(" = Done.");

@@ -14,8 +14,7 @@ use super::early::{EarlyFunctions, EarlyFunction};
 use super::Backend;
 
 
-// const DEBUG_FUNCTION: u64 = 0x140205378;
-// const DEBUG_FUNCTION: u64 = 0x140205402;
+const DEBUG_FUNCTION: u64 = 0x140027680;
 
 
 /// Analyze all IDR functions.
