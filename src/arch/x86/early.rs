@@ -36,20 +36,16 @@ pub fn analyze_early_functions(backend: &mut Backend) -> EarlyFunctions {
 
         while let Some(inst) = backend.decoder.decode() {
 
-            // println!("[{:08X}] {inst}", inst.ip());
+            // if inst.ip() >= 0x1402E04F1 && inst.ip() < 0x1402E04F1 + 100 {
+                // println!("[{:08X}] {inst}", inst.ip());
+            // }
 
-            let mut is_nop = false;
+            let mut is_int3 = false;
 
             match inst.code() {
                 // NOP
-                Code::Nopw |
-                Code::Nopd |
-                Code::Nopq |
-                Code::Nop_rm16 |
-                Code::Nop_rm32 |
-                Code::Nop_rm64 |
                 Code::Int3 => {
-                    is_nop = true;
+                    is_int3 = true;
                 }
                 // Jcc
                 code if code.is_jcc_short_or_near() => {
@@ -73,7 +69,7 @@ pub fn analyze_early_functions(backend: &mut Backend) -> EarlyFunctions {
                 _ => {}
             }
 
-            if !is_nop && function_start.is_none() {
+            if !is_int3 && function_start.is_none() {
                 // If the instruction is not a no-op we can start function if relevant.
                 // Also add a basic block at the function's start.
                 ret.basic_blocks.insert(inst.ip());
@@ -81,7 +77,7 @@ pub fn analyze_early_functions(backend: &mut Backend) -> EarlyFunctions {
             } else {
 
                 let end_ip;
-                if is_nop {
+                if is_int3 {
                     // If current instruction is a no-op then we can directly end this
                     // function here (exclusive end).
                     end_ip = inst.ip();

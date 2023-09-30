@@ -118,13 +118,15 @@ pub enum Expression {
         /// List of arguments to pass to the function.
         arguments: Vec<Operand>,
     },
-    /// Perform a binary comparison that produces a boolean value.
+    /// Perform a binary comparison that produces a boolean value. The two operands 
+    /// are required to be of the same type.
     Comparison {
         left: Operand,
         right: Operand,
         operator: ComparisonOperator,
     },
-    /// A binary expression with two operands and a binary operator.
+    /// A binary expression with two operands and a binary operator. The two operands 
+    /// are required to be of the same type.
     Binary {
         left: Operand,
         right: Operand,
@@ -186,10 +188,16 @@ impl Statement {
 /// Kind of binary expression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOperator {
+    /// Add two number, valid for integers, floats and vectors.
     Add,
+    /// Subtract two number, valid for integers, floats and vectors.
     Sub,
+    /// Multiply two number, valid for integers, floats and vectors.
     Mul,
+    /// Divide two number, valid for integers, floats and vectors and get the quotient.
     Div,
+    /// Divide two integers are get the remainder (signed).
+    Rem,
     And,
     Or,
     Xor,

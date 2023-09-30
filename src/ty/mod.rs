@@ -232,6 +232,15 @@ impl PrimitiveType {
         matches!(self, Self::FloatVec(_) | Self::DoubleVec(_))
     }
 
+    /// If this is an integer, returns its bit count.
+    #[inline]
+    pub const fn int_bits(self) -> Option<u32> {
+        match self {
+            Self::WeakInt(n) | Self::UnsignedInt(n) | Self::SignedInt(n) => Some(n),
+            _ => None
+        }
+    }
+
     /// If this is a weak integer, returns its bit count.
     #[inline]
     pub const fn weak_int_bits(self) -> Option<u32> {
