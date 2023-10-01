@@ -15,8 +15,6 @@ use super::Backend;
 
 
 const DEBUG_FUNCTIONS: &'static [u64] = &[
-    0x140001000, // Signed comparison
-    0x140030470, // Unknown int layout
     // 0x1402E0370, // Example of imul <r/m>
     // 0x140033120, // Example of div
     // 0x140207E00, // Example of idiv with cdq
