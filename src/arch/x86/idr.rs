@@ -112,7 +112,9 @@ struct IdrDecoder<'e, 't> {
     /// Current stack pointer value.
     /// **This is reset between passes.**
     stack_pointer: i32,
-    /// Mapping of stack offset to the local they are storing.
+    /// Mapping of stack offset to the local they are storing. The layout of the stack is
+    /// computed from accesses made to it, it acts like a single big register holding a
+    /// complex structure with many fields.
     /// **This is reset between passes.**
     stack_locals: HashMap<i32, LocalRef>,
     /// Mapping of local variables and which tuple register/type is holding them. 
@@ -382,22 +384,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
 
                 // Compute real stack offset from currently known stack pointer.
                 let offset = self.stack_pointer + mem_displ as i32;
-                let stack_local = self.decode_stack_local(offset, ty);
-                // We check the effective stack local's type.
-                let stack_ty = self.function.local_type(stack_local);
-                if stack_ty != ty {
-
-                    // Wrong type so we create a pointer and then cast this pointer.
-                    let temp_local_0 = self.alloc_temp_local(stack_ty.pointer(1));
-                    self.push_assign(Place::new_direct(temp_local_0), Expression::Ref(Place::new_direct(stack_local)));
-                    let temp_local_1 = self.alloc_temp_local(ty.pointer(1));
-                    self.push_assign(Place::new_direct(temp_local_1), Expression::Cast(Place::new_direct(temp_local_0)));
-
-                    place = Place::new_index_absolute(temp_local_1, 0);
-
-                } else {
-                    place = Place::new_direct(stack_local);
-                }
+                place = self.decode_stack_place(offset, ty);
                 
             }
             Register::None => {
@@ -546,9 +533,9 @@ impl<'e, 't> IdrDecoder<'e, 't> {
         
         let reg_local = self.decode_register_import_int(reg, reg.size())?;
         let reg_ty = self.function.local_type(reg_local);
-        let stack_local = self.decode_stack_local(self.stack_pointer, reg_ty);
+        let stack_place = self.decode_stack_place(self.stack_pointer, reg_ty);
 
-        self.push_assign(Place::new_direct(stack_local), Expression::Copy(Operand::new_local(reg_local)));
+        self.push_assign(stack_place, Expression::Copy(Operand::new_local(reg_local)));
         Ok(())
 
     }
@@ -561,6 +548,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             bail!("decode_pop_r: cannot pop to sp ({inst})");
         }
 
+        // TODO: Use 'decode_stack_place' instead.
         let stack_default_ty = IntLayout::Weak.to_type(reg.size());
         let stack_local = self.decode_stack_local(self.stack_pointer, stack_default_ty);
         let stack_ty = self.function.local_type(stack_local);
@@ -1928,6 +1916,28 @@ impl<'e, 't> IdrDecoder<'e, 't> {
     fn decode_stack_local(&mut self, offset: i32, ty: Type) -> LocalRef {
         *self.stack_locals.entry(offset)
             .or_insert_with(|| self.function.new_local(&self.type_system, ty, format!("stack: {offset}")))
+    }
+
+    /// Decode a stack place given an offset and the type we want the place to be.
+    fn decode_stack_place(&mut self, offset: i32, ty: Type) -> Place {
+
+        let stack_local = self.decode_stack_local(offset, ty);
+        // We check the effective stack local's type.
+        let stack_ty = self.function.local_type(stack_local);
+        if stack_ty != ty {
+
+            // Wrong type so we create a pointer and then cast this pointer.
+            let temp_local_0 = self.alloc_temp_local(stack_ty.pointer(1));
+            self.push_assign(Place::new_direct(temp_local_0), Expression::Ref(Place::new_direct(stack_local)));
+            let temp_local_1 = self.alloc_temp_local(ty.pointer(1));
+            self.push_assign(Place::new_direct(temp_local_1), Expression::Cast(Place::new_direct(temp_local_0)));
+
+            Place::new_index_absolute(temp_local_1, 0)
+
+        } else {
+            Place::new_direct(stack_local)
+        }
+        
     }
 
     /// Allocate a temporary variable to hold the given type, the local will be freed
