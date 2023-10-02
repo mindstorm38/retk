@@ -1079,7 +1079,7 @@ impl<'e, 't> IdrDecoder<'e, 't> {
             self.push_assign(Place::new_direct(reg_local), Expression::Copy(Operand::Zero));
 
         } else {
-            bail!("decode_xorp_r_rm: different registers ({inst})");
+            bail!("decode_xor_simd_r_rm: different registers ({inst})");
         }
 
         Ok(())
